@@ -1,22 +1,19 @@
 # dsh-workbench-ecs
 
+> v0.3.3 · MIT License
+
 [English](./README.md) | 中文
 
-> 阿里云 Workbench CLI 包装插件 —— 让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 直接控制远程 ECS 实例。
-
-## 为什么做这个插件
-
-开发环境与生产环境不同, 生产环境的 bug 往往无法本地复现。传统排查流程是: 人手动登录服务器 → 复制指令 → 把结果再复制给 Agent → 循环往复, 非常繁琐。
-
-这个插件让 **Agent 自己就有能力连上生产实例**: 通过工具调用, 在本机执行阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances), 完成实例列表查询、远程命令执行、文件传输、一键体检、受控发布、会话管理 —— 覆盖"发现问题 → 定位 → 修复 → 上传 → 重启 → 验证"的完整闭环, 全程无需人工复制指令和结果。
+一个把官方阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances) 接入本地、由 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (Cordis) 驱动来操控 ECS 实例的插件。内置 **7 个 Agent 原生工具** —— `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 覆盖「列表 → 体检 → 执行 → 上传 → 重启 → 验证」完整闭环; 并附带**可视化设置面板**(CLI 状态、实例管理、受控发布向导、会话、操作时间线)。实例经 Workbench 后端通道连接, **无需公网 IP**; 破坏性命令走 Harness 审批守卫, 未获明确放行一律拒绝(fail closed)。
 
 ## 特性
 
 - **7 个 Agent 原生工具**: `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 与 Harness 工具体系无缝集成
+- **可视化设置面板**(v0.3.0+): CLI 状态(20s Host 缓存 + 本地秒显)、实例浏览(搜索/批量/30s 自动刷新)、一键诊断(磁盘·内存仪表盘)、受控发布向导+模板、会话管理、操作时间线; 自动适配深/浅色主题
 - **真实 API 调用**: 工具执行本机 `workbench` 命令, 经阿里云 Workbench 后端连接实例(支持无公网 IP 的实例)
 - **JSON 解析 + 可读渲染**: 解析 CLI 的 JSON 输出, 渲染为表格/文本/终端卡片; CLI 层错误(`{code, message}`)转成可读报错
-- **安全守卫**: 破坏性命令(`rm -rf`、`shutdown`、`reboot`、`mkfs`、`dd` 等)自动接入 Harness 审批服务, 未获批准一律拒绝(fail closed)
-- **后台任务**: `ecs_exec` 支持 `run_in_background`, 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止
+- **安全守卫**: 破坏性命令(`rm -rf`、`shutdown`、`reboot`、`mkfs`、`dd`、`iptables -F/-X` 等)自动接入 Harness 审批服务, 未获批准一律拒绝(fail closed)
+- **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(串行, 单台失败不中断), 适合集群排查
 - **大输出 spill**: stdout 超限自动落盘并返回完整输出路径, 日志排查不再截断丢头
 - **健壮二进制解析**: 按 PATH 解析 `workbench`, 失败时回退常见安装位置(如 `C:\Program Files\workbench\workbench.exe`), 解决宿主进程 PATH 过期问题
@@ -24,11 +21,40 @@
 
 ## 安装
 
-### 1. 安装 DeepSeek Harness(略)
+### 前置要求
 
-本插件是标准的 [Cordis](https://github.com/cordiverse/cordis) 插件, 需要运行在 DeepSeek Harness(或兼容的 Cordis 运行时)中。
+- Node.js ≥ 20 且 DeepSeek Harness 的 `dsh web` 正在运行;
+- **与本插件同一台机器**上安装并配置好官方 Workbench CLI(见下文 [使用前准备](#使用前准备))。
 
-### 2. 安装 Workbench CLI(必做)
+### 官方 dsh 命令一键安装
+
+```bash
+dsh plugin --profile web add dsh-workbench-ecs
+```
+
+就这一条 —— bundle 层会把插件行写入 web profile: 7 个工具对 Agent 立即可用, Harness 设置(齿轮图标)里出现 **「Workbench ECS」** 标签页。不支持热重载的部署请重启 `dsh web`。
+
+> 本地从仓库开发时改用链接方式:
+> `dsh plugin --profile web add link:<仓库绝对路径>` —— 之后修改 `lib/client.js` 刷新页面即生效(无需重启服务)。
+
+### 验证安装
+
+```bash
+curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.3"}
+```
+
+然后让 Agent 调用:
+
+```text
+ecs_list { region: "cn-shanghai" }
+ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
+ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
+```
+
+### 使用前准备: 安装 Workbench CLI 与配置凭据
+
+#### 安装 Workbench CLI(必做)
 
 | 平台 | 命令 |
 |---|---|
@@ -41,9 +67,9 @@
 workbench version     # 应输出版本号 / commit / build date
 ```
 
-> ⚠️ **Windows 用户注意**: 如果你在 Harness 进程启动之后才安装 CLI, 宿主进程继承的 `PATH` 是旧环境, 直接运行 `workbench` 会找不到命令。插件已内置"常见安装位置回退", 通常无需重启; 若仍失败, 请重启 Harness 会话, 或把安装目录(如 `C:\Program Files\workbench`)加入 PATH。
+> ⚠️ **Windows 用户注意**: 如果你在 Harness 进程启动之后才安装 CLI, 宿主进程继承的 `PATH` 是旧环境, 直接运行 `workbench` 会找不到命令。插件已内置「常见安装位置回退」, 通常无需重启; 若仍失败, 请重启 Harness 会话, 或把安装目录(如 `C:\Program Files\workbench`)加入 PATH。
 
-### 3. 配置凭据
+#### 配置凭据
 
 Workbench CLI 的凭据存储在 `~/.workbench/config.json`(权限要求 `0600`)。支持 5 种认证模式, 直接编辑该文件即可(避免交互式 `workbench config`):
 
@@ -147,7 +173,7 @@ workbench config get                      # 查看当前 profile 详情(JSON)
 workbench config delete --profile old     # 删除 profile(不能删除激活中的)
 ```
 
-### 4. RAM 最小权限策略(推荐)
+#### RAM 最小权限策略(推荐)
 
 给运行 CLI 的 RAM 用户/角色绑定最小权限:
 
@@ -182,54 +208,26 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 - `ecs-workbench:LoginECSInstance`: `acs:ecs:<region>:<account-id>:ecs/<instance-id>`
 - `ecs` 相关 Action: `acs:ecs:<region>:<account-id>:instance/<instance-id>`
 
-### 5. 安装本插件
+#### 手动安装(高级)
 
-**方式 A —— 作为插件行加入 Cordis 组合(cordis.yml / cordis.patch.yml):**
+也可以直接把插件行写进 Cordis 组合(cordis.yml / cordis.patch.yml):
 
 ```yaml
 - id: dsh-workbench-ecs
   name: dsh-workbench-ecs
 ```
 
-**方式 B —— 使用 Harness 的插件管理命令(推荐, 同时启用设置页):**
+注意: 浏览器设置面板只能由 `dsh` 命令接上(bundle 层 `dsh.bundle` + `dsh.client` 声明)。
 
-```bash
-# web profile: 工具 + 可视化设置页一次性安装(包自带 cordis.patch.yml bundle 层)
-dsh plugin --profile web add dsh-workbench-ecs
-```
+#### 本地仓库开发
 
-安装后**重启 dsh web**(或在支持热重载的部署中刷新页面), 插件注册的 7 个工具即对 Agent 可见。
+用 [`scripts/install-local.ps1`](./scripts/install-local.ps1) 把仓库以 junction 链接进 `%DSH_HOME%` 并代写插件行(`install` / `status` / `uninstall`), 修改后随下一次 patch 热重载或 `dsh web` 重启生效。
 
-> 本包从 **v0.3.0** 起同时提供浏览器端设置页(见下文「设置页面」):
-> `exports["./client"]` + `dsh.client` 由 DSH 客户端模块系统自动装载, 无需额外配置。
-
-### 6. 验证安装
-
-```bash
-# 手工验证 CLI 本身可用(在安装了 Workbench CLI 的本机执行):
-workbench list ecs --region cn-hangzhou --output json
-workbench exec --instance-id i-bp1xxxxx --command "df -h" --output json
-
-# 验证设置页 RPC 路由(要求插件已作为 bundle 行挂载):
-curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.2"}
-```
-
-然后让 Agent 调用:
-
-```text
-ecs_list { region: "cn-shanghai" }
-ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
-ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
-```
-
-### 7. 设置页面(可视化面板, v0.3.0+)
-
-安装 bundle 后, 打开 Harness 设置(齿轮图标)即出现 **「Workbench ECS」** 标签页:
+## 设置页面
 
 | 区域 | 能力 |
 |---|---|
-| CLI 状态 | Workbench CLI 可用性 / 版本 / 凭据 Profile / Daemon; **20 秒缓存 + 本地秒显**(点击面板即时渲染, 后台静默刷新; [刷新] 强制重查) |
+| CLI 状态 | Workbench CLI 可用性 / 版本 / 凭据 Profile / Daemon; **20 秒缓存 + 本地秒显**(面板即时渲染, 后台静默刷新; [刷新] 强制重查) |
 | ECS 实例 | 地域/状态筛选 + 名称/ID 搜索 + 状态分布条 + 复选框(批量执行) + **30s 自动刷新** |
 | 实例行操作 | [执行] 选中目标 / [诊断] 一键体检(磁盘·内存仪表盘) / [发布] 受控发布向导 / [详情] 属性 + 最近日志 |
 | 远程命令 | 命令历史(datalist)、破坏性命令两次点击确认(Host 端仍二次拦截); 批量执行逐台结果表 |
@@ -237,10 +235,19 @@ ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
 | Workbench 会话 | 会话列表 / 关闭单会话 / 关闭全部(排障与资源回收) |
 | 操作时间线 | 本次会话面板内所有操作留痕 |
 
-面板直连**本机** Workbench CLI(同源路由 `/dsh-workbench-ecs/rpc`, 由 `lib/index.js` 注册),
-不经过 Agent/LLM——因此远程命令的破坏性守卫为「拒绝优先」(要审批放行请走 Agent 的 `ecs_exec` 工具)。
+面板直连**本机** Workbench CLI(同源路由 `/dsh-workbench-ecs/rpc`, 由 `lib/index.js` 注册), 不经过 Agent/LLM——因此远程命令的破坏性守卫为「拒绝优先」(要审批放行请走 Agent 的 `ecs_exec` 工具)。界面自动适配深/浅色主题。
 
-> 界面自动适配深/浅色主题; 本地开发可用 `install-local.ps1` 以 junction 链接实时生效。
+## 工作原理
+
+本包是 DSH **静态双半插件**, 以 **bundle 层** 编入 DSH web profile 组合:
+
+| 半 | 文件 | 职责 |
+|---|---|---|
+| Host 半(Node) | `lib/index.js` | 通过 `tools` 注册 7 个模型工具; 通过 `webServer` 注册同源路由 `/dsh-workbench-ecs/health` 与 `/dsh-workbench-ecs/rpc`; 设置页 RPC 经 `subprocess` 执行本机 CLI(共享 `lib/common.js` / `lib/settings-api.js`) |
+| 浏览器半 | `lib/client.js` | 单文件 client bundle(`window.__ModuleLoader__` 工厂形式): 注册「Workbench ECS」设置页标签, 经同源 RPC 路由与 Host 通信 |
+| 组合层 | `cordis.patch.yml` | `dsh.bundle` patch: 把插件行插入 profile 组合 —— `dsh web` 启动即生效, 由 `dsh plugin --profile web add` 自动装载 |
+
+两端零构建: `lib/client.js` 为手写单文件 bundle, 无需打包器; 同一套 `lib/` 源码也可临时挂载为动态 body(`npm run build:body`)。
 
 ## 工具参考
 

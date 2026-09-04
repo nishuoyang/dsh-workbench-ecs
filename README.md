@@ -1,21 +1,18 @@
 # dsh-workbench-ecs
 
-English | [中文](./README.zh.md)
+> v0.3.3 · MIT License
 
-> A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (Cordis) plugin that lets the Agent control remote Alibaba Cloud ECS instances through the local Workbench CLI.
+English | [中文](README.zh.md)
 
-## Why this plugin
-
-Development and production environments differ, and production-only bugs are often impossible to reproduce locally. The traditional debugging loop is painful: a human logs into the server, copies commands back and forth, and pastes results to the Agent again and again.
-
-This plugin gives the **Agent the ability to reach production instances on its own**: through tool calls it executes the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances) locally, covering instance listing, remote command execution, file transfer, one-shot diagnostics, guarded deployment, and session management — the complete loop of *detect → locate → fix → upload → restart → verify*, with no manual copy-paste of commands or results.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (Cordis) plugin that drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances) locally to control ECS instances. Ships **7 agent-native tools** — `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session` — covering the full *list → diagnose → execute → upload → restart → verify* loop, plus a **visual settings panel** (CLI status, instance browser, guarded deploy wizard, sessions, operation timeline). Instances are reached through the Workbench backend channel, so **no public IP is needed**; destructive commands go through the Harness approval guard and are rejected unless explicitly allowed (fail closed).
 
 ## Features
 
 - **7 Agent-native tools**: `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, integrated with the Harness tool pipeline
+- **Visual settings panel** (v0.3.0+): CLI status with 20s host cache + instant local render, instance browser (search / batch / 30s auto-refresh), one-click diagnostics with disk & memory gauges, guarded publish wizard with templates, session management, operation timeline — auto-adapts to light/dark themes
 - **Real API calls**: tools run the local `workbench` command and reach instances through the Alibaba Cloud Workbench backend (works for instances **without public IPs**)
 - **JSON parsing + readable rendering**: parses CLI JSON output into tables/text/terminal cards; CLI-level errors (`{code, message}`) become readable messages
-- **Safety guard**: destructive commands (`rm -rf`, `shutdown`, `reboot`, `mkfs`, `dd`, …) request confirmation through the Harness approval service; anything not `allowed-once` is rejected (fail closed)
+- **Safety guard**: destructive commands (`rm -rf`, `shutdown`, `reboot`, `mkfs`, `dd`, `iptables -F/-X`, …) request confirmation through the Harness approval service; anything not `allowed-once` is rejected (fail closed)
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (serial; per-instance failures do not stop others)
 - **Large-output spill**: oversized stdout spills to disk with the full path returned, so log triage never loses the head
@@ -24,11 +21,40 @@ This plugin gives the **Agent the ability to reach production instances on its o
 
 ## Installation
 
-### 1. DeepSeek Harness (required)
+### Prerequisites
 
-This is a standard [Cordis](https://github.com/cordiverse/cordis) plugin and must run inside DeepSeek Harness (or a compatible Cordis runtime).
+- Node.js ≥ 20 with a running DeepSeek Harness `dsh web`;
+- The official Workbench CLI installed and authenticated **on the same machine** (see [Before first use](#before-first-use) below).
 
-### 2. Install the Workbench CLI (required)
+### Install via the official dsh command
+
+```bash
+dsh plugin --profile web add dsh-workbench-ecs
+```
+
+That's it — the bundle layer inserts the plugin row into the web profile: the 7 tools become visible to the Agent and a **"Workbench ECS"** tab appears in the harness settings (gear icon). Restart `dsh web` when hot reload is unavailable.
+
+> For local development from a checkout, link the repo instead:
+> `dsh plugin --profile web add link:<absolute-path-to-repo>` — subsequent `lib/client.js` edits apply after a plain page refresh (no server restart).
+
+### Verify
+
+```bash
+curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.3"}
+```
+
+Then ask the Agent:
+
+```text
+ecs_list { region: "cn-shanghai" }
+ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
+ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
+```
+
+### Before first use: Workbench CLI & credentials
+
+#### Install the Workbench CLI (required)
 
 | Platform | Command |
 |---|---|
@@ -43,7 +69,7 @@ workbench version     # should print version / commit / build date
 
 > ⚠️ **Windows note**: if you installed the CLI *after* the Harness process started, the host process's inherited `PATH` is stale and `workbench` will not resolve on its own. The plugin includes a fallback scan of common install locations, so it usually works without a restart; if it still fails, restart the Harness session or add the install directory (e.g. `C:\Program Files\workbench`) to `PATH`.
 
-### 3. Configure credentials
+#### Configure credentials
 
 The Workbench CLI stores credentials in `~/.workbench/config.json` (must be mode `0600`). Five authentication modes are supported; edit the file directly (avoid interactive `workbench config`):
 
@@ -147,7 +173,7 @@ workbench config get                      # show the current profile details (JS
 workbench config delete --profile old     # delete a profile (cannot delete the active one)
 ```
 
-### 4. Minimum RAM policy (recommended)
+#### Minimum RAM policy (recommended)
 
 Attach the following minimum policy to the RAM user/role that runs the CLI:
 
@@ -182,53 +208,22 @@ To restrict to specific instances, replace `"Resource": "*"` with:
 - `ecs-workbench:LoginECSInstance`: `acs:ecs:<region>:<account-id>:ecs/<instance-id>`
 - `ecs` actions: `acs:ecs:<region>:<account-id>:instance/<instance-id>`
 
-### 5. Install this plugin
+#### Manual install (advanced)
 
-**Option A — add a plugin row to your Cordis composition (cordis.yml / cordis.patch.yml):**
+Add the plugin row to your Cordis composition instead (cordis.yml / cordis.patch.yml):
 
 ```yaml
 - id: dsh-workbench-ecs
   name: dsh-workbench-ecs
 ```
 
-**Option B — use the Harness plugin manager (recommended; also enables the settings UI):**
+Note: the browser settings panel is only wired up by the `dsh` command (which uses the package's `dsh.bundle` layer and `dsh.client` declarations).
 
-```bash
-# web profile: tools + visual settings panel in one shot (ships its own cordis.patch.yml bundle layer)
-dsh plugin --profile web add dsh-workbench-ecs
-```
+#### Local development from a checkout
 
-Restart `dsh web` after installing (or just refresh the page on deployments with hot reload);
-the 7 registered tools become visible to the Agent.
+Use [`scripts/install-local.ps1`](./scripts/install-local.ps1) to link the repo into `%DSH_HOME%` with a junction and write the plugin row for you (`install` / `status` / `uninstall`) — edits apply on the next patch reload or `dsh web` restart.
 
-> Since **v0.3.0** the package also ships a browser settings panel (see "Settings UI" below):
-> `exports["./client"]` plus the `dsh.client` declaration are picked up automatically by the
-> DSH client module system — no extra wiring needed.
-
-### 6. Verify the installation
-
-```bash
-# Manually verify the CLI (run on the machine that has Workbench CLI installed):
-workbench list ecs --region cn-hangzhou --output json
-workbench exec --instance-id i-bp1xxxxx --command "df -h" --output json
-
-# Verify the settings RPC route (requires the bundle row to be mounted):
-curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.2"}
-```
-
-Then ask the Agent:
-
-```text
-ecs_list { region: "cn-shanghai" }
-ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
-ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
-```
-
-### 7. Settings UI (visual panel, v0.3.0+)
-
-Once the bundle is installed, open the Harness settings (gear icon) and you will find a
-**"Workbench ECS"** tab:
+## Settings panel
 
 | Area | Capabilities |
 |---|---|
@@ -240,13 +235,19 @@ Once the bundle is installed, open the Harness settings (gear icon) and you will
 | Workbench sessions | session list / close one / close all (troubleshooting & resource reclamation) |
 | Operation timeline | every panel action is logged for the current session |
 
-The panel talks to the **local** Workbench CLI through a same-origin route
-(`/dsh-workbench-ecs/rpc`, registered by `lib/index.js`) — no LLM/Agent in the loop,
-so the destructive-command guard is **deny-first** (for approval-gated execution use the
-Agent's `ecs_exec` tool instead).
+The panel talks to the **local** Workbench CLI through a same-origin route (`/dsh-workbench-ecs/rpc`, registered by `lib/index.js`) — no LLM/Agent in the loop, so the destructive-command guard is **deny-first** (for approval-gated execution use the Agent's `ecs_exec` tool instead). The UI auto-adapts to light/dark themes.
 
-> The UI auto-adapts to light/dark themes; for local development use `install-local.ps1`
-> to link the checkout with a junction and iterate live.
+## How it works
+
+This package is a DSH **static two-half plugin**, composed into the DSH web profile as a **bundle layer**:
+
+| Half | File | Responsibility |
+|---|---|---|
+| Host half (Node) | `lib/index.js` | Registers the 7 model tools with `tools`, and same-origin routes `/dsh-workbench-ecs/health` & `/dsh-workbench-ecs/rpc` with `webServer`; the settings RPC runs the local CLI through `subprocess` (shared `lib/common.js` / `lib/settings-api.js`) |
+| Browser half | `lib/client.js` | Single-file client bundle (`window.__ModuleLoader__` factory form): registers the "Workbench ECS" settings tab and talks to the host over the same-origin RPC route |
+| Composition | `cordis.patch.yml` | `dsh.bundle` patch: inserts the plugin row into the profile composition — active on `dsh web` startup, picked up automatically by `dsh plugin --profile web add` |
+
+Zero build on both ends: `lib/client.js` is a hand-written single-file bundle, no bundler required; the same `lib/` sources can also be mounted as a temporary dynamic body (`npm run build:body`).
 
 ## Tools reference
 
