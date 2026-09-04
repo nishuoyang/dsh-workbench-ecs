@@ -1,17 +1,21 @@
 # ============================================================================
-# scripts/install-local.ps1 —— dsh-workbench-ecs 本地开发安装 (junction 实时生效)
+# scripts/install-local.ps1 -- dsh-workbench-ecs local dev install (junction)
 # ----------------------------------------------------------------------------
-# 用法:  在仓库根目录执行
+# Usage (run from the repo root):
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1        (install)
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 status
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall
 #
-# 安装 = ① 在 %DSH_HOME%\node_modules 下创建指向本仓库的 junction (与 DSH 的
-#         ESM 解析链一致) ② 把插件行写进 profiles/*/cordis.patch.yml (用户
-#         自有补丁层, 支持热重载)。幂等可逆, 仅涉及 %DSH_HOME% 与本仓库。
+# install = (1) create a junction at %DSH_HOME%\node_modules\dsh-workbench-ecs
+# pointing at this repo (matches the DSH ESM resolution chain),
+#           (2) insert the plugin row into profiles/*/cordis.patch.yml (the
+# user patch layer, hot-reloadable). Idempotent & reversible; touches only
+# %DSH_HOME% and this repo.
 #
-# 完成后: 刷新页面即可看到「设置 → Workbench ECS」标签; 若刷新后无效果,
-# 重启 dsh web (Ctrl+C 后重新运行 dsh web)。
+# After install: refresh the settings page (or restart `dsh web` when hot
+# reload is unavailable).
+# NOTE: keep this file ASCII-only (Windows PowerShell 5.1 parses ANSI; use
+# install-local.mjs-style scripts for non-ASCII output).
 # ============================================================================
 param([string]$Command = 'install')
 
@@ -23,16 +27,16 @@ $rowName = 'dsh-workbench-ecs'
 $patchBlock = @(
   '- insert:',
   '    # dsh-workbench-ecs (managed-by: install-local.ps1)',
-  '    # 设置页 Workbench ECS + 7 个 ECS 工具; 随 dsh web 启动即生效。',
+  '    # Settings panel "Workbench ECS" + 7 ECS tools; applies at dsh web start.',
   '    - id: workbench-ecs',
-  "      name: $rowName",
+  "      name: $rowName"
 )
 $templateLines = @(
   '# Your patch layer for this dsh profile, applied after every bundle layer:',
   '# a top-level YAML array of loader patch entries (id-targeted config',
   '# overrides, disables, and insert lists; `!!js` expressions allowed).',
   '[]',
-  '',
+  ''
 )
 
 function Get-ProfilePatchPaths {
@@ -57,39 +61,47 @@ function Get-LinkState {
 
 function Invoke-EnsureLink {
   $state = Get-LinkState
-  if ($state -eq "link:$repo") { Write-Host "[link] 已存在 junction: $linkPath"; return $true }
-  if ($state -ne 'absent') { Write-Error "[link] $linkPath 已被非本插件的其它内容占用 ($state), 请手动处理"; return $false }
+  if ($state -eq "link:$repo") { Write-Host "[link] junction already present: $linkPath"; return $true }
+  if ($state -ne 'absent') { Write-Error "[link] $linkPath is occupied by foreign content ($state); fix manually"; return $false }
   New-Item -ItemType Junction -Path $linkPath -Target $repo -Force | Out-Null
-  Write-Host "[link] 已创建 junction: $linkPath -> $repo"
+  Write-Host "[link] created junction: $linkPath -> $repo"
   return $true
 }
 
 function Invoke-RemoveLink {
   $state = Get-LinkState
-  if ($state -eq 'absent') { Write-Host "[link] 无链接可移除"; return }
+  if ($state -eq 'absent') { Write-Host "[link] nothing to remove"; return }
   if ($state -eq "link:$repo") {
     Remove-Item $linkPath -Force -Recurse
-    Write-Host "[link] 已移除 $linkPath"
+    Write-Host "[link] removed $linkPath"
   } else {
-    Write-Warning "[link] $linkPath 不属于本插件 ($state), 未动它"
+    Write-Warning "[link] $linkPath does not belong to this plugin ($state); left untouched"
   }
 }
 
 function Test-RowPresent([string]$text) { return $text -match "name:\s*$rowName" }
 
+function Write-TextFile([string]$path, [string]$text) {
+  # UTF-8 without BOM (compatible with Windows PowerShell 5.1)
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($path, $text, $enc)
+}
+
 function Invoke-WritePatch([string]$path) {
   $content = Get-Content $path -Raw -ErrorAction SilentlyContinue
-  if ($null -eq $content) { Write-Error "[patch] 无法读取 $path"; return $false }
-  if (Test-RowPresent $content) { Write-Host "[patch] $path 已包含插件行"; return $true }
+  if ($null -eq $content) { Write-Error "[patch] cannot read $path"; return $false }
+  if (Test-RowPresent $content) { Write-Host "[patch] $path already contains the row"; return $true }
   $blockText = ($patchBlock -join "`n") + "`n`n"
-  if ($content -match '^\[\]\s*$') {
-    # 模板态 (仅注释 + 空数组): 替换为插入块
-    $next = $content -replace '^\[\]\s*$', $blockText.TrimEnd("`n")
+  if ($content -match '(?m)^\[\]\s*$') {
+    # template state (comments + empty array): replace the empty array line
+    # with the insert block (must NOT leave a bare [] next to the block —
+    # that combination is invalid YAML and would break the profile boot)
+    $next = $content -replace '(?m)^\[\]\s*$', $blockText.TrimEnd("`n")
   } else {
     $next = $content.TrimEnd("`n") + "`n" + $blockText
   }
-  Set-Content -Path $path -Value $next -Encoding utf8NoBOM
-  Write-Host "[patch] 已写入 $path"
+  Write-TextFile $path $next
+  Write-Host "[patch] wrote $path"
   return $true
 }
 
@@ -110,7 +122,7 @@ function Invoke-RemovePatch([string]$path) {
       }
       if (($block -join "`n") -match $rowName) {
         $i = $j
-        continue   # 跳过整块 (已删除)
+        continue   # skip whole block (removed)
       }
       foreach ($b in $block) { $out.Add($b) }
       $i = $j
@@ -120,15 +132,16 @@ function Invoke-RemovePatch([string]$path) {
     $i++
   }
   $body = ($out -join "`n").Trim()
-  # 只剩注释/空白时恢复模板 [] (DSH 要求补丁层是合法 YAML 数组, 否则启动失败)
+  # Only comments/whitespace left: restore the template [] (DSH requires a
+  # valid YAML array here, otherwise the profile fails to boot).
   $meaningful = $body -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }
   if ($meaningful.Count -eq 0) {
-    Set-Content -Path $path -Value ($templateLines -join "`n") -Encoding utf8NoBOM
-    Write-Host "[patch] $path 已恢复为模板 []"
+    Write-TextFile $path ($templateLines -join "`n")
+    Write-Host "[patch] $path restored to template []"
     return
   }
-  Set-Content -Path $path -Value ($body + "`n") -Encoding utf8NoBOM
-  Write-Host "[patch] 已从 $path 移除插件行"
+  Write-TextFile $path ($body + "`n")
+  Write-Host "[patch] removed the row from $path"
 }
 
 switch ($Command.ToLower()) {
@@ -136,37 +149,37 @@ switch ($Command.ToLower()) {
     if (-not (Invoke-EnsureLink)) { exit 1 }
     $paths = Get-ProfilePatchPaths
     if ($paths.Count -eq 0) {
-      Write-Error '[patch] 找不到 profiles/*/cordis.patch.yml; 请先运行一次 dsh web 生成 profile, 或手动添加插件行'
+      Write-Error '[patch] no profiles/*/cordis.patch.yml found; run `dsh web` once to generate the profile, or add the row manually'
       exit 1
     }
     $any = $false
     foreach ($p in $paths) { if (Invoke-WritePatch $p) { $any = $true } }
     if (-not $any) { exit 1 }
     Write-Host ''
-    Write-Host '安装完成。接下来:'
-    Write-Host '  1. 刷新页面 (热重载) 或在无热重载时重启 dsh web'
-    Write-Host '  2. 设置(齿轮) → Workbench ECS 使用面板'
-    Write-Host '  3. 当前会话可用工具: ecs_list / ecs_exec / ecs_upload / ecs_download / ecs_diagnose / ecs_deploy / ecs_session'
+    Write-Host 'Install done. Next:'
+    Write-Host '  1. Refresh the settings page (hot reload) or restart dsh web'
+    Write-Host '  2. Open Settings(gear) -> Workbench ECS tab'
+    Write-Host '  3. Session tools: ecs_list / ecs_exec / ecs_upload / ecs_download / ecs_diagnose / ecs_deploy / ecs_session'
   }
   'status' {
     Write-Host "DSH_HOME: $dshHome"
     Write-Host "repo:     $repo"
     Write-Host "link:     $linkPath -> $(Get-LinkState)"
     foreach ($p in Get-ProfilePatchPaths) {
-      $has = if (Test-RowPresent ((Get-Content $p -Raw))) { '已安装' } else { '未安装' }
+      $has = if (Test-RowPresent ((Get-Content $p -Raw))) { 'installed' } else { 'absent' }
       Write-Host "patch:    $p -> $has"
     }
     Write-Host ''
-    Write-Host '安装: powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1'
-    Write-Host '卸载: powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall'
+    Write-Host 'Install: powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1'
+    Write-Host 'Uninstall: powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall'
   }
   'uninstall' {
     foreach ($p in Get-ProfilePatchPaths) { Invoke-RemovePatch $p }
     Invoke-RemoveLink
-    Write-Host '若还通过 dsh plugin --profile web add 安装过, 再执行: dsh plugin --profile web remove dsh-workbench-ecs'
+    Write-Host 'If it was also installed via `dsh plugin --profile web add`, run: dsh plugin --profile web remove dsh-workbench-ecs'
   }
   default {
-    Write-Error "未知命令: $Command (可用: install / status / uninstall)"
+    Write-Error "unknown command: $Command (available: install / status / uninstall)"
     exit 1
   }
 }
