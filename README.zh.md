@@ -1,8 +1,8 @@
 # dsh-workbench-ecs
 
-> 阿里云 Workbench CLI 包装插件 —— 让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 直接控制远程 ECS 实例。
+[English](./README.md) | 中文
 
-[英文 README](./README.md) | 中文 README
+> 阿里云 Workbench CLI 包装插件 —— 让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 直接控制远程 ECS 实例。
 
 ## 为什么做这个插件
 

@@ -1,8 +1,8 @@
 # dsh-workbench-ecs
 
-> A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (Cordis) plugin that lets the Agent control remote Alibaba Cloud ECS instances through the local Workbench CLI.
+English | [中文](./README.zh.md)
 
-[English README](./README.md) | [中文 README](./README.zh.md)
+> A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (Cordis) plugin that lets the Agent control remote Alibaba Cloud ECS instances through the local Workbench CLI.
 
 ## Why this plugin
 
