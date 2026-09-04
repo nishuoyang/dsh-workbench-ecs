@@ -212,7 +212,7 @@ workbench exec --instance-id i-bp1xxxxx --command "df -h" --output json
 
 # 验证设置页 RPC 路由(要求插件已作为 bundle 行挂载):
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.0"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.1"}
 ```
 
 然后让 Agent 调用:

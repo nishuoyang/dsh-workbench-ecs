@@ -6,8 +6,7 @@
 //       去除 import/export 外壳, 生成与发布源码同源的单一 body。
 // 用法: node scripts/to-body.mjs [输出路径]
 // ============================================================================
-import { readFileSync, writeFileSync } from 'node:fs'
-import { readdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, readdirSync } from 'node:fs'
 
 const rootUrl = new URL('../', import.meta.url)
 const libUrl = new URL('lib/', rootUrl)
@@ -53,6 +52,7 @@ function compactModule(src) {
 const strip = (s) => stripModule(s)
 const compact = (s) => compactModule(s)
 // 兼容参数: node scripts/to-body.mjs [输出路径] [--tools=t1,t2] (默认打包全部工具)
+// --pretty: 保留注释与空行(仅用于调试 body; 动态挂载载荷用默认紧凑模式)
 const pretty = process.argv.includes('--pretty')
 const toolsArg = process.argv.find((a) => a.startsWith('--tools='))
 const filter = toolsArg !== undefined ? toolsArg.slice('--tools='.length).split(',') : undefined
@@ -73,18 +73,19 @@ function processIndex(src, selected) {
   return src.replace(/const TOOL_FACTORIES = \[[\s\S]*?\]/, 'const TOOL_FACTORIES = [' + defs.join(', ') + ']')
 }
 
+// 紧凑化仅在非 --pretty 模式生效: pretty 用于生成可读 body 调试
 const body = [
   '// 由 scripts/to-body.mjs 从 lib/ 各模块自动生成 — 动态挂载用 host body',
   'const defineTool = harness.defineTool',
   '',
-  compact(strip(commonSrc)),
+  ...(pretty ? [strip(commonSrc)] : [compact(strip(commonSrc))]),
   '',
-  compact(strip(settingsApiSrc)),
+  ...(pretty ? [strip(settingsApiSrc)] : [compact(strip(settingsApiSrc))]),
   '',
   // 注意: selectedTools 是文件名数组, 这里按文件名读取内容后再转换
-  ...selectedTools.map((f) => compact(strip(readFileSync(new URL('tools/' + f, libUrl), 'utf8')))),
+  ...selectedTools.map((f) => (pretty ? strip(readFileSync(new URL('tools/' + f, libUrl), 'utf8')) : compact(strip(readFileSync(new URL('tools/' + f, libUrl), 'utf8'))))),
   '',
-  compact(processIndex(strip(indexSrc), selectedTools)),
+  ...(pretty ? [strip(processIndex(strip(indexSrc), selectedTools))] : [compact(processIndex(strip(indexSrc), selectedTools))]),
   '',
   'return { name, inject, apply }',
   '',

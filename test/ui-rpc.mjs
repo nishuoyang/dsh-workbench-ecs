@@ -13,7 +13,11 @@
 import assert from 'node:assert'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
+import { readFileSync } from 'node:fs'
 import { apply } from '../lib/index.js'
+
+// 版本漂移防护: /health 的 version 必须与发布包 package.json 一致
+const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 
 const CLI = 'C:\\Program Files\\workbench\\workbench.exe'
 const REGION = 'cn-shanghai'
@@ -101,6 +105,7 @@ function ok(label, cond, detail) {
   assert.equal(resp.status, 200, 'health 应返回 200')
   const j = await resp.json()
   ok('health 返回插件标识', j != null && j.ok === true && j.plugin === 'dsh-workbench-ecs', j)
+  ok('health 版本与 package.json 一致', j != null && j.version === pkg.version, j)
 }
 
 // 2. status (真实 CLI)

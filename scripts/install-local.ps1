@@ -72,8 +72,20 @@ function Invoke-RemoveLink {
   $state = Get-LinkState
   if ($state -eq 'absent') { Write-Host "[link] nothing to remove"; return }
   if ($state -eq "link:$repo") {
-    Remove-Item $linkPath -Force -Recurse
-    Write-Host "[link] removed $linkPath"
+    $item = Get-Item $linkPath -Force
+    if ($item.LinkType -eq 'Junction') {
+      # Delete junctions without recursion. On Windows PowerShell 5.1,
+      # Remove-Item -Recurse on a reparse point can delete the *target's*
+      # contents; Directory.Delete(recurse=$false) removes the link itself.
+      [System.IO.Directory]::Delete($linkPath, $false)
+    } else {
+      Remove-Item -LiteralPath $linkPath -Force
+    }
+    if (Test-Path $linkPath) {
+      Write-Warning "[link] $linkPath still exists after removal; remove it manually"
+    } else {
+      Write-Host "[link] removed $linkPath"
+    }
   } else {
     Write-Warning "[link] $linkPath does not belong to this plugin ($state); left untouched"
   }
