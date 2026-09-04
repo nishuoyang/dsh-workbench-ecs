@@ -91,6 +91,7 @@ assert.ok(clientText.includes("require('react')"), 'client.js 应 require react 
 assert.ok(clientText.includes("exports.inject = ['slots']"), 'client.js 应注入 slots')
 assert.ok(clientText.includes("'settings.section'"), 'client.js 应注册设置页 section')
 assert.ok(clientText.includes("/dsh-workbench-ecs/rpc"), 'client.js 应调用同源 RPC 路由')
+assert.ok(clientText.includes('\\biptables\\s+-[FX]\\b'), 'client.js 预检应包含 iptables 规则(与 DANGEROUS_PATTERNS 对齐)')
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 assert.equal(pkg.dsh.client.platform, 'web', 'dsh.client.platform 应为 web')
 assert.equal(pkg.dsh.client.immediately, true, 'dsh.client.immediately 应为 true')

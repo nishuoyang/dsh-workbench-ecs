@@ -214,7 +214,7 @@ workbench exec --instance-id i-bp1xxxxx --command "df -h" --output json
 
 # Verify the settings RPC route (requires the bundle row to be mounted):
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.1"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.2"}
 ```
 
 Then ask the Agent:
