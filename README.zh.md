@@ -8,14 +8,18 @@
 
 开发环境与生产环境不同, 生产环境的 bug 往往无法本地复现。传统排查流程是: 人手动登录服务器 → 复制指令 → 把结果再复制给 Agent → 循环往复, 非常繁琐。
 
-这个插件让 **Agent 自己就有能力连上生产实例**: 通过工具调用, 在本机执行阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances), 完成实例列表查询、远程命令执行、日志查看、进程检查、服务状态排查、代码部署等工作, 全程无需人工复制指令和结果。
+这个插件让 **Agent 自己就有能力连上生产实例**: 通过工具调用, 在本机执行阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances), 完成实例列表查询、远程命令执行、文件传输、一键体检、受控发布、会话管理 —— 覆盖"发现问题 → 定位 → 修复 → 上传 → 重启 → 验证"的完整闭环, 全程无需人工复制指令和结果。
 
 ## 特性
 
-- **Agent 原生工具**: 注册 `ecs_list` / `ecs_exec` 两个模型可见工具, 与 Harness 工具体系无缝集成
+- **7 个 Agent 原生工具**: `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 与 Harness 工具体系无缝集成
 - **真实 API 调用**: 工具执行本机 `workbench` 命令, 经阿里云 Workbench 后端连接实例(支持无公网 IP 的实例)
-- **JSON 解析 + 可读渲染**: 解析 CLI 的 JSON 输出, 渲染为表格/文本, CLI 层错误(`{code, message}`)转成可读报错
-- **健壮的二进制解析**: 按 PATH 解析 `workbench`, 失败时回退常见安装位置(如 `C:\Program Files\workbench\workbench.exe`), 解决宿主进程 PATH 过期问题
+- **JSON 解析 + 可读渲染**: 解析 CLI 的 JSON 输出, 渲染为表格/文本/终端卡片; CLI 层错误(`{code, message}`)转成可读报错
+- **安全守卫**: 破坏性命令(`rm -rf`、`shutdown`、`reboot`、`mkfs`、`dd` 等)自动接入 Harness 审批服务, 未获批准一律拒绝(fail closed)
+- **后台任务**: `ecs_exec` 支持 `run_in_background`, 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止
+- **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(串行, 单台失败不中断), 适合集群排查
+- **大输出 spill**: stdout 超限自动落盘并返回完整输出路径, 日志排查不再截断丢头
+- **健壮二进制解析**: 按 PATH 解析 `workbench`, 失败时回退常见安装位置(如 `C:\Program Files\workbench\workbench.exe`), 解决宿主进程 PATH 过期问题
 - **取消支持**: 工具调用被取消时自动终止进程树(SIGTERM → SIGKILL), 不留孤儿进程
 
 ## 安装
@@ -119,10 +123,19 @@ Workbench CLI 的凭据存储在 `~/.workbench/config.json`(权限要求 `0600`)
 }
 ```
 
-设置文件权限(仅 Linux/macOS 需要, Windows 确保文件不被其他用户读取):
+设置文件权限(仅 Linux/macOS 需要; Windows 确保文件不被其他用户读取):
 
 ```bash
 chmod 600 ~/.workbench/config.json
+```
+
+**一键配置脚本(Windows):** 仓库提供 [`scripts/workbench-setup.ps1`](./scripts/workbench-setup.ps1), 支持全部 5 种模式与非交互式多 profile:
+
+```powershell
+# AK 模式
+./scripts/workbench-setup.ps1 -AccessKeyId LTAIxxx -AccessKeySecret xxx
+# RamRoleArn 模式(生产推荐) + 多个 profile
+./scripts/workbench-setup.ps1 -Mode RamRoleArn -Profile prod -AccessKeyId LTAIxxx -AccessKeySecret xxx -RamRoleArn acs:ram::123456789:role/WorkbenchRole -AutoSwitch
 ```
 
 **多 profile 管理(非交互):**
@@ -184,7 +197,7 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 dsh plugin add dsh-workbench-ecs
 ```
 
-安装后重启 Harness, 插件注册的 `ecs_list` / `ecs_exec` 工具即对 Agent 可见。
+安装后重启 Harness, 插件注册的 7 个工具即对 Agent 可见。
 
 ### 6. 验证安装
 
@@ -199,13 +212,14 @@ workbench exec --instance-id i-bp1xxxxx --command "df -h" --output json
 ```text
 ecs_list { region: "cn-shanghai" }
 ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
+ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
 ```
 
 ## 工具参考
 
 ### `ecs_list` —— 列出指定地域的 ECS 实例
 
-对应 CLI: `workbench list ecs --region <region> [过滤项...] --output json`
+CLI 对应: `workbench list ecs --region <region> [过滤项...] --output json`
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -216,37 +230,118 @@ ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
 | `instance_name` | string | | 按实例名称过滤, 支持 `*` 通配符 |
 | `limit` | integer | | 每页数量 10–100, 默认 50(ECS API 页大小下限为 10) |
 
-返回: `{ command, region, count, instances: [{ instance_id, instance_name, instance_type, region_id, status, private_ip, public_ip, os_type, image_id, tags }] }`, 渲染为文本表格。
+返回实例清单(实例ID为其它工具的输入), 渲染为文本表格。
 
-### `ecs_exec` —— 在指定实例上执行远程命令
+### `ecs_exec` —— 在指定实例上执行远程命令(增强版)
 
-对应 CLI: `workbench exec --instance-id <id> --command <cmd> [--timeout <s>] --output json`
+CLI 对应: `workbench exec --instance-id <id> --command <cmd> [--timeout <s>] --output json`
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `instance_id` | string | ✅ | 目标实例 ID(可由 `ecs_list` 取得) |
+| `instance_id` | string | | 目标实例 ID(与 `instance_ids` 二选一) |
+| `instance_ids` | array\<string\> | | 批量目标(串行, 最多 20 台, 单台失败不中断) |
 | `command` | string | ✅ | 远程命令; 需要共享上下文时用 `&&` 或 `;` 串联 |
 | `timeout` | integer | | 命令超时(秒), 默认 30 |
 | `region` | string | | 地域, 可缺省(CLI 从实例 ID 自动推断) |
+| `run_in_background` | boolean | | 后台执行长命令: 立即返回 `job_id`, `job_output` 增量读取(不适用于批量) |
 
-返回: `{ instance_id, command, exit_code, output, stderr, stdout_truncated, command_line }`, 渲染为文本(输出 + stderr 段 + 退出码)。
+返回 `{ kind: single|batch|background, ... }`。
 
-> **安全提示**: `ecs_exec` 是非交互执行器, 每次调用是独立 shell 上下文。破坏性命令(`rm -rf`、`shutdown`、`reboot`、`mkfs`、`dd`、服务停止/重启等)执行前应先征得用户确认 —— 插件文档与工具描述中均会向模型强调这一点。
+### `ecs_upload` —— 上传本地文件到实例
 
-## 典型用法(生产排障)
+CLI 对应: `workbench upload <local-file> <remote-path> --instance-id <id> [--force]`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `local_file` | string | ✅ | 本地文件路径(相对路径基于会话工作区) |
+| `remote_path` | string | ✅ | 远端目标路径(文件或目录) |
+| `instance_id` | string | ✅ | 目标实例 ID |
+| `region` | string | | 地域, 可缺省 |
+| `force` | boolean | | 覆盖远端已存在文件而不需确认(默认 false) |
+
+经阿里云 OSS 中继传输(最大 1GB)。搭配 `ecs_deploy` / `ecs_exec` 完成发布。
+
+### `ecs_download` —— 从实例下载文件到本地
+
+CLI 对应: `workbench download <remote-path> [local-path] --instance-id <id> [--force]`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `remote_path` | string | ✅ | 远端文件路径 |
+| `local_path` | string | | 本地保存路径(文件或目录, 相对会话工作区; 省略=当前目录) |
+| `instance_id` | string | ✅ | 目标实例 ID |
+| `region` | string | | 地域, 可缺省 |
+| `force` | boolean | | 覆盖本地已存在文件而不需确认(默认 false) |
+
+**典型场景**: 把生产日志/配置文件拉回本地分析。
+
+### `ecs_diagnose` —— 一键只读体检
+
+CLI 对应: 一次远程 `exec`(分号串联的只读命令集)
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `instance_id` | string | ✅ | 目标实例 ID |
+| `region` | string | | 地域, 可缺省 |
+| `extra_command` | string | | 追加的自定义只读命令(会被安全守卫检查) |
+| `timeout` | integer | | 超时(秒), 默认 120 |
+
+内置 7 段: 主机信息 / 负载与运行时长 / 内存 / 磁盘 / 运行服务与容器(docker ps)/ 内存 TOP 进程 / 监听端口。**生产排障的起始动作** —— 一个工具代替一串命令。
+
+### `ecs_deploy` —— 受控发布(上传 + 重启 + 健康检查)
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `instance_id` | string | ✅ | 目标实例 ID |
+| `command` | string | ✅ | 重启/生效命令, 如 `docker compose restart` |
+| `local_file` | string | | 可选: 要上传的本地文件 |
+| `remote_path` | string | | 可选: 上传目标远端路径(local_file 提供时必填) |
+| `health_check` | string | | 可选: 健康检查命令, 如 `curl -fsS http://127.0.0.1/health \|\| true` |
+| `region` / `force` / `timeout` | | | 同前 |
+
+三段流程结果全部返回(任一失败不中断后续阶段): 上传 → 重启 → 健康检查。**"改代码 → 上传 → 重启 → 验证"的完整修复闭环**。
+
+### `ecs_session` —— 会话管理
+
+CLI 对应: `workbench session list` / `workbench session close <id>` / `--all`
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `action` | string | ✅ | `list` 查看活动会话; `close` 关闭会话 |
+| `session_id` | string | | 要关闭的会话 ID(close 时使用) |
+| `all` | boolean | | 关闭全部会话(close 时使用) |
+
+一般无需手动管理(会话自动管理), 用于排障与资源回收。
+
+## 安全机制
+
+- **破坏性命令守卫**: `ecs_exec` / `ecs_deploy`(重启命令与健康检查)执行前扫描命令, 命中 `rm -rf`、`shutdown`/`poweroff`/`reboot`/`halt`、`mkfs`、`dd`、`init 0/6`、`systemctl stop/disable/mask`、`service stop`、`iptables -F/-X`、`userdel`/`groupdel` 等模式时, 接入 Harness `approval` 服务请求确认; 未获 `allowed-once`(或无审批服务/政策为 never)一律拒绝执行(fail closed)。
+- **只读体检**: `ecs_diagnose` 内置命令均为只读; 自定义命令同样过守卫。
+- **文件传输确认**: `ecs_upload`/`ecs_download` 默认对已存在文件要求确认, `force=true` 才覆盖。
+- **凭据安全**: 凭据只存在本机 `~/.workbench/config.json`(0600), 建议用 RamRoleArn/CredentialsCmd/CredentialsURI 模式而非长期 AK。
+
+## 典型用法(生产修复闭环)
 
 ```text
 # 1. 找到实例
 ecs_list { region: "cn-shanghai", status: "Running" }
 
-# 2. 查看服务状态
-ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "systemctl status nginx" }
+# 2. 一键体检定位问题
+ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
 
-# 3. 查看日志(单次调用内共享上下文)
+# 3. 看日志
 ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "cd /var/log/nginx && tail -n 100 error.log" }
 
-# 4. 排查磁盘/内存
-ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h && free -m" }
+# 4. 修改代码后受控发布(上传 + 重启 + 健康检查)
+ecs_deploy {
+  instance_id: "i-uf66ct2o35p7fjcd0sru",
+  local_file: "./app.jar", remote_path: "/opt/app/app.jar",
+  command: "docker compose -f /opt/app/docker-compose.yml restart app",
+  health_check: "curl -fsS http://127.0.0.1:3000/health || true"
+}
+
+# 5. 长任务后台执行
+ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "npm run build", run_in_background: true }
 ```
 
 ## 故障排查
@@ -275,6 +370,7 @@ ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h && free -m" }
 | `network timeout` (code 5) | 检查到 `*.aliyuncs.com` 的网络与安全组规则 |
 | 找不到实例 (code 1) | 核对实例 ID 与地域, 用 `ecs_list` 确认 |
 | 无公网 IP 的实例连不上 | 本插件走 Workbench 后端通道, 无需公网 IP; 确认实例安装了云助手(cloud assistant) |
+| `破坏性命令未获批准` | 这是安全守卫的正常行为: 需要用户(或审批方)明确放行 |
 
 ### 插件报错格式示例
 
@@ -286,13 +382,16 @@ ecs_exec: workbench CLI 错误 (code 1): session resolve: login instance: SDKErr
 
 ```bash
 npm install          # 安装 devDependencies(@deepseek-ai/dsh-tools)
-npm test             # 冒烟测试: 校验模块导出 + 工具注册契约
-npm run build:body   # 生成动态挂载用 body(test/body.generated.js, 与 lib/index.js 同源)
+npm test             # 冒烟测试: 模块导出 + 7 工具注册契约 + body 一致性
+npm run test:e2e     # 真实 CLI 端到端测试(需要本机 Workbench CLI + 有效凭据 + 可达实例)
+npm run build:body   # 生成动态挂载用 body(与 lib/ 同源)
 ```
 
-- 源码: [`lib/index.js`](./lib/index.js) —— 标准 Cordis 插件(`export { name, inject, apply }`)
+- 源码结构: `lib/common.js`(共享层) · `lib/tools/*.js`(每工具一个模块) · `lib/index.js`(入口)
 - 动态挂载(临时会话): `npm run build:body` 后把生成的 body 用于 `cordis_define` 的 `code.host`
-- 结构: `lib/`(发布物) · `test/`(冒烟) · `scripts/`(构建辅助)
+- CI: [GitHub Actions](./.github/workflows/ci.yml) —— push/PR 跑测试, `v*` tag 自动发布 npm(需 `NPM_TOKEN` secret)
+- 类型声明: [`lib/types/index.d.ts`](./lib/types/index.d.ts)
+- 一键配置脚本: [`scripts/workbench-setup.ps1`](./scripts/workbench-setup.ps1)
 
 ## License
 
