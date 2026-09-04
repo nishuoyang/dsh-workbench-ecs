@@ -184,20 +184,24 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 
 ### 5. 安装本插件
 
-**方式 A —— 作为插件行加入 Cordis 组合(cordis.yml):**
+**方式 A —— 作为插件行加入 Cordis 组合(cordis.yml / cordis.patch.yml):**
 
 ```yaml
 - id: dsh-workbench-ecs
   name: dsh-workbench-ecs
 ```
 
-**方式 B —— 使用 Harness 的插件管理命令:**
+**方式 B —— 使用 Harness 的插件管理命令(推荐, 同时启用设置页):**
 
 ```bash
-dsh plugin add dsh-workbench-ecs
+# web profile: 工具 + 可视化设置页一次性安装(包自带 cordis.patch.yml bundle 层)
+dsh plugin --profile web add dsh-workbench-ecs
 ```
 
-安装后重启 Harness, 插件注册的 7 个工具即对 Agent 可见。
+安装后**重启 dsh web**(或在支持热重载的部署中刷新页面), 插件注册的 7 个工具即对 Agent 可见。
+
+> 本包从 **v0.3.0** 起同时提供浏览器端设置页(见下文「设置页面」):
+> `exports["./client"]` + `dsh.client` 由 DSH 客户端模块系统自动装载, 无需额外配置。
 
 ### 6. 验证安装
 
@@ -205,6 +209,10 @@ dsh plugin add dsh-workbench-ecs
 # 手工验证 CLI 本身可用(在安装了 Workbench CLI 的本机执行):
 workbench list ecs --region cn-hangzhou --output json
 workbench exec --instance-id i-bp1xxxxx --command "df -h" --output json
+
+# 验证设置页 RPC 路由(要求插件已作为 bundle 行挂载):
+curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.0"}
 ```
 
 然后让 Agent 调用:
@@ -214,6 +222,25 @@ ecs_list { region: "cn-shanghai" }
 ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
 ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
 ```
+
+### 7. 设置页面(可视化面板, v0.3.0+)
+
+安装 bundle 后, 打开 Harness 设置(齿轮图标)即出现 **「Workbench ECS」** 标签页:
+
+| 区域 | 能力 |
+|---|---|
+| CLI 状态 | Workbench CLI 可用性 / 版本 / 凭据 Profile / Daemon; **20 秒缓存 + 本地秒显**(点击面板即时渲染, 后台静默刷新; [刷新] 强制重查) |
+| ECS 实例 | 地域/状态筛选 + 名称/ID 搜索 + 状态分布条 + 复选框(批量执行) + **30s 自动刷新** |
+| 实例行操作 | [执行] 选中目标 / [诊断] 一键体检(磁盘·内存仪表盘) / [发布] 受控发布向导 / [详情] 属性 + 最近日志 |
+| 远程命令 | 命令历史(datalist)、破坏性命令两次点击确认(Host 端仍二次拦截); 批量执行逐台结果表 |
+| 受控发布 | 上传本地文件(OSS 中继 ≤1GB) + 重启/生效命令 + 健康检查, 三阶段进度; 可保存/复用模板 |
+| Workbench 会话 | 会话列表 / 关闭单会话 / 关闭全部(排障与资源回收) |
+| 操作时间线 | 本次会话面板内所有操作留痕 |
+
+面板直连**本机** Workbench CLI(同源路由 `/dsh-workbench-ecs/rpc`, 由 `lib/index.js` 注册),
+不经过 Agent/LLM——因此远程命令的破坏性守卫为「拒绝优先」(要审批放行请走 Agent 的 `ecs_exec` 工具)。
+
+> 界面自动适配深/浅色主题; 本地开发可用 `install-local.ps1` 以 junction 链接实时生效。
 
 ## 工具参考
 

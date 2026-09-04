@@ -12,8 +12,9 @@ import { readdirSync } from 'node:fs'
 const rootUrl = new URL('../', import.meta.url)
 const libUrl = new URL('lib/', rootUrl)
 
-// 模块顺序: common 先(被引用), tools 次, index 最后
+// 模块顺序: common 先(被引用), settings-api 次(依赖 common), tools 次, index 最后
 const commonSrc = readFileSync(new URL('common.js', libUrl), 'utf8')
+const settingsApiSrc = readFileSync(new URL('settings-api.js', libUrl), 'utf8')
 const toolsDir = readdirSync(new URL('tools/', libUrl)).filter((f) => f.endsWith('.js')).sort()
 const toolsSrc = toolsDir.map((f) => readFileSync(new URL('tools/' + f, libUrl), 'utf8'))
 const indexSrc = readFileSync(new URL('index.js', libUrl), 'utf8')
@@ -78,6 +79,8 @@ const body = [
   '',
   compact(strip(commonSrc)),
   '',
+  compact(strip(settingsApiSrc)),
+  '',
   // 注意: selectedTools 是文件名数组, 这里按文件名读取内容后再转换
   ...selectedTools.map((f) => compact(strip(readFileSync(new URL('tools/' + f, libUrl), 'utf8')))),
   '',
@@ -90,4 +93,4 @@ const body = [
 const outPath = process.argv[2] ?? 'test/body.generated.js'
 writeFileSync(new URL(outPath, rootUrl), body)
 console.log('已生成: ' + outPath + ' (' + body.length + ' 字符, ' + body.split('\n').length + ' 行, pretty=' + pretty + ')')
-console.log('模块: lib/common.js + lib/tools/' + selectedTools.join(', ') + ' + lib/index.js')
+console.log('模块: lib/common.js + lib/settings-api.js + lib/tools/' + selectedTools.join(', ') + ' + lib/index.js')

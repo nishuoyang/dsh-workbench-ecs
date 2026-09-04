@@ -24,6 +24,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - name: Build dynamic-mount body (required by smoke)
+        run: npm run build:body
       - run: npm test
 
   publish:
@@ -41,6 +43,13 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
-      - run: npm publish
+      - name: Publish (skip when the version already exists)
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if npm view dsh-workbench-ecs@"$VER" version >/dev/null 2>&1; then
+            echo "dsh-workbench-ecs@$VER already published — skipping"
+            exit 0
+          fi
+          npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

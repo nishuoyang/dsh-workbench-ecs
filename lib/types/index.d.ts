@@ -7,10 +7,16 @@
 export const name: 'dsh-workbench-ecs'
 
 /** 插件注入的服务 */
-export const inject: readonly ['tools']
+export const inject: readonly ['tools', 'webServer', 'subprocess']
 
-/** Cordis apply: 注册全部 Workbench ECS 工具 */
+/** Cordis apply: 注册全部 Workbench ECS 工具; web profile 下同时注册设置页 RPC 路由 /dsh-workbench-ecs/* */
 export function apply(ctx: unknown): void
+
+/**
+ * 设置页 RPC 操作标识 (host: POST /dsh-workbench-ecs/rpc, client: fetch 同源路由)。
+ * 非公开 API —— 仅 dsh-workbench-ecs 自身 browser half (exports["./client"]) 使用。
+ */
+export type SettingsRpcOp = 'status' | 'list' | 'exec' | 'deploy' | 'session-list' | 'session-close'
 
 /** ecs_list 参数 */
 export interface EcsListArgs {

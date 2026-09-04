@@ -1,7 +1,7 @@
 {
   "name": "dsh-workbench-ecs",
-  "version": "0.2.0",
-  "description": "DeepSeek Harness (Cordis) plugin: control Alibaba Cloud ECS instances through the local Workbench CLI — list/exec/upload/download/diagnose/deploy/session model tools",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness (Cordis) plugin: control Alibaba Cloud ECS instances through the local Workbench CLI — list/exec/upload/download/diagnose/deploy/session model tools plus a visual settings panel",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -10,10 +10,25 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "files": [
-    "lib/"
+    "lib/",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
   ],
   "license": "MIT",
   "repository": {
@@ -34,7 +49,9 @@
     "agent",
     "plugin",
     "tool",
-    "ssh"
+    "ssh",
+    "settings",
+    "ui"
   ],
   "engines": {
     "node": ">=18"
@@ -48,6 +65,7 @@
   },
   "scripts": {
     "test": "node test/smoke.mjs",
+    "test:ui": "node test/ui-rpc.mjs",
     "test:e2e": "node test/e2e-local.mjs",
     "build:body": "node scripts/to-body.mjs test/body.generated.js"
   }

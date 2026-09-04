@@ -1,0 +1,14 @@
+# dsh-workbench-ecs — profile bundle patch layer
+# ==============================================
+# 由 dsh.bundle.patch 声明, 经 `dsh plugin --profile web add dsh-workbench-ecs`
+# 安装后作为 profile 组合层之一被应用 (写入 profiles/<name>/cordis.patch.yml
+# 或 bundles 层均可)。
+#
+# 该行处于 host 平面: 随 dsh web 启动即挂载 ——
+#   * 注册 7 个模型可见工具 (ecs_list / ecs_exec / ecs_upload / ecs_download /
+#     ecs_diagnose / ecs_deploy / ecs_session);
+#   * 注册设置页同源 RPC 路由 /dsh-workbench-ecs/*;
+#   * 浏览器半 (lib/client.js) 在设置页出现「Workbench ECS」选项卡。
+- insert:
+    - id: workbench-ecs
+      name: dsh-workbench-ecs

@@ -184,20 +184,26 @@ To restrict to specific instances, replace `"Resource": "*"` with:
 
 ### 5. Install this plugin
 
-**Option A — add a plugin row to your Cordis composition (cordis.yml):**
+**Option A — add a plugin row to your Cordis composition (cordis.yml / cordis.patch.yml):**
 
 ```yaml
 - id: dsh-workbench-ecs
   name: dsh-workbench-ecs
 ```
 
-**Option B — use the Harness plugin manager:**
+**Option B — use the Harness plugin manager (recommended; also enables the settings UI):**
 
 ```bash
-dsh plugin add dsh-workbench-ecs
+# web profile: tools + visual settings panel in one shot (ships its own cordis.patch.yml bundle layer)
+dsh plugin --profile web add dsh-workbench-ecs
 ```
 
-Restart the Harness after installing; the 7 registered tools become visible to the Agent.
+Restart `dsh web` after installing (or just refresh the page on deployments with hot reload);
+the 7 registered tools become visible to the Agent.
+
+> Since **v0.3.0** the package also ships a browser settings panel (see "Settings UI" below):
+> `exports["./client"]` plus the `dsh.client` declaration are picked up automatically by the
+> DSH client module system — no extra wiring needed.
 
 ### 6. Verify the installation
 
@@ -205,6 +211,10 @@ Restart the Harness after installing; the 7 registered tools become visible to t
 # Manually verify the CLI (run on the machine that has Workbench CLI installed):
 workbench list ecs --region cn-hangzhou --output json
 workbench exec --instance-id i-bp1xxxxx --command "df -h" --output json
+
+# Verify the settings RPC route (requires the bundle row to be mounted):
+curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.0"}
 ```
 
 Then ask the Agent:
@@ -214,6 +224,29 @@ ecs_list { region: "cn-shanghai" }
 ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "df -h" }
 ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
 ```
+
+### 7. Settings UI (visual panel, v0.3.0+)
+
+Once the bundle is installed, open the Harness settings (gear icon) and you will find a
+**"Workbench ECS"** tab:
+
+| Area | Capabilities |
+|---|---|
+| CLI status | CLI availability / version / credential profile / daemon; **20s host cache + instant local render** (panel opens immediately, refreshes silently in the background; [Refresh] forces a re-check) |
+| ECS instances | region / status filters, name-or-ID search, status distribution strip, checkboxes for batch actions, **30s auto-refresh** |
+| Row actions | [Run] pick target / [Diagnose] one-shot health check (disk · memory gauges) / [Deploy] guarded publish wizard / [Details] metadata + recent logs |
+| Remote command | command history (datalist), two-click confirmation for destructive patterns (host still rejects); batch execution with per-instance result table |
+| Guarded deploy | upload local file (OSS relay, ≤1GB) + restart/apply command + health check, 3-stage progress; save/reuse templates |
+| Workbench sessions | session list / close one / close all (troubleshooting & resource reclamation) |
+| Operation timeline | every panel action is logged for the current session |
+
+The panel talks to the **local** Workbench CLI through a same-origin route
+(`/dsh-workbench-ecs/rpc`, registered by `lib/index.js`) — no LLM/Agent in the loop,
+so the destructive-command guard is **deny-first** (for approval-gated execution use the
+Agent's `ecs_exec` tool instead).
+
+> The UI auto-adapts to light/dark themes; for local development use `install-local.ps1`
+> to link the checkout with a junction and iterate live.
 
 ## Tools reference
 
