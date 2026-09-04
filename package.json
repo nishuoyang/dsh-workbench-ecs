@@ -1,0 +1,48 @@
+{
+  "name": "dsh-workbench-ecs",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (Cordis) plugin: control Alibaba Cloud ECS instances through the local Workbench CLI — ecs_list and ecs_exec model tools",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nishuoyang/dsh-workbench-ecs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nishuoyang/dsh-workbench-ecs/issues"
+  },
+  "homepage": "https://github.com/nishuoyang/dsh-workbench-ecs#readme",
+  "keywords": [
+    "deepseek-harness",
+    "cordis",
+    "aliyun",
+    "alibaba-cloud",
+    "ecs",
+    "workbench",
+    "agent",
+    "plugin",
+    "tool"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs",
+    "build:body": "node scripts/to-body.mjs test/body.generated.js"
+  }
+}
