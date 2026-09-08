@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.3.6 · MIT License
+> v0.3.7 · MIT License
 
 [English](./README.md) | 中文
 
@@ -17,6 +17,7 @@
 - **安全守卫**: 破坏性命令(`rm -rf`、`shutdown`、`reboot`、`mkfs`、`dd`、`iptables -F/-X` 等)自动接入 Harness 审批服务, 未获批准一律拒绝(fail closed)
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(串行, 单台失败不中断), 适合集群排查
+- **同实例串行化**: 同一实例上的操作按 FIFO 逐个执行, 并发调用不会经由共享的 Workbench 会话互相串流; 不同实例仍可并行。长时间后台任务会一直占用该实例的名额直到结束
 - **大输出 spill**: stdout 超限自动落盘并返回完整输出路径, 日志排查不再截断丢头
 - **健壮二进制解析**: 按 PATH 解析 `workbench`, 失败时回退常见安装位置(如 `C:\Program Files\workbench\workbench.exe`), 解决宿主进程 PATH 过期问题
 - **取消支持**: 工具调用被取消时自动终止进程树(SIGTERM → SIGKILL), 不留孤儿进程
@@ -43,7 +44,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.6"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.7"}
 ```
 
 然后让 Agent 调用:

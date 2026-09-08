@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.3.6 · MIT License
+> v0.3.7 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -17,6 +17,7 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Safety guard**: destructive commands (`rm -rf`, `shutdown`, `reboot`, `mkfs`, `dd`, `iptables -F/-X`, …) request confirmation through the Harness approval service; anything not `allowed-once` is rejected (fail closed)
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (serial; per-instance failures do not stop others)
+- **Per-instance serialization**: operations touching the same instance run one at a time (FIFO), so concurrent calls can never interleave output through the shared Workbench session; different instances still run in parallel. A long background task holds its instance's slot until it finishes
 - **Large-output spill**: oversized stdout spills to disk with the full path returned, so log triage never loses the head
 - **Robust binary resolution**: resolves `workbench` via PATH and falls back to common install locations (e.g. `C:\Program Files\workbench\workbench.exe`), handling stale host-process PATH
 - **Cancellation support**: aborted tool calls terminate the process tree (SIGTERM → SIGKILL), leaving no orphan processes
@@ -43,7 +44,7 @@ That's it — the bundle layer inserts the plugin row into the web profile: the 
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.6"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.7"}
 ```
 
 Then ask the Agent:

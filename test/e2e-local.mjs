@@ -182,7 +182,40 @@ await run('ecs_exec 后台任务(jobs 模拟)', async () => {
   const done = await jobRun.done
   const out = jobRun.readOutput()
   assert.ok(out.includes('bg-ok'), '后台输出应包含 bg-ok')
-  assert.equal(done.exitCode, 0)
+  // dsh-jobs 契约: done 必须解析 JobOutcome{status, detail?}; 否则 job.status
+  // 会是 undefined, 使 job_output/job_list 的快照含 undefined 而报 not lossless JSON
+  assert.ok(['completed', 'killed', 'failed'].includes(done.status), 'done.status 必须是终态枚举, 实际: ' + String(done.status))
+  assert.equal(done.status, 'completed', '退出码 0 应结算为 completed')
+  assert.match(String(done.detail), /exit code: 0/, 'done.detail 应含退出码')
+  assertLossless('jobs outcome', done)
+  // 模拟 dsh-jobs-local 的 snapshot(): status 键无条件存在
+  const snapshot = {
+    id: 'job-e2e-1', kind: 'workbench-ecs', label: 'ecs_exec', status: done.status,
+    ...(done.detail !== undefined ? { detail: done.detail } : {}),
+    startedAt: Date.now(), finishedAt: Date.now(), reported: false,
+  }
+  assertLossless('模拟 jobs snapshot(job_output/job_list 载荷)', snapshot)
+})
+
+// 缺陷 2 回归: 同实例并发必须串行化, 互不串流
+await run('同实例并发不串流(后台 + 前台)', async () => {
+  let jobRun
+  const jobsMock = { start(spec) { jobRun = spec.run(); return 'job-conc-1' } }
+  const bgDef = ecsExecDefinition(makeCtx({ jobs: jobsMock }))
+  const bgValue = await bgDef.execute(
+    { instance_id: INSTANCE_ID, command: 'for i in 1 2 3; do echo tick-$i; sleep 1; done; echo done-bg', run_in_background: true },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(bgValue.kind, 'background')
+  // 后台任务持有实例锁; 前台并发调用排队, 完成后只应看到自己的输出
+  const fgDef = ecsExecDefinition(ctx)
+  const fg = await fgDef.execute({ instance_id: INSTANCE_ID, command: 'echo fg-only-marker' }, makeExec('ecs_exec'))
+  const bgOut = await (async () => { await jobRun.done; return jobRun.readOutput() })()
+  assert.ok(fg.output.includes('fg-only-marker'), '前台输出应含自己的标记, 实际: ' + fg.output)
+  assert.ok(!fg.output.includes('tick-'), '前台输出不应混入后台任务内容, 实际: ' + fg.output)
+  assert.ok(!fg.output.includes('done-bg'), '前台输出不应含后台结束标记, 实际: ' + fg.output)
+  assert.ok(bgOut.includes('done-bg'), '后台输出应完整, 实际: ' + bgOut)
+  assert.ok(!bgOut.includes('fg-only-marker'), '后台输出不应混入前台内容, 实际: ' + bgOut)
 })
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-'))
