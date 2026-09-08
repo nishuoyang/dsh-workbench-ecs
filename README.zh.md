@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.3.5 · MIT License
+> v0.3.6 · MIT License
 
 [English](./README.md) | 中文
 
@@ -43,7 +43,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.5"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.6"}
 ```
 
 然后让 Agent 调用:

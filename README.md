@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.3.5 · MIT License
+> v0.3.6 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -43,7 +43,7 @@ That's it — the bundle layer inserts the plugin row into the web profile: the 
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.5"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.6"}
 ```
 
 Then ask the Agent:

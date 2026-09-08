@@ -12,6 +12,7 @@ import { writeFileSync, readFileSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert'
+import { isJsonValue } from '@deepseek-ai/dsh-session'
 
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
 import { ecsExecDefinition } from '../lib/tools/ecs-exec.js'
@@ -88,6 +89,14 @@ function makeExec(name) {
   }
 }
 
+// 回归断言: 工具返回值必须通过 DSH 管线的 lossless JSON 校验(isJsonValue),
+// 否则真实 Harness 里会报 "not lossless JSON" 使整次调用失败。
+// (此前 ecs_exec/ecs_diagnose 因 undefined 值属性(如 stdout_spill_path、
+// presentationMeta 中的 job_id/count)触发该错误。)
+function assertLossless(label, value) {
+  assert.ok(isJsonValue(value), label + ' 必须通过 isJsonValue(lossless JSON)')
+}
+
 // ---- 测试执行器 ----
 let passed = 0
 let failed = 0
@@ -108,20 +117,24 @@ const ctx = makeCtx()
 
 await run('ecs_list', async () => {
   const def = ecsListDefinition(ctx)
-  const value = await def.execute({ region: REGION }, makeExec('ecs_list'))
+  const args = { region: REGION }
+  const value = await def.execute(args, makeExec('ecs_list'))
   assert.ok(Array.isArray(value.instances), 'instances 应为数组')
   assert.ok(value.count >= 1, 'cn-shanghai 至少 1 台实例')
+  assertLossless('ecs_list value', value)
+  assertLossless('ecs_list presentationMeta', def.output.presentationMeta(args, value))
 })
 
 await run('ecs_exec 单实例(真实命令)', async () => {
   const def = ecsExecDefinition(ctx)
-  const value = await def.execute(
-    { instance_id: INSTANCE_ID, command: 'echo e2e-ok-123 && uname -s' },
-    makeExec('ecs_exec'),
-  )
+  const args = { instance_id: INSTANCE_ID, command: 'echo e2e-ok-123 && uname -s' }
+  const value = await def.execute(args, makeExec('ecs_exec'))
   assert.equal(value.kind, 'single')
   assert.ok(value.output.includes('e2e-ok-123'), '输出应包含 e2e-ok-123')
   assert.equal(value.exit_code, 0)
+  assertLossless('ecs_exec single value', value)
+  assertLossless('ecs_exec single presentationMeta', def.output.presentationMeta(args, value))
+  assertLossless('ecs_exec single presentCall', def.presentCall(args))
 })
 
 await run('ecs_exec 批量(1 成功 + 1 失败)', async () => {
@@ -135,6 +148,8 @@ await run('ecs_exec 批量(1 成功 + 1 失败)', async () => {
   assert.equal(value.failed_count, 1, '假实例应记为失败')
   assert.equal(value.batch[0].is_error, false)
   assert.equal(value.batch[1].is_error, true)
+  assertLossless('ecs_exec batch value', value)
+  assertLossless('ecs_exec batch presentationMeta', def.output.presentationMeta({}, value))
 })
 
 await run('ecs_exec 破坏性命令守卫(无审批 -> 拒绝)', async () => {
@@ -161,6 +176,9 @@ await run('ecs_exec 后台任务(jobs 模拟)', async () => {
   )
   assert.equal(value.kind, 'background')
   assert.equal(value.job_id, 'job-e2e-1')
+  assertLossless('ecs_exec background value', value)
+  assertLossless('ecs_exec background presentationMeta', def.output.presentationMeta({}, value))
+  assertLossless('ecs_exec background presentCall', def.presentCall({ instance_id: INSTANCE_ID, command: 'echo bg-ok', run_in_background: true }))
   const done = await jobRun.done
   const out = jobRun.readOutput()
   assert.ok(out.includes('bg-ok'), '后台输出应包含 bg-ok')
@@ -178,6 +196,7 @@ await run('ecs_upload(真实上传)', async () => {
     makeExec('ecs_upload'),
   )
   assert.equal(value.exit_code, 0, '上传应成功')
+  assertLossless('ecs_upload value', value)
 })
 
 await run('ecs_download(真实下载并校验内容)', async () => {
@@ -187,6 +206,7 @@ await run('ecs_download(真实下载并校验内容)', async () => {
     makeExec('ecs_download'),
   )
   assert.equal(value.exit_code, 0, '下载应成功')
+  assertLossless('ecs_download value', value)
   const saved = readFileSync(join(tmpDir, 'dsh-e2e-upload.txt'), 'utf8')
   assert.ok(saved.includes('hello-from-dsh-e2e'), '下载内容应一致')
 })
@@ -197,12 +217,15 @@ await run('ecs_diagnose(一键体检)', async () => {
   assert.equal(value.exit_code, 0)
   assert.ok(value.output.includes('1/7') || value.output.includes('主机信息'), '体检输出应含分段标记')
   assert.ok(value.output.includes('docker') || value.output.includes('systemctl'), '体检输出应含服务段')
+  assertLossless('ecs_diagnose value', value)
+  assertLossless('ecs_diagnose presentationMeta', def.output.presentationMeta({}, value))
 })
 
 await run('ecs_session list', async () => {
   const def = ecsSessionDefinition(ctx)
   const value = await def.execute({ action: 'list' }, makeExec('ecs_session'))
   assert.equal(value.exit_code, 0)
+  assertLossless('ecs_session value', value)
 })
 
 await run('ecs_deploy(重启 + 健康检查)', async () => {
@@ -220,6 +243,9 @@ await run('ecs_deploy(重启 + 健康检查)', async () => {
   assert.equal(value.done_stage, 2)
   assert.equal(value.ok, true, '两阶段都应成功')
   assert.ok(value.stages[0].output.includes('deploy-restart-ok'))
+  assertLossless('ecs_deploy value', value)
+  assertLossless('ecs_deploy presentationMeta', def.output.presentationMeta({}, value))
+  assertLossless('ecs_deploy presentCall', def.presentCall({ instance_id: INSTANCE_ID, command: 'echo x' }))
 })
 
 console.log('')
