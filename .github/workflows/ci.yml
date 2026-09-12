@@ -46,6 +46,13 @@ jobs:
       - name: Publish (skip when the version already exists)
         run: |
           VER="${GITHUB_REF_NAME#v}"
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::warning::NPM_TOKEN 未配置 — 跳过 npm 发布(tag 仍然有效)。"
+            echo "配置方式: 仓库 Settings → Secrets and variables → Actions → New repository secret, 名称 NPM_TOKEN,"
+            echo "值为 npm Automation token(粒度访问令牌即可); 配置后重新推送该 tag 即可发布。"
+            echo "也可在本机 npm login 后直接 npm publish(两条路径产出的包完全一致)。"
+            exit 0
+          fi
           if npm view dsh-workbench-ecs@"$VER" version >/dev/null 2>&1; then
             echo "dsh-workbench-ecs@$VER already published — skipping"
             exit 0
