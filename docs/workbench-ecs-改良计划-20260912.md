@@ -1,4 +1,4 @@
-# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.2)
+# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.3)
 
 > 输入: `E:\AiProject\nailong\docs\workbench-ecs-反馈与改进建议-20260912.md`(奶龙生产运维 ~30 次真实调用)
 > 核对基线: 插件源码 v0.3.7(commit `324d979`)+ 本机 Workbench CLI **v1.0.1**(commit `86c0aff`)
@@ -341,6 +341,30 @@ ecs_deploy {
 
 **工作量**:S4a 2 天;S4b 3~5 天 + 每项目适配;S4b' 1 天。
 
+**S4b'' [v0.6.3 / ✅ 已交付] 跑书的静态校验(lint)+ shell 变量转义**
+
+runbook 是**纯数据**, 因此"哪里写错了"完全可以在下发任何命令之前查清。此前只能靠真跑一遍去撞,
+而且执行期一次只报第一条。v0.6.3 把这个能力补上:
+
+- **`ecs_runbook` 工具(只读, 不触达任何实例, 不需要 `instance_id`)**:
+  `action: list`(清点工作区全部 runbook + 校验结论)、`validate`(逐条给出 error/warn 与步骤定位)、
+  `plan`(按参数展开成计划并回显命令, 不执行)。建议顺序:**validate → plan → ecs_deploy**。
+- **校验复用执行期的同一份结构校验**(`steps-engine.planSteps`) → 文案与真正执行时的报错**逐字一致**,
+  不会出现"lint 说没事、跑起来才炸"; 其余规则是 lint 独有的静态检查:
+  - **字段笔误**(多余字段会被静默忽略, 最难发现):`commnad` → "是否想写 command?";
+  - **断言太弱**:`assert` 的 `expect` 为空 → 实际只校验了 `exit_code=0`;
+  - **护栏矛盾**:`read_only: true` 的命令命中写操作模式 → 执行必被拒(报 **error**);
+  - **破坏性命令**:命中 `rm -rf` / `systemctl stop` 等 → 提醒 Agent 侧需审批、面板侧会被直接拒绝;
+  - **tail 语义**:既无 `wait_seconds` 又无 `exit_file` → 只读一次(文件还在写就会读到半截);
+  - **参数**:缺参数报 error、多余入参、`params` 里从未使用的默认值。
+- **shell 变量转义 `$${name}`**:`${NAME}` 与 runbook 占位符写法完全相同 —— 脚本里写 `${HOME}`/`${PATH}`
+  会被当成"缺参数 HOME"而报错。现在 `$${NAME}` 表示"字面量 `${NAME}`", 不参与替换也不计入声明参数;
+  lint 遇到**全大写**的缺参数名会直接给出转义提示(`若它是 shell 变量请写成 $${NAME} 转义`)。
+- **面板**:Runbook 卡片新增「校验」按钮(等价于 `validate`, 不触达实例)+ 列表里的校验徽标
+  (通过 / N 错误 / N 提醒)与必填参数提示; 有结构错误的 runbook 直接禁用「执行」按钮。
+- **RPC**:新增 `runbook-validate`;`runbook-list` 的每条目附带 `lint_ok`/`error_count`/`warn_count`/
+  `required_params`/`first_issue`。
+
 ---
 
 ### S5 [P0 部分 / P2 部分] 传输增强(F5)
@@ -364,6 +388,7 @@ ecs_deploy {
 | **v0.6.0** ✅ **S4a 已完成** | 编排 | S4a `ecs_deploy { steps }` 编排(upload/exec/assert/tail + dry_run + continue_on_error)/ 老三阶段保持兼容 | 已达成:unit 38/38、e2e 38/38(含 dry_run 不落地、断言失败中止且远端验证后续步骤未执行、`continue_on_error`、tail `wait_seconds` 等到退出码文件) |
 | **v0.6.1** ✅ **S4b 机制已交付** | 跑书机制 | Runbook: `runbook` + `runbook_params`(工作区 `.dsh/workbench-ecs/runbooks/*.json` 或内联)、`${参数}` 替换(整串保留类型)、隐式 `instance_id`/`region`、名字白名单、缺参数/缺文件的可操作报错;顺带修掉 **D10**(to-body 模块清单硬编码) | 已达成:unit 45/45、e2e 41/41;内容侧按约定留在项目仓库 |
 | **v0.6.2** ✅ **S4b' 面板化已交付** | 跑书进面板 | 抽出 `lib/steps-engine.js`(工具与面板共用同一引擎);设置页新增 `runbook-list` / `runbook-plan` / `runbook-run`;面板新增 Runbook 卡片(列出/预演/执行)+ 发布向导 runbook 模式;`to-body` 模块发现改递归 | 已达成:unit 52/52(含跨通道"计划逐字一致")、ui-rpc 22/22(含真机 `runbook-run`)、e2e 45/45(含面板路径真机执行与"预演不改动远端") |
+| **v0.6.3** ✅ **S4b'' 静态校验已交付** | 跑书 lint | 新工具 `ecs_runbook`(list/validate/plan, 只读零远程调用);`lintRunbook` 纯函数(结构复用执行期校验 + 字段笔误/弱断言/护栏矛盾/破坏性命令/tail 语义/参数齐备);`$${name}` 转义解决 shell 变量与占位符同写法;RPC `runbook-validate` + 面板「校验」按钮与校验徽标 | 已达成:unit 58/58、ui-rpc 25/25、e2e 46/46(含真实工作区 lint 与"字段笔误→提示是否想写 command") |
 | **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,
@@ -417,9 +442,17 @@ ecs_deploy {
       **真机 `runbook-run`**(2 步全绿 + 断言 + `runbook.source=workspace`);
     - e2e 4 项(真实实例 + 真实工作区):工作区扫描(坏文件不炸)、**预演前后远端文件内容完全一致**(零副作用)、
       面板侧真机执行(参数替换 + 断言 + lossless JSON)、被拒的破坏性 runbook **远端核对无痕迹**。
+21. **S4b''** ✅ *已覆盖(v0.6.3)*:
+    - unit 6 项:`$${name}` 转义(替换/收集/缺失三处口径)、lint 五类问题一次报全(字段笔误/弱断言/护栏矛盾/
+      破坏性/参数)且 error 与 warn 计数正确、结构错误与执行期报错同源且带 step 定位、解析失败与干净 runbook、
+      `ecs_runbook` 工具 list/validate/plan(含动作白名单与缺参数拒绝)、设置页 `runbook-validate`
+      (参数齐备性、JSON 文本入参、内联对象、列表校验计数与必填参数);
+    - ui-rpc 3 项(真实 CLI):`runbook-validate` 通过好 runbook / 标出坏文件 / 查缺参数;
+    - e2e 1 项(真实工作区):`ecs_runbook` 清点 + 校验(字段笔误提示)+ 预演(脚本正文不入计划、默认超时 180、
+      明确"未执行任何命令")+ 全部出口过 `isJsonValue`。
 
-> 当前实际测试资产:`test/unit.mjs` **52 项**(不触达实例)、`test/e2e-local.mjs` **45 项**(真实实例)、
-> `test/ui-rpc.mjs` **22 项**(真实 CLI + 内存 fake ctx,含真机 runbook);
+> 当前实际测试资产:`test/unit.mjs` **58 项**(不触达实例)、`test/e2e-local.mjs` **46 项**(真实实例)、
+> `test/ui-rpc.mjs` **25 项**(真实 CLI + 内存 fake ctx,含真机 runbook);
 > `npm test` = unit + 冒烟(含动态 body 一致性与完整性守卫)。
 
 ---
@@ -446,7 +479,7 @@ ecs_deploy {
 | F1 嵌套引号必炸 | 真缺口,根因修正为"远端两层"(D4) | S1 | ✅ **v0.4.0 已交付** |
 | F2 长命令软上限 + 日志不可续读 | 真缺口;机制解释见 D3,另发现 D1 | S2 + D1 | D1 ✅ v0.4.0 / S2 ✅ v0.5.0 |
 | F3 每次独立 shell | 真缺口,但 CLI 无可靠会话创建 | S3(伪会话) | ✅ v0.5.0 |
-| F4 多步流水线零编排 | 真缺口,建议拆 S4a/S4b | S4 | S4a ✅ **v0.6.0** / S4b ✅ **v0.6.1 机制** + **v0.6.2 面板化** |
+| F4 多步流水线零编排 | 真缺口,建议拆 S4a/S4b | S4 | S4a ✅ **v0.6.0** / S4b ✅ **v0.6.1 机制** + **v0.6.2 面板化** + **v0.6.3 静态校验** |
 | F5 传输无校验/无目录语义 | 部分真缺口;直连不可做 | S5a / S5b / S5c | S5a ✅ v0.4.0 / S5b ✅ v0.5.1 / S5c 上游 |
 | F6 无只读护栏 | 真缺口 | S6 | ✅ **v0.4.0 已交付** |
 | F7 小项(批量串行/无 description/timeout 偏短) | 真缺口 + D1 | S7 + S8' | S8' ✅ v0.4.0 / S7 ✅ v0.5.1(分页受 CLI 限制) |

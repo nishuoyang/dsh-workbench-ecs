@@ -1,16 +1,16 @@
 # dsh-workbench-ecs
 
-> v0.6.2 · MIT License
+> v0.6.3 · MIT License
 
 English | [中文](README.zh.md)
 
 > A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (Cordis) plugin that lets the Agent control remote Alibaba Cloud ECS instances through the local Workbench CLI.
 
-It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances) locally, and ships **8 agent-native tools** — `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session` — covering the full *list → diagnose → execute → upload → restart → verify* loop, plus a **visual settings panel** (CLI status, instance browser, guarded deploy wizard, sessions, operation timeline). Instances are reached through the Workbench backend channel, so **no public IP is needed**; destructive commands go through the Harness approval guard and are rejected unless explicitly allowed (fail closed).
+It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances) locally, and ships **9 agent-native tools** — `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_runbook` / `ecs_session` — covering the full *list → diagnose → execute → upload → restart → verify* loop, plus a **visual settings panel** (CLI status, instance browser, guarded deploy wizard, sessions, operation timeline). Instances are reached through the Workbench backend channel, so **no public IP is needed**; destructive commands go through the Harness approval guard and are rejected unless explicitly allowed (fail closed).
 
 ## Features
 
-- **8 Agent-native tools**: `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, integrated with the Harness tool pipeline
+- **9 Agent-native tools**: `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_runbook` / `ecs_session`, integrated with the Harness tool pipeline
 - **Detached long tasks + log cursor** (v0.5.0+): `ecs_exec { detach: true }` starts the job with remote `nohup`, writes a log file, and immediately returns `job_id`/`log_path`/`exit_path`; the plugin polls increments on an interval, so it never holds the instance for the whole run (other calls on the same instance interleave normally) and the remote log file stays the single source of truth — a slow reader can no longer lose or duplicate segments. `ecs_log` reads any remote file by **byte cursor**, so release-log polling no longer needs repeated full `tail`s
 - **Pseudo-sessions** (v0.5.0+): `ecs_exec { session_id: "deploy" }` keeps the working directory and environment across calls (`cd`/`export` carry over), different session ids stay isolated, and an idle session resets after 30 minutes with an explicit notice
 - **Visual settings panel** (v0.3.0+): CLI status with 20s host cache + instant local render, instance browser (search / batch / 30s auto-refresh), one-click diagnostics with disk & memory gauges, guarded publish wizard with templates (switchable to Runbook mode), session management, operation timeline — auto-adapts to light/dark themes
@@ -21,7 +21,7 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Read-only guard** (v0.4.0+): `read_only` on `ecs_exec` / `ecs_diagnose` rejects write operations before they reach a shell (redirects, `rm`/`mv`/`cp`/`chmod`, `docker`/`systemctl` mutations, `nohup`, …); on by default for `ecs_diagnose`, with zero false positives on the built-in diagnostic script
 - **Transfer integrity** (v0.4.0+): `ecs_upload.verify_sha256` compares local/remote digests after upload; `ecs_deploy` enables it by default and **aborts before restart** on a mismatch. Local hashing uses `sha256sum`/`shasum`/`certutil`, so no extra runtime is required
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
-- **Runbooks** (v0.6.2+): keep an orchestration as **pure data** in `<workspace>/.dsh/workbench-ecs/runbooks/*.json` and run it with `ecs_deploy { runbook: "release", runbook_params: { sha } }` in one call; the plugin only supplies the mechanism (load / validate / `${param}` substitution / expansion) while **the content and script bodies stay in the project repository** — reviewable, versioned, and free of plugin-side project logic. The settings panel can also **list / preview / execute** the same runbook (shared engine, byte-identical preview)
+- **Runbooks** (v0.6.2+): keep an orchestration as **pure data** in `<workspace>/.dsh/workbench-ecs/runbooks/*.json` and run it with `ecs_deploy { runbook: "release", runbook_params: { sha } }` in one call; the plugin only supplies the mechanism (load / validate / `${param}` substitution / expansion) while **the content and script bodies stay in the project repository** — reviewable, versioned, and free of plugin-side project logic. The settings panel can also **list / validate / preview / execute** the same runbook (shared engine, byte-identical preview); the `ecs_runbook` tool gives read-only static checks (typos, missing params, weak assertions, guard conflicts) and shell variables escape as `$${NAME}`
 - **Multi-step orchestration** (v0.6.0+): `ecs_deploy { steps: [...] }` expresses "upload → run → assert → read log" as one call; `assert` evaluates `expect` checks and reports **exactly which assertion failed, what was expected, and what actually happened**; `dry_run` previews the commands without executing. A release drops from a dozen calls to one
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (per-instance failures do not stop others); `concurrency` controls parallelism (default 4 when `read_only`, otherwise serial) while the same instance still serializes behind its lock — cluster triage no longer queues one host at a time (v0.5.1+)
 - **Recursive directory upload** (v0.5.1+): `ecs_upload { local_dir: "dist" }` does "local `tar` → upload → sha256 verify → remote extract" in one call; a checksum mismatch **aborts the extract**, so a corrupt archive never rewrites the remote directory
@@ -247,7 +247,7 @@ Use [`scripts/install-local.ps1`](./scripts/install-local.ps1) to link the repo 
 | Row actions | [Run] pick target / [Diagnose] one-shot health check (disk · memory gauges) / [Deploy] guarded publish wizard / [Details] metadata + recent logs |
 | Remote command | command history (datalist), two-click confirmation for destructive patterns (host still rejects); batch execution with per-instance result table |
 | Guarded deploy | upload local file (OSS relay, ≤1GB) + restart/apply command + health check, 3-stage progress; save/reuse templates; **mode switchable to "Runbook"** (run a workspace runbook, with preview) (v0.6.2+) |
-| Runbook (release runbook) | scans `<workspace>/.dsh/workbench-ecs/runbooks/*.json` and lists name / description / step count / kinds / declared params (a broken file is flagged invalid without hiding the others); with a target instance and JSON params you can **preview** (zero side effects) or **execute**; results render per step, including `skipped` markers and per-assertion ✔/✘ (v0.6.2+) |
+| Runbook (release runbook) | scans `<workspace>/.dsh/workbench-ecs/runbooks/*.json` and lists name / description / step count / kinds / declared params plus the **static check verdict** (a broken file is flagged invalid without hiding the others); per row: **Validate** (read-only, item-by-item error/warn with step positions) / **Preview** (zero side effects) / **Execute**; results render per step, including `skipped` markers and per-assertion ✔/✘ (v0.6.2+, checks in v0.6.3+) |
 | Workbench sessions | session list / close one / close all (troubleshooting & resource reclamation) |
 | Operation timeline | every panel action is logged for the current session |
 
@@ -259,7 +259,7 @@ This package is a DSH **static two-half plugin**, composed into the DSH web prof
 
 | Half | File | Responsibility |
 |---|---|---|
-| Host half (Node) | `lib/index.js` | Registers the 8 model tools with `tools`, and same-origin routes `/dsh-workbench-ecs/health` & `/dsh-workbench-ecs/rpc` with `webServer`; the settings RPC runs the local CLI through `subprocess` (shared `lib/common.js` / `lib/settings-api.js` / `lib/steps-engine.js`; runbook mechanism in `lib/runbooks.js`) |
+| Host half (Node) | `lib/index.js` | Registers the 9 model tools with `tools`, and same-origin routes `/dsh-workbench-ecs/health` & `/dsh-workbench-ecs/rpc` with `webServer`; the settings RPC runs the local CLI through `subprocess` (shared `lib/common.js` / `lib/settings-api.js` / `lib/steps-engine.js`; runbook mechanism in `lib/runbooks.js`) |
 | Browser half | `lib/client.js` | Single-file client bundle (`window.__ModuleLoader__` factory form): registers the "Workbench ECS" settings tab and talks to the host over the same-origin RPC route |
 | Composition | `cordis.patch.yml` | `dsh.bundle` patch: inserts the plugin row into the profile composition — active on `dsh web` startup, picked up automatically by `dsh plugin --profile web add` |
 
@@ -468,7 +468,41 @@ Returns `mode` (`legacy` / `steps`), `ok`, `done_stage`/`total_stage`, `stopped_
 
 - The panel and the Agent share **one orchestration engine** (`lib/steps-engine.js`), so a previewed command line is byte-for-byte what the Agent would send — no "works in the panel, fails through the tool" drift;
 - **Guard difference (intentional)**: the panel has no approval context, so a destructive command pattern is **rejected outright** with the offending step index (use the Agent's `ecs_deploy` for approval-gated execution); `read_only` steps are pre-checked by the read-only guard;
-- Panel-side RPC operations: `runbook-list` / `runbook-plan` / `runbook-run` (same-origin route `/dsh-workbench-ecs/rpc`).
+- Panel-side RPC operations: `runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run` (same-origin route `/dsh-workbench-ecs/rpc`).
+
+### `ecs_runbook` — read-only inventory & static checks for workspace runbooks (v0.6.3+)
+
+CLI equivalent: **none** — this tool runs no CLI command and never touches an ECS instance (local files + pure logic only)
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `action` | string | ✅ | `list` all runbooks with their check verdict; `validate` one runbook item by item; `plan` expand with params and echo the commands (no execution) |
+| `runbook` | string \| object | validate / plan | `"name"` → reads `<workspace>/.dsh/workbench-ecs/runbooks/<name>.json`; or an inline object |
+| `runbook_params` | object | | parameter object (overrides defaults, substitutes `${placeholders}`); `instance_id` / `region` are implicit |
+| `instance_id` / `region` | string | | optional: display-only for `plan` (defaults to `<instance_id>`) |
+
+**Why run it first**: a runbook is **pure data**, so every mistake can be found before a single command is sent. Checks include:
+
+| Category | Example |
+|---|---|
+| Structure (the **same** validation the executor uses, identical wording) | illegal `kind`, upload missing `local_file`/`remote_path`, both `command` and `script`, more than 20 steps |
+| Field typos (the sneakiest: unknown fields are silently ignored) | `commnad` → `did you mean command?` |
+| Weak assertions | `assert` with an empty `expect` → in effect only `exit_code=0` is checked |
+| Guard conflict | `read_only: true` whose command matches a write pattern → execution is guaranteed to be rejected (reported as an error) |
+| Destructive commands | matches `rm -rf` / `systemctl stop` … → warns that the Agent path needs approval and the panel rejects it |
+| Parameters | missing params (error; ALL-CAPS names get a `$${NAME}` escaping hint), unused inputs, `params` defaults never used |
+| Tail semantics | neither `wait_seconds` nor `exit_file` → it reads once (you may catch a half-written log) |
+
+```
+# recommended order: read-only checks, then preview, then execute
+ecs_runbook { action: "validate", runbook: "release", runbook_params: { sha: "abc123" } }
+ecs_runbook { action: "plan",     runbook: "release", instance_id: "i-xxx", runbook_params: { sha: "abc123" } }
+ecs_deploy  { instance_id: "i-xxx", runbook: "release", runbook_params: { sha: "abc123" } }
+```
+
+> **Escape shell variables**: `${NAME}` is treated as a runbook placeholder; write `$${NAME}` to leave `${NAME}`
+> for the remote shell (kept verbatim, and not counted as a declared parameter).
+> The settings panel's Runbook card has the same **Validate** button (equivalent to `validate`, touches no instance).
 
 ### `ecs_session` — session management
 

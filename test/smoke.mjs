@@ -24,6 +24,7 @@ const EXPECTED = {
   ecs_download: ['remote_path', 'instance_id'],
   ecs_diagnose: ['instance_id'],
   ecs_deploy: ['instance_id'],
+  ecs_runbook: ['action'],
   ecs_session: ['action'],
 }
 

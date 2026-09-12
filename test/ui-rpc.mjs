@@ -38,6 +38,10 @@ writeFileSync(join(runbookDir, 'ui-smoke.json'), JSON.stringify({
   ],
 }, null, 2))
 writeFileSync(join(runbookDir, 'ui-broken.json'), '{ not json }')
+writeFileSync(join(runbookDir, 'ui-need-param.json'), JSON.stringify({
+  name: 'ui-need-param',
+  steps: [{ kind: 'exec', command: 'echo ${sha}' }],
+}, null, 2))
 
 // 最小 fs 服务替身(真实文件系统): 只实现 runbook 机制用到的 resolve/readText/listDir
 const fsStub = {
@@ -188,6 +192,13 @@ ok('runbook-list 给出步数/类型/参数占位', rbSmoke != null && rbSmoke.v
   rbSmoke.step_count === 2 && rbSmoke.declared_params.indexOf('tag') >= 0, rbSmoke)
 const rbBroken = rbList.runbooks.find((r) => r.name === 'ui-broken')
 ok('runbook-list 坏文件标为无效且不抛错', rbBroken != null && rbBroken.valid === false && /JSON/.test(String(rbBroken.error)), rbBroken)
+
+// 9b2. runbook-validate(v0.6.3): 只读静态校验
+const rbOk = await rpc('runbook-validate', { runbook: 'ui-smoke' })
+ok('runbook-validate 通过(好 runbook)', rbOk != null && rbOk.ok === true && rbOk.error_count === 0, rbOk)
+const rbBad = await rpc('runbook-validate', { runbook: 'ui-broken' })
+ok('runbook-validate 标出坏文件', rbBad != null && rbBad.ok === false && rbBad.error_count >= 1, rbBad)
+ok('runbook-validate 缺参数可查', (await rpc('runbook-validate', { runbook: 'ui-need-param' })).ok === false)
 
 // 9c. runbook-plan: 只回显计划, 不触碰实例(此处连实例都不需要能给出计划)
 const rbPlan = await rpc('runbook-plan', { instance_id: sample != null ? sample.instance_id : 'i-test', runbook: 'ui-smoke', params: { tag: 'plan' } })

@@ -22,6 +22,7 @@ import { ecsDownloadDefinition } from '../lib/tools/ecs-download.js'
 import { ecsDiagnoseDefinition } from '../lib/tools/ecs-diagnose.js'
 import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
 import { ecsSessionDefinition } from '../lib/tools/ecs-session.js'
+import { ecsRunbookDefinition } from '../lib/tools/ecs-runbook.js'
 import { createSettingsCore } from '../lib/settings-api.js'
 import { runWorkbench, localSha256, remoteSha256, delay, hasLocalTimer } from '../lib/common.js'
 import { RUNBOOK_DIR } from '../lib/runbooks.js'
@@ -1098,6 +1099,50 @@ await run('设置页 runbook-run: 破坏性命令被直接拒绝(面板无审批
     makeExec('ecs_exec'),
   )
   assert.ok(probe.output.includes('ABSENT'), '被拒的 runbook 不得在远端留下任何痕迹')
+})
+
+await run('ecs_runbook: 工作区清点 + 静态校验 + 预演(全程零远程调用)', async () => {
+  writeFileSync(join(e2eRbDir, 'lint-typo.json'), JSON.stringify({
+    name: 'lint-typo',
+    params: { sha: 'latest' },
+    steps: [
+      { kind: 'exec', command: 'echo ${sha}', commnad: '这是字段笔误' },
+      { kind: 'assert', command: 'curl -fsS http://127.0.0.1/health', expect: {} },
+      { kind: 'tail', path: '/tmp/lint.log' },
+    ],
+  }, null, 2))
+  const def = ecsRunbookDefinition(runbookCtx)
+  const exec = makeExec('ecs_runbook')
+
+  const list = await def.execute({ action: 'list' }, exec)
+  assert.equal(list.action, 'list')
+  assert.ok(list.count >= 3, '应列出工作区全部 runbook, 实际 ' + list.count)
+  assert.ok(String(list.dir).replace(/\\/g, '/').endsWith(RUNBOOK_DIR), list.dir)
+  const entry = list.runbooks.find((r) => r.name === 'lint-typo')
+  assert.equal(entry.ok, true, '只有提醒时仍算通过: ' + entry.first_issue)
+  assert.ok(entry.warn_count >= 3, '应有若干提醒: ' + JSON.stringify(entry))
+  assert.ok(list.runbooks.find((r) => r.name === 'panel-broken').ok === false, '坏文件应标为不通过')
+  assertLossless('ecs_runbook list', list)
+
+  const report = await def.execute({ action: 'validate', runbook: 'lint-typo' }, exec)
+  assert.equal(report.action, 'validate')
+  const codes = report.issues.map((i) => i.code)
+  assert.ok(codes.includes('unknown_field'), '应认出字段笔误: ' + codes.join(','))
+  assert.ok(codes.includes('weak_assert'))
+  assert.ok(codes.includes('tail_once'))
+  assertLossless('ecs_runbook validate', report)
+  const reportText = def.output.render({}, report)[0].text
+  assert.ok(reportText.includes('是否想写 command'), reportText.slice(0, 300))
+
+  const plan = await def.execute({ action: 'plan', runbook: 'e2e-smoke', runbook_params: { tag: 'lint' }, instance_id: INSTANCE_ID }, exec)
+  assert.equal(plan.ok, true, JSON.stringify(plan.issues))
+  assert.equal(plan.total_stage, 3)
+  assert.ok(plan.plan[0].command_line.includes('<script'), '脚本步骤不应内联正文: ' + plan.plan[0].command_line)
+  assert.equal(plan.plan[0].timeout, 180, '应回报默认超时')
+  assert.ok(String(plan.command_line).includes('预演不执行任何命令'))
+  assertLossless('ecs_runbook plan', plan)
+  assertLossless('ecs_runbook presentationMeta', def.output.presentationMeta({}, plan))
+  assertLossless('ecs_runbook presentCall', def.presentCall({ action: 'plan', runbook: 'e2e-smoke' }))
 })
 
 console.log('')

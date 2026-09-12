@@ -1,16 +1,16 @@
 # dsh-workbench-ecs
 
-> v0.6.2 · MIT License
+> v0.6.3 · MIT License
 
 [English](./README.md) | 中文
 
 > 阿里云 Workbench CLI 包装插件 —— 让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 直接控制远程 ECS 实例。
 
-它在本机驱动官方阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances), 内置 **8 个 Agent 原生工具** —— `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 覆盖「列表 → 体检 → 执行 → 长任务 → 上传 → 重启 → 验证」完整闭环; 并附带**可视化设置面板**(CLI 状态、实例管理、受控发布向导、会话、操作时间线)。实例经 Workbench 后端通道连接, **无需公网 IP**; 破坏性命令走 Harness 审批守卫, 未获明确放行一律拒绝(fail closed)。
+它在本机驱动官方阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances), 内置 **9 个 Agent 原生工具** —— `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_runbook` / `ecs_session`, 覆盖「列表 → 体检 → 执行 → 长任务 → 上传 → 重启 → 验证」完整闭环; 并附带**可视化设置面板**(CLI 状态、实例管理、受控发布向导、会话、操作时间线)。实例经 Workbench 后端通道连接, **无需公网 IP**; 破坏性命令走 Harness 审批守卫, 未获明确放行一律拒绝(fail closed)。
 
 ## 特性
 
-- **8 个 Agent 原生工具**: `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 与 Harness 工具体系无缝集成
+- **9 个 Agent 原生工具**: `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_runbook` / `ecs_session`, 与 Harness 工具体系无缝集成
 - **detach 长任务 + 日志游标**(v0.5.0+): `ecs_exec { detach: true }` 在远端 `nohup` 启动并写日志文件, 立即返回 `job_id`/`log_path`/`exit_path`; 插件按间隔轮询增量, **不长期占用实例**(期间同实例其它调用可正常插空执行), 远端日志文件是唯一事实源, 模型读得慢也不会丢段或重复。配套 `ecs_log` 用**字节游标**从头续读任意远端文件(发布日志轮询不再需要反复整段 tail)
 - **伪会话**(v0.5.0+): `ecs_exec { session_id: "deploy" }` 在同一会话内保留工作目录与环境变量(`cd`/`export` 跨调用继承), 不同 session_id 互不影响; 状态由插件持有, 空闲 30 分钟自动重置并显式提示
 - **可视化设置面板**(v0.3.0+): CLI 状态(20s Host 缓存 + 本地秒显)、实例浏览(搜索/批量/30s 自动刷新)、一键诊断(磁盘·内存仪表盘)、受控发布向导+模板、会话管理、操作时间线; 自动适配深/浅色主题
@@ -21,7 +21,7 @@
 - **只读护栏**(v0.4.0+): `ecs_exec` / `ecs_diagnose` 的 `read_only` 在命令进入 shell 之前拒绝写操作(重定向、`rm`/`mv`/`cp`/`chmod`、`docker` 变更、`systemctl` 变更、`nohup` 等); `ecs_diagnose` **默认开启**, 且预置诊断脚本零误杀
 - **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止; 批量时每台实例各起一个 job 并返回 `job_ids`(v0.5.1+)
-- **Runbook / 跑书**(v0.6.1+ 机制, v0.6.2+ 面板): 把编排存成**纯数据**放在工作区 `.dsh/workbench-ecs/runbooks/*.json`,`ecs_deploy { runbook: "release", runbook_params: { sha } }` 一次调用跑完;插件只做机制(读取/校验/`${参数}` 替换/展开),**内容与脚本本体留在项目仓库** —— 发布契约可评审、可版本化, 插件里没有项目逻辑。设置面板里也能**列出 / 预演 / 执行**同一份跑书(与 Agent 共用同一引擎, 预演的命令行逐字一致)
+- **Runbook / 跑书**(v0.6.1+ 机制, v0.6.2+ 面板, v0.6.3+ 静态校验): 把编排存成**纯数据**放在工作区 `.dsh/workbench-ecs/runbooks/*.json`,`ecs_deploy { runbook: "release", runbook_params: { sha } }` 一次调用跑完;插件只做机制(读取/校验/`${参数}` 替换/展开),**内容与脚本本体留在项目仓库** —— 发布契约可评审、可版本化, 插件里没有项目逻辑。设置面板里也能**列出 / 校验 / 预演 / 执行**同一份跑书(与 Agent 共用同一引擎, 预演的命令行逐字一致);`ecs_runbook` 工具可只读地先查错(字段笔误、缺参数、断言无判据、护栏矛盾), shell 变量用 `$${NAME}` 转义
 - **多步编排**(v0.6.0+): `ecs_deploy { steps: [...] }` 把「上传 → 执行 → 断言 → 读日志」写成一次调用, `assert` 用 `expect` 逐条判定并在失败时**精确标出是哪一条断言、期望什么、实际什么**; `dry_run` 可先预演命令而不执行。一次发布从十余次调用收敛为一次
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(单台失败不中断), 适合集群排查; `concurrency` 控制并发(默认只读 4 / 写 1 串行), 同实例仍由实例锁串行 —— 集群排查不再逐台排队(v0.5.1+)
 - **目录递归上传**(v0.5.1+): `ecs_upload { local_dir: "dist" }` 一次调用完成「本机 `tar` 归档 → 上传 → sha256 校验 → 远端解包」, 省掉手工打包; 校验失败**中止解包**, 坏包不会改写远端目录
@@ -246,7 +246,7 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 | 实例行操作 | [执行] 选中目标 / [诊断] 一键体检(磁盘·内存仪表盘) / [发布] 受控发布向导 / [详情] 属性 + 最近日志 |
 | 远程命令 | 命令历史(datalist)、破坏性命令两次点击确认(Host 端仍二次拦截); 批量执行逐台结果表 |
 | 受控发布 | 上传本地文件(OSS 中继 ≤1GB) + 重启/生效命令 + 健康检查, 三阶段进度; 可保存/复用模板; **模式可切换为「Runbook」**(直接跑工作区跑书, 带预演)(v0.6.2+) |
-| Runbook(发布跑书) | 扫描 `<工作区>/.dsh/workbench-ecs/runbooks/*.json`, 列出名称/说明/步数/类型/参数占位(坏文件标为无效而不影响其它条目); 填目标实例与参数 JSON 后可 **预演**(零副作用)或 **执行**; 结果按步骤渲染(含 `skipped` 标记与断言逐条 ✔/✘)(v0.6.2+) |
+| Runbook(发布跑书) | 扫描 `<工作区>/.dsh/workbench-ecs/runbooks/*.json`, 列出名称/说明/步数/类型/参数占位与**静态校验结论**(坏文件标为无效而不影响其它条目); 逐条 **校验**(只读, 逐条列出 error/warn 与步骤定位)/ **预演**(零副作用) / **执行**; 结果按步骤渲染(含 `skipped` 标记与断言逐条 ✔/✘)(v0.6.2+, 校验 v0.6.3+) |
 | Workbench 会话 | 会话列表 / 关闭单会话 / 关闭全部(排障与资源回收) |
 | 操作时间线 | 本次会话面板内所有操作留痕 |
 
@@ -258,7 +258,7 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 
 | 半 | 文件 | 职责 |
 |---|---|---|
-| Host 半(Node) | `lib/index.js` | 通过 `tools` 注册 8 个模型工具; 通过 `webServer` 注册同源路由 `/dsh-workbench-ecs/health` 与 `/dsh-workbench-ecs/rpc`; 设置页 RPC 经 `subprocess` 执行本机 CLI(共享 `lib/common.js` / `lib/settings-api.js` / `lib/steps-engine.js`; runbook 机制在 `lib/runbooks.js`) |
+| Host 半(Node) | `lib/index.js` | 通过 `tools` 注册 9 个模型工具; 通过 `webServer` 注册同源路由 `/dsh-workbench-ecs/health` 与 `/dsh-workbench-ecs/rpc`; 设置页 RPC 经 `subprocess` 执行本机 CLI(共享 `lib/common.js` / `lib/settings-api.js` / `lib/steps-engine.js`; runbook 机制在 `lib/runbooks.js`) |
 | 浏览器半 | `lib/client.js` | 单文件 client bundle(`window.__ModuleLoader__` 工厂形式): 注册「Workbench ECS」设置页标签, 经同源 RPC 路由与 Host 通信 |
 | 组合层 | `cordis.patch.yml` | `dsh.bundle` patch: 把插件行插入 profile 组合 —— `dsh web` 启动即生效, 由 `dsh plugin --profile web add` 自动装载 |
 
@@ -473,7 +473,41 @@ runbook 文件形状:
 
 - 面板与 Agent **共用同一个编排引擎**(`lib/steps-engine.js`),因此预演出来的命令行与 Agent 真正下发的逐字一致 —— 不会出现"面板能跑、工具跑不通"的漂移;
 - **守卫口径差异(有意)**:面板没有审批上下文,命中破坏性命令模式**直接拒绝**并把错误定位到具体步骤(要审批放行请走 Agent 的 `ecs_deploy`);`read_only` 步骤按只读护栏预检;
-- 面板侧 RPC 操作:`runbook-list` / `runbook-plan` / `runbook-run`(同源路由 `/dsh-workbench-ecs/rpc`)。
+- 面板侧 RPC 操作:`runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run`(同源路由 `/dsh-workbench-ecs/rpc`)。
+
+### `ecs_runbook` —— 工作区跑书的只读清点与静态校验(v0.6.3+)
+
+CLI 对应: **无** —— 本工具不调用任何 CLI 命令, 也不触达 ECS 实例(纯本地文件 + 纯逻辑)
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `action` | string | ✅ | `list` 列出全部 runbook 及校验结论; `validate` 对某一份逐条给出静态校验问题; `plan` 按参数展开成计划并回显命令(不执行) |
+| `runbook` | string \| object | validate / plan | `"名字"` → 读工作区 `.dsh/workbench-ecs/runbooks/<name>.json`; 或内联对象 |
+| `runbook_params` | object | | 参数对象(覆盖默认值并替换 `${占位符}`); 隐式可用 `instance_id` / `region` |
+| `instance_id` / `region` | string | | 可选: 仅供 `plan` 展示目标(缺省显示 `<instance_id>`) |
+
+**为什么值得先跑一遍**: runbook 是**纯数据**, 因此"哪里写错了"完全可以在下发任何命令之前查清。校验覆盖:
+
+| 类别 | 例子 |
+|---|---|
+| 结构(与执行期**同一份**校验, 文案逐字一致) | 非法 `kind`、upload 缺 `local_file`/`remote_path`、`command` 与 `script` 同给、超过 20 步 |
+| 字段笔误(最隐蔽: 多余字段会被静默忽略) | `commnad` → `是否想写 command?` |
+| 断言太弱 | `assert` 的 `expect` 为空 → 实际只校验了 `exit_code=0` |
+| 护栏矛盾 | `read_only: true` 的命令命中写操作模式 → 执行时必被拒(报 error) |
+| 破坏性命令 | 命中 `rm -rf` / `systemctl stop` 等 → 提醒 Agent 侧需审批、面板侧会被直接拒绝 |
+| 参数 | 缺参数(报 error; 大写名字会提示用 `$${NAME}` 转义)、多余入参、`params` 里从未使用的默认值 |
+| tail 语义 | 既无 `wait_seconds` 又无 `exit_file` → 只读一次(文件还在写就会读到半截) |
+
+```
+# 建议顺序: 先只读校验, 再预演, 最后才执行
+ecs_runbook { action: "validate", runbook: "release", runbook_params: { sha: "abc123" } }
+ecs_runbook { action: "plan",     runbook: "release", instance_id: "i-xxx", runbook_params: { sha: "abc123" } }
+ecs_deploy  { instance_id: "i-xxx", runbook: "release", runbook_params: { sha: "abc123" } }
+```
+
+> **shell 变量要转义**: `${NAME}` 会被当成 runbook 占位符; 想留给远端 shell 展开请写 `$${NAME}`
+> (插件原样保留 `${NAME}`, 不参与替换也不参与"声明参数"统计)。
+> 设置页的 Runbook 卡片同样有「校验」按钮(等价于 `validate`, 不触达实例)。
 
 ### `ecs_session` —— 会话管理
 

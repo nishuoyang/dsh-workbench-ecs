@@ -28,8 +28,9 @@ import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
 import { createSettingsCore } from '../lib/settings-api.js'
 import {
   isValidRunbookName, substituteParams, collectParamNames, parseRunbook, buildRunbookRun,
-  loadRunbook, listRunbookNames, RUNBOOK_DIR,
+  loadRunbook, listRunbookNames, RUNBOOK_DIR, lintRunbook,
 } from '../lib/runbooks.js'
+import { ecsRunbookDefinition } from '../lib/tools/ecs-runbook.js'
 
 let passed = 0
 let failed = 0
@@ -1196,6 +1197,181 @@ await runAsync('设置页 runbook-run: 缺少 instance_id / 未知 runbook 都�
   const badShape = await core.runbookRun({ instance_id: 'i-x', runbook: ['nope'] })
   assert.equal(badShape.ok, false)
   assert.match(String(badShape.error), /runbook 必须是名字字符串/)
+})
+
+// ---- v0.6.3: Runbook 静态校验(lint)与 ecs_runbook 工具 ----
+run('$${name} 转义: shell 变量不再被当成 runbook 占位符', () => {
+  assert.equal(substituteParams('echo $${HOME}', {}), 'echo ${HOME}', '转义后应原样保留 ${HOME}')
+  assert.equal(substituteParams('echo $${HOME} && echo ${sha}', { sha: 'abc' }), 'echo ${HOME} && echo abc')
+  assert.equal(substituteParams('$${sha}', { sha: 'abc' }), '${sha}', '转义优先于替换')
+  assert.deepEqual(Array.from(collectParamNames('echo $${HOME} ${sha}')), ['sha'], '转义后的名字不计入声明参数')
+  const missing = new Set()
+  substituteParams('echo $${HOME}', {}, missing)
+  assert.deepEqual(Array.from(missing), [], '转义不产生缺失参数')
+  // 未转义的 shell 变量仍按占位符处理(并给出转义提示, 见 lint 用例)
+  assert.equal(substituteParams('echo ${HOME}', {}), 'echo ${HOME}')
+})
+
+run('lintRunbook: 结构/字段/断言/护栏/参数五类问题一次报全', () => {
+  const text = JSON.stringify({
+    name: 'demo',
+    params: { sha: 'latest', unused: 'x' },
+    steps: [
+      { kind: 'exec', command: 'echo ${sha}', commnad: 'typo' },              // 字段笔误
+      { kind: 'assert', command: 'curl -fsS http://127.0.0.1/health', expect: {} }, // 断言无判据
+      { kind: 'exec', command: 'rm -rf /tmp/x', read_only: true },            // 只读矛盾 + 破坏性
+      { kind: 'tail', path: '/tmp/x.log' },                                    // 只读一次
+      { kind: 'upload', local_file: 'a.tgz', remote_path: '/opt/', verify_sha256: false }, // 关闭校验
+      { kind: 'exec', command: 'echo ${MISSING_ENV}' },                        // 缺参数(像 shell 变量)
+    ],
+  })
+  const report = lintRunbook(text, { name: 'demo' })
+  assert.equal(report.ok, false, '有 error 时 ok 应为 false')
+  const codes = report.issues.map((i) => i.code)
+  for (const code of ['unknown_field', 'weak_assert', 'read_only_conflict', 'destructive', 'tail_once', 'no_verify', 'missing_param', 'unused_default']) {
+    assert.ok(codes.includes(code), '应报出 ' + code + ', 实际: ' + codes.join(','))
+  }
+  assert.equal(report.error_count, 2, '错误应为 2 条(只读矛盾 + 缺参数)')
+  assert.ok(report.warn_count >= 5, '提醒应不少于 5 条, 实际 ' + report.warn_count)
+  const typo = report.issues.find((i) => i.code === 'unknown_field')
+  assert.equal(typo.step, 0)
+  assert.match(typo.message, /是否想写 command/)
+  const missing = report.issues.find((i) => i.code === 'missing_param')
+  assert.match(missing.message, /缺少参数 MISSING_ENV/)
+  assert.match(missing.message, /\$\$\{MISSING_ENV\} 转义/, '大写名字应给转义提示: ' + missing.message)
+  assert.equal(report.summary.step_count, 6)
+  assert.deepEqual(report.declared_params, ['MISSING_ENV', 'sha'])
+})
+
+run('lintRunbook: 结构错误与执行期报错同源(含 step 定位)', () => {
+  const report = lintRunbook(JSON.stringify({
+    steps: [
+      { kind: 'exec', command: 'echo ok' },
+      { kind: 'upload', remote_path: '/only-remote' },
+      { kind: 'rm', command: 'x' },
+      { command: 'a', script: 'b' },
+    ],
+  }), { name: 'bad' })
+  assert.equal(report.ok, false)
+  const stepErrors = report.issues.filter((i) => i.code === 'step_invalid')
+  assert.equal(stepErrors.length, 3, '三步各自应报一条结构错误: ' + JSON.stringify(report.issues))
+  assert.deepEqual(stepErrors.map((i) => i.step), [1, 2, 3])
+  assert.match(stepErrors[0].message, /缺少 local_file/)
+  assert.match(stepErrors[1].message, /kind 非法/)
+  assert.match(stepErrors[2].message, /二选一/)
+})
+
+run('lintRunbook: 解析失败与干净 runbook', () => {
+  const broken = lintRunbook('{ not json }', { name: 'broken' })
+  assert.equal(broken.ok, false)
+  assert.equal(broken.issues[0].code, 'parse')
+  assert.equal(broken.summary, undefined)
+
+  const clean = lintRunbook(JSON.stringify({
+    name: 'clean',
+    params: { sha: 'latest', log: '/tmp/r.log' },
+    steps: [
+      { kind: 'upload', local_file: 'dist.tgz', remote_path: '/opt/', description: '上传' },
+      { kind: 'exec', command: 'bash /opt/deploy.sh ${sha}', description: '执行' },
+      { kind: 'assert', command: 'curl -fsS http://127.0.0.1/health', expect: { stdout_contains: ['ok'] } },
+      { kind: 'tail', path: '${log}', exit_file: '${log}.exit', wait_seconds: 60 },
+    ],
+  }), { name: 'clean' })
+  assert.equal(clean.ok, true, JSON.stringify(clean.issues))
+  assert.equal(clean.error_count, 0)
+  assert.equal(clean.warn_count, 0)
+  assert.deepEqual(clean.missing_params, undefined)
+})
+
+await runAsync('ecs_runbook 工具: list / validate / plan(纯只读, 零远程调用)', async () => {
+  const files = {
+    ['/ws/' + RUNBOOK_DIR + '/demo.json']: JSON.stringify({
+      name: 'demo', description: '演示', params: { sha: 'latest' },
+      steps: [{ kind: 'exec', command: 'echo ${sha}' }],
+    }),
+    ['/ws/' + RUNBOOK_DIR + '/broken.json']: '{ broken',
+  }
+  const ctx = {
+    get: (n) => {
+      if (n === 'fs') return fakeFs(files)
+      if (n === 'sandboxPolicy') return { workspaceRoot: '/ws' }
+      return undefined
+    },
+  }
+  const def = ecsRunbookDefinition(ctx)
+  const exec = { name: 'ecs_runbook', signal: { aborted: false } }
+
+  const list = await def.execute({ action: 'list' }, exec)
+  assert.equal(list.action, 'list')
+  assert.equal(list.count, 2)
+  assert.ok(String(list.dir).endsWith(RUNBOOK_DIR))
+  const demo = list.runbooks.find((r) => r.name === 'demo')
+  assert.equal(demo.ok, true)
+  assert.equal(demo.step_count, 1)
+  assert.deepEqual(demo.declared_params, ['sha'])
+  const broken = list.runbooks.find((r) => r.name === 'broken')
+  assert.equal(broken.ok, false)
+  assert.ok(broken.error_count >= 1)
+
+  const report = await def.execute({ action: 'validate', runbook: 'demo' }, exec)
+  assert.equal(report.action, 'validate')
+  assert.equal(report.ok, true)
+  assert.equal(report.error_count, 0)
+  const reportText = def.output.render({}, report)[0].text
+  assert.ok(reportText.includes('Runbook 校验'), reportText.slice(0, 120))
+  assert.ok(reportText.includes('未发现问题'), reportText.slice(0, 200))
+
+  const plan = await def.execute({ action: 'plan', runbook: 'demo', instance_id: 'i-x', runbook_params: { sha: 'deadbeef' } }, exec)
+  assert.equal(plan.action, 'plan')
+  assert.equal(plan.ok, true)
+  assert.equal(plan.total_stage, 1)
+  assert.ok(plan.plan[0].command_line.includes('echo deadbeef'), plan.plan[0].command_line)
+  const planText = def.output.render({}, plan)[0].text
+  assert.ok(planText.includes('未执行任何命令'), planText.slice(0, 300))
+
+  // 缺参数: plan 明确拒绝而不是下发未替换的占位符
+  const missing = await def.execute({ action: 'plan', runbook: { steps: [{ command: 'echo ${nope}' }] } }, exec)
+  assert.equal(missing.ok, false)
+  assert.deepEqual(missing.missing_params, ['nope'])
+  // 动作白名单
+  await assert.rejects(() => def.execute({ action: 'run' }, exec), /action 非法/)
+  assert.ok(def.presentCall({ action: 'list' }).title.includes('list'))
+})
+
+await runAsync('设置页 runbook-validate: 单份静态校验(含参数齐备性), 列表带校验计数', async () => {
+  const files = {
+    good: JSON.stringify({ name: 'good', steps: [{ command: 'echo hi' }] }),
+    needparam: JSON.stringify({ steps: [{ command: 'echo ${sha}' }] }),
+    typo: JSON.stringify({ steps: [{ kind: 'exec', commnad: 'echo x', command: 'echo y' }] }),
+  }
+  const core = settingsCoreWith(files, () => '{}')
+  const list = await core.runbookList()
+  const good = list.runbooks.find((r) => r.name === 'good')
+  assert.equal(good.lint_ok, true)
+  assert.equal(good.error_count, 0)
+  const need = list.runbooks.find((r) => r.name === 'needparam')
+  assert.equal(need.lint_ok, true, '列表视图里"缺参数"不计为错误(是否缺取决于本次入参)')
+  assert.deepEqual(need.required_params, ['sha'], '应给出必填参数(无默认值且非隐式)')
+  const typo = list.runbooks.find((r) => r.name === 'typo')
+  assert.equal(typo.error_count, 0)
+  assert.ok(typo.warn_count >= 1)
+  assert.match(String(typo.first_issue), /不被 exec 步骤识别/)
+
+  const okReport = await core.runbookValidate({ runbook: 'good' })
+  assert.equal(okReport.ok, true)
+  assert.equal(okReport.error_count, 0)
+  assert.equal(okReport.source, 'workspace')
+  const missingReport = await core.runbookValidate({ runbook: 'needparam' })
+  assert.equal(missingReport.ok, false)
+  assert.deepEqual(missingReport.missing_params, ['sha'])
+  const withParams = await core.runbookValidate({ runbook: 'needparam', params: '{"sha":"x"}' })
+  assert.equal(withParams.ok, true, '传入参数后应通过(参数可用 JSON 文本)')
+  const badJson = await core.runbookValidate({ runbook: 'needparam', params: '{oops' })
+  assert.equal(badJson.ok, false)
+  assert.match(String(badJson.error), /不是合法 JSON/)
+  const inline = await core.runbookValidate({ runbook: { name: 'inline', steps: [{ path: '/x' }] } })
+  assert.equal(inline.source, 'inline')
+  assert.equal(inline.ok, false)
 })
 
 console.log('')
