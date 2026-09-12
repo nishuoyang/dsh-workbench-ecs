@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.5.0 · MIT License
+> v0.5.1 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -21,7 +21,10 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Read-only guard** (v0.4.0+): `read_only` on `ecs_exec` / `ecs_diagnose` rejects write operations before they reach a shell (redirects, `rm`/`mv`/`cp`/`chmod`, `docker`/`systemctl` mutations, `nohup`, …); on by default for `ecs_diagnose`, with zero false positives on the built-in diagnostic script
 - **Transfer integrity** (v0.4.0+): `ecs_upload.verify_sha256` compares local/remote digests after upload; `ecs_deploy` enables it by default and **aborts before restart** on a mismatch. Local hashing uses `sha256sum`/`shasum`/`certutil`, so no extra runtime is required
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
-- **Batch execution**: `ecs_exec` supports an `instance_ids` array (serial; per-instance failures do not stop others)
+- **Batch execution**: `ecs_exec` supports an `instance_ids` array (per-instance failures do not stop others); `concurrency` controls parallelism (default 4 when `read_only`, otherwise serial) while the same instance still serializes behind its lock — cluster triage no longer queues one host at a time (v0.5.1+)
+- **Recursive directory upload** (v0.5.1+): `ecs_upload { local_dir: "dist" }` does "local `tar` → upload → sha256 verify → remote extract" in one call; a checksum mismatch **aborts the extract**, so a corrupt archive never rewrites the remote directory
+- **Structured output** (v0.5.1+): `output_json: true` returns stable JSON text for downstream automation (`ecs_exec` / `ecs_list`)
+- **Background jobs**: `ecs_exec` supports `run_in_background` — long commands are registered with the jobs service, read incrementally with `job_output`, terminated with `job_kill`; with a batch, each instance gets its own job and the call returns `job_ids` (v0.5.1+)
 - **Per-instance serialization**: operations touching the same instance run one at a time (FIFO), so concurrent calls can never interleave output through the shared Workbench session; different instances still run in parallel. Detached tasks only hold the lock during each poll instead of for the whole run (v0.5.0+)
 - **Large-output spill**: oversized stdout spills to disk with the full path returned, so log triage never loses the head
 - **Output cleanup**: ANSI escapes, control characters and CLI progress frames (spinners, percentage bars) are stripped by default, so logs and upload results stay readable (`strip_ansi: false` opts out)
@@ -51,7 +54,7 @@ That's it — the bundle layer inserts the plugin row into the web profile: the 
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.0"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.1"}
 ```
 
 Then ask the Agent:
@@ -272,9 +275,18 @@ CLI equivalent: `workbench list ecs --region <region> [filters...] --output json
 | `tag` | array\<string\> | | Tag filter, each entry `key=value` or `key`, repeatable, AND logic |
 | `instance_type` | string | | Instance type filter, e.g. `ecs.g7.large` |
 | `instance_name` | string | | Instance name filter, `*` wildcard supported |
+| `vpc_id` | string | | VPC ID filter (v0.5.1+) |
+| `vswitch_id` | string | | VSwitch ID filter (v0.5.1+) |
+| `zone_id` | string | | Zone filter (v0.5.1+), e.g. `cn-shanghai-a` |
+| `private_ip` | array\<string\> | | Private IP filter (v0.5.1+), repeatable |
+| `image_id` | string | | Image ID filter (v0.5.1+) |
 | `limit` | integer | | Page size 10–100, default 50 (ECS API page-size floor is 10) |
+| `next_token` | string | | Token returned by the previous page (v0.5.1+, passed through to the CLI) |
+| `output_json` | boolean | | Return stable JSON text instead of the rendered table (v0.5.1+) |
 
 Returns the instance list (instance IDs feed the other tools), rendered as a text table.
+
+> **Pagination status (measured on v0.5.1)**: `list ecs --output json` returns **only `instances`** — no `NextToken`/`TotalCount` — so the plugin cannot page automatically. When the result count reaches `limit` and the CLI returned no token, the value carries a `pagination_note` that says so explicitly (instead of letting the model assume "that's all"). Mitigation: tighten the filters (`instance_name`/`tag`/`status`/`vpc_id`/`zone_id`). A real fix needs the CLI to expose `NextToken` in its JSON output (tracked as an upstream ask in `docs/workbench-ecs-改良计划-20260912.md`).
 
 ### `ecs_exec` — run a remote command on an instance (enhanced)
 
@@ -283,7 +295,8 @@ CLI equivalent: `workbench exec --instance-id <id> --command <cmd> [--timeout <s
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `instance_id` | string | | Target instance ID (alternate with `instance_ids`) |
-| `instance_ids` | array\<string\> | | Batch targets (serial, max 20, per-instance failures do not stop others) |
+| `instance_ids` | array\<string\> | | Batch targets (max 20, per-instance failures do not stop others; `concurrency` optional) |
+| `concurrency` | integer | | Batch parallelism (v0.5.1+; defaults to 4 when `read_only`, otherwise 1/serial). Same-instance calls still serialize behind the instance lock — only cross-instance work truly parallelizes |
 | `command` | string | | Remote command (alternate with `script`); chain with `&&` or `;` when shared context is needed |
 | `script` | string | | Script body (alternate with `command`). **Zero escaping**: the text is base64-delivered to a remote file and executed, so quotes, Chinese, `$`, backticks, multi-line and heredocs need no handling |
 | `shell` | `bash`\|`sh` | | Interpreter for `script` mode, default `bash` |
@@ -293,15 +306,16 @@ CLI equivalent: `workbench exec --instance-id <id> --command <cmd> [--timeout <s
 | `strip_ansi` | boolean | | Strip ANSI/control chars/progress frames (default true) |
 | `timeout` | integer | | Remote command timeout in seconds, default 60 (always sent explicitly; the CLI default is only 30) |
 | `region` | string | | Region, optional (CLI infers it from the instance ID) |
-| `run_in_background` | boolean | | Run long commands in the background: returns a `job_id`, read with `job_output` (not for batches) |
+| `run_in_background` | boolean | | Run long commands in the background: returns a `job_id`, read with `job_output`; combined with `instance_ids` each instance gets its own job and the call returns `job_ids` (v0.5.1+) |
 | `detach` | boolean | | **Remote detached task** (recommended for release/build work lasting minutes to hours): remote `nohup` + log file, returns `job_id`/`log_path`/`exit_path` immediately; polls increments without holding the instance |
 | `poll_interval` | integer | | Detach poll interval in seconds, default 2 |
 | `max_duration` | integer | | How long the plugin tracks a detached task, default 3600s; on expiry it stops tracking (the remote task keeps running) |
 | `session_id` | string | | **Pseudo-session**: keeps cwd/env across calls with the same id; single-instance foreground only |
 | `session_reset` | boolean | | Clear this session's cwd/env before executing |
 | `env` | array\<string\> | | Session-persistent environment entries, each `K=V`, merged with existing ones |
+| `output_json` | boolean | | Return stable JSON text (v0.5.1+; for downstream automation), default false renders readable text |
 
-Returns `{ kind: single|batch|background|detached, ... }` (including `exit_code` / `request_id` / `cli_session_id`, plus `session_cwd` / `env_keys` in session mode).
+Returns `{ kind: single|batch|batch_background|background|detached, ... }` (including `exit_code` / `request_id` / `cli_session_id`, plus `session_cwd` / `env_keys` in session mode and `concurrency` for batches).
 
 **When to use `script`**: whenever the command contains nested quotes. Compare —
 
@@ -334,14 +348,20 @@ CLI equivalent: `workbench upload <local-file> <remote-path> --instance-id <id> 
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `local_file` | string | ✅ | Local file path (relative paths resolve against the session workspace) |
-| `remote_path` | string | ✅ | Remote target path (a trailing separator means directory; the file name is appended) |
+| `local_file` | string | | Local file path (relative paths resolve against the session workspace); alternate with `local_dir` |
+| `local_dir` | string | | Local directory (**recursive upload**, v0.5.1+): local `tar` → upload → remote extract; alternate with `local_file` |
+| `remote_path` | string | ✅ | Remote target. For `local_file`: a path (a trailing separator means directory, the file name is appended). For `local_dir`: the **target directory** |
 | `instance_id` | string | ✅ | Target instance ID |
 | `region` | string | | Region, optional |
 | `force` | boolean | | Overwrite an existing remote file without confirmation (default false) |
-| `verify_sha256` | boolean | | Compare local/remote sha256 after upload (default false; recommended on release paths) |
+| `verify_sha256` | boolean | | Compare local/remote sha256 after upload (default false; recommended on release paths. In directory mode a mismatch **aborts the extract**) |
+| `keep_root_dir` | boolean | | Directory mode: keep the archive's top-level directory name (default false — only the directory contents are uploaded) |
+| `keep_archive` | boolean | | Directory mode: keep the remote archive after extraction (default false — removed) |
+| `timeout` | integer | | Directory mode: timeout for the remote extract command in seconds, default 120 |
 
 Transfers through Alibaba Cloud OSS (up to 1GB). Returns `verification` (`ok` / `mismatch` / `remote-unavailable` / `local-tool-unavailable`) plus both digests. Pair with `ecs_deploy` / `ecs_exec` for deployments.
+
+**Recursive directory upload** (v0.5.1+) collapses "pack locally → upload → extract remotely" into one call with a fixed order of **archive → upload → verify → extract**: on a sha256 mismatch the extract command is never issued, so a corrupt archive cannot rewrite the remote directory. Returns `entries` (archive entry count) / `extracted` / `local_archive_cleanup`. The local archive is staged in the session workspace root and removed afterwards (`.dsh-ecs-upload-*.tar.gz`). Requires local `tar` (bundled with Windows 10+ / Linux).
 
 ### `ecs_download` — download a file from an instance
 

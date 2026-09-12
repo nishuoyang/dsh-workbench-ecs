@@ -3,3 +3,5 @@ node_modules/
 *.log
 .DS_Store
 test/body*.js
+# 目录上传(S5b)在工作区根目录暂存的本地归档, 正常情况下会被自动清理
+.dsh-ecs-upload-*

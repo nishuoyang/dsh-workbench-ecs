@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.5.0 · MIT License
+> v0.5.1 · MIT License
 
 [English](./README.md) | 中文
 
@@ -20,8 +20,10 @@
 - **脚本直送**(v0.4.0+): `ecs_exec` 的 `script` 参数把脚本正文 base64 投递远端落盘后执行, 内容不经过任何 shell 引用层 —— `docker exec ... node -e "..."` 这类多层引号组合、中文、`$`、反引号、heredoc、多行全部**零转义**; 超过 16KB 自动分片投递, 并按字节数校验落盘完整性
 - **只读护栏**(v0.4.0+): `ecs_exec` / `ecs_diagnose` 的 `read_only` 在命令进入 shell 之前拒绝写操作(重定向、`rm`/`mv`/`cp`/`chmod`、`docker` 变更、`systemctl` 变更、`nohup` 等); `ecs_diagnose` **默认开启**, 且预置诊断脚本零误杀
 - **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
-- **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止
-- **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(串行, 单台失败不中断), 适合集群排查
+- **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止; 批量时每台实例各起一个 job 并返回 `job_ids`(v0.5.1+)
+- **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(单台失败不中断), 适合集群排查; `concurrency` 控制并发(默认只读 4 / 写 1 串行), 同实例仍由实例锁串行 —— 集群排查不再逐台排队(v0.5.1+)
+- **目录递归上传**(v0.5.1+): `ecs_upload { local_dir: "dist" }` 一次调用完成「本机 `tar` 归档 → 上传 → sha256 校验 → 远端解包」, 省掉手工打包; 校验失败**中止解包**, 坏包不会改写远端目录
+- **结构化输出**(v0.5.1+): `output_json: true` 直接返回稳定 JSON 文本, 便于下游自动化接线(`ecs_exec` / `ecs_list`)
 - **同实例串行化**: 同一实例上的操作按 FIFO 逐个执行, 并发调用不会经由共享的 Workbench 会话互相串流; 不同实例仍可并行。detach 任务只在每次轮询期间短暂持锁, 不再长期占用实例名额(v0.5.0+)
 - **大输出 spill**: stdout 超限自动落盘并返回完整输出路径, 日志排查不再截断丢头
 - **输出清洗**: 默认剔除 ANSI 转义、控制字符与 CLI 进度帧(spinner/百分比条), 日志与上传结果直接可读(`strip_ansi: false` 可关闭)
@@ -51,7 +53,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.0"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.1"}
 ```
 
 然后让 Agent 调用:
@@ -272,9 +274,18 @@ CLI 对应: `workbench list ecs --region <region> [过滤项...] --output json`
 | `tag` | array\<string\> | | 标签过滤, 每项 `key=value` 或 `key`, 可重复, 多个取交集 |
 | `instance_type` | string | | 按实例规格过滤, 例如 `ecs.g7.large` |
 | `instance_name` | string | | 按实例名称过滤, 支持 `*` 通配符 |
+| `vpc_id` | string | | 按 VPC ID 过滤(v0.5.1+) |
+| `vswitch_id` | string | | 按交换机(VSwitch) ID 过滤(v0.5.1+) |
+| `zone_id` | string | | 按可用区过滤(v0.5.1+), 例如 `cn-shanghai-a` |
+| `private_ip` | array\<string\> | | 按私网 IP 过滤(v0.5.1+), 可多个 |
+| `image_id` | string | | 按镜像 ID 过滤(v0.5.1+) |
 | `limit` | integer | | 每页数量 10–100, 默认 50(ECS API 页大小下限为 10) |
+| `next_token` | string | | 上一页返回的 token(v0.5.1+, 透传给 CLI) |
+| `output_json` | boolean | | 以稳定 JSON 文本返回结果(v0.5.1+) |
 
 返回实例清单(实例ID为其它工具的输入), 渲染为文本表格。
+
+> **分页现状(v0.5.1 实测)**: CLI 的 `list ecs --output json` **只返回 `instances`**, 不含 `NextToken`/`TotalCount` —— 因此插件无法自动翻页。当返回条数顶到 `limit` 且 CLI 未给 token 时, 结果里会出现 `pagination_note` 明确提示(避免误以为"就这么多"); 缓解办法是收紧过滤条件(`instance_name`/`tag`/`status`/`vpc_id`/`zone_id`)。彻底解决需要 CLI 侧在 JSON 输出中透出 `NextToken`(已记入 `docs/workbench-ecs-改良计划-20260912.md` 的上游需求)。
 
 ### `ecs_exec` —— 在指定实例上执行远程命令(增强版)
 
@@ -283,7 +294,8 @@ CLI 对应: `workbench exec --instance-id <id> --command <cmd> [--timeout <s>] -
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `instance_id` | string | | 目标实例 ID(与 `instance_ids` 二选一) |
-| `instance_ids` | array\<string\> | | 批量目标(串行, 最多 20 台, 单台失败不中断) |
+| `instance_ids` | array\<string\> | | 批量目标(最多 20 台, 单台失败不中断; 可选 `concurrency` 并发) |
+| `concurrency` | integer | | 批量并发度(v0.5.1+; 默认 `read_only=true` 时 4, 否则 1 串行)。同实例仍由实例锁串行, 跨实例才真正并行 |
 | `command` | string | | 远程命令(与 `script` 二选一); 需要共享上下文时用 `&&` 或 `;` 串联 |
 | `script` | string | | 脚本正文(与 `command` 二选一)。**零转义**: base64 投递远端落盘后执行, 引号/中文/`$`/反引号/多行/heredoc 都不需要处理 |
 | `shell` | `bash`\|`sh` | | `script` 模式的远端解释器, 默认 `bash` |
@@ -293,15 +305,16 @@ CLI 对应: `workbench exec --instance-id <id> --command <cmd> [--timeout <s>] -
 | `strip_ansi` | boolean | | 清洗 ANSI/控制字符/进度帧(默认 true) |
 | `timeout` | integer | | 远端命令超时(秒), 默认 60(显式下发; CLI 自身默认仅 30) |
 | `region` | string | | 地域, 可缺省(CLI 从实例 ID 自动推断) |
-| `run_in_background` | boolean | | 后台执行长命令: 立即返回 `job_id`, `job_output` 增量读取(不适用于批量) |
+| `run_in_background` | boolean | | 后台执行长命令: 立即返回 `job_id`, `job_output` 增量读取; 与 `instance_ids` 同用时每台一个 job, 返回 `job_ids` 数组(v0.5.1+) |
 | `detach` | boolean | | **远端 detach 长任务**(发布/构建等分钟~小时级操作推荐): 远端 `nohup` + 日志文件, 立即返回 `job_id`/`log_path`/`exit_path`; 轮询增量且不长期占锁 |
 | `poll_interval` | integer | | detach 轮询间隔(秒), 默认 2 |
 | `max_duration` | integer | | detach 最长跟踪时长(秒), 默认 3600; 超时停止跟踪(远端任务继续跑) |
 | `session_id` | string | | **伪会话**: 同一 id 下保留 cwd/环境变量; 仅单实例前台(不能与批量/detach/后台同用) |
 | `session_reset` | boolean | | 先清空该会话的 cwd/环境变量再执行 |
 | `env` | array\<string\> | | 会话内持久环境变量, 每项 `K=V`, 与已有会话变量合并 |
+| `output_json` | boolean | | 以稳定 JSON 文本返回结果(v0.5.1+; 便于下游自动化解析), 默认 false 返回可读文本 |
 
-返回 `{ kind: single|batch|background|detached, ... }`(含 `exit_code` / `request_id` / `cli_session_id`, 会话模式下还有 `session_cwd` / `env_keys`)。
+返回 `{ kind: single|batch|batch_background|background|detached, ... }`(含 `exit_code` / `request_id` / `cli_session_id`, 会话模式下还有 `session_cwd` / `env_keys`, 批量时还有 `concurrency`)。
 
 **什么时候用 `script`**: 命令里出现任何嵌套引号就一律用它。典型对比 ——
 
@@ -335,14 +348,20 @@ CLI 对应: `workbench upload <local-file> <remote-path> --instance-id <id> [--f
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `local_file` | string | ✅ | 本地文件路径(相对路径基于会话工作区) |
-| `remote_path` | string | ✅ | 远端目标路径(以分隔符结尾视为目录, 自动拼接文件名) |
+| `local_file` | string | | 本地文件路径(相对路径基于会话工作区); 与 `local_dir` 二选一 |
+| `local_dir` | string | | 本地目录路径(**递归上传**, v0.5.1+): 本机 `tar` 归档 → 上传 → 远端解包; 与 `local_file` 二选一 |
+| `remote_path` | string | ✅ | 远端目标路径(`local_file` 时以分隔符结尾视为目录, 自动拼接文件名; `local_dir` 时为**目标目录**) |
 | `instance_id` | string | ✅ | 目标实例 ID |
 | `region` | string | | 地域, 可缺省 |
 | `force` | boolean | | 覆盖远端已存在文件而不需确认(默认 false) |
-| `verify_sha256` | boolean | | 上传后比对本地/远端 sha256(默认 false; 发布关键路径建议开启) |
+| `verify_sha256` | boolean | | 上传后比对本地/远端 sha256(默认 false; 发布关键路径建议开启。**目录模式校验失败会中止解包**) |
+| `keep_root_dir` | boolean | | 目录模式: 保留归档顶层的目录名(默认 false, 即只上传目录内容) |
+| `keep_archive` | boolean | | 目录模式: 远端解包后保留归档文件(默认 false, 解包后删除) |
+| `timeout` | integer | | 目录模式远端解包命令超时(秒), 默认 120 |
 
 经阿里云 OSS 中继传输(最大 1GB)。返回 `verification`(`ok` / `mismatch` / `remote-unavailable` / `local-tool-unavailable`)与两侧摘要。搭配 `ecs_deploy` / `ecs_exec` 完成发布。
+
+**目录递归上传**(v0.5.1+)把"本地打包 → 上传 → 远端解包"收敛成一次调用, 顺序固定为 **归档 → 上传 → 校验 → 解包**: sha256 不一致时**不下发解包命令**, 远端目录不会被损坏的包改写; 返回 `entries`(归档条目数)/`extracted`/`local_archive_cleanup`。本地归档暂存在会话工作区根目录并在结束后自动清理(`.dsh-ecs-upload-*.tar.gz`)。需要本机 `tar`(Windows 10+ / Linux 自带)。
 
 ### `ecs_download` —— 从实例下载文件到本地
 

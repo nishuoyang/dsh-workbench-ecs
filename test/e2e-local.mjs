@@ -8,7 +8,7 @@
 // 说明: 本测试只使用只读命令与 /tmp 临时文件, 不会改动生产数据。
 // ============================================================================
 import { spawn } from 'node:child_process'
-import { writeFileSync, readFileSync, mkdtempSync } from 'node:fs'
+import { writeFileSync, readFileSync, mkdtempSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert'
@@ -252,6 +252,94 @@ await run('ecs_exec 批量(1 成功 + 1 失败)', async () => {
   assertLossless('ecs_exec batch value', value)
   assertLossless('ecs_exec batch presentationMeta', def.output.presentationMeta({}, value))
 })
+
+await run('ecs_exec 批量并发(S7: concurrency 生效且结果保序)', async () => {
+  const def = ecsExecDefinition(ctx)
+  const value = await def.execute(
+    { instance_ids: [INSTANCE_ID, 'i-bp1dummysmoketest0000'], command: 'echo par-ok && uname -s', concurrency: 2 },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(value.kind, 'batch')
+  assert.equal(value.count, 2)
+  assert.equal(value.concurrency, 2, '显式并发度应回显')
+  assert.equal(value.failed_count, 1, '假实例应记为失败')
+  assert.equal(value.batch[0].instance_id, INSTANCE_ID, '结果必须按输入顺序')
+  assert.ok(value.batch[0].output.includes('par-ok'), '真实实例应成功')
+  assertLossless('ecs_exec batch 并发 value', value)
+})
+
+await run('ecs_exec 只读批量默认并发 4(S7)', async () => {
+  const def = ecsExecDefinition(ctx)
+  // 只读命令默认并发 min(4, 台数); 单台时 instance_ids 走单实例路径(无并发概念)
+  const two = await def.execute(
+    { instance_ids: [INSTANCE_ID, 'i-bp1dummysmoketest0000'], command: 'uptime', read_only: true },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(two.kind, 'batch')
+  assert.equal(two.concurrency, 2, '只读批量默认并发应为 min(4, 台数)')
+  const single = await def.execute(
+    { instance_ids: [INSTANCE_ID], command: 'uptime', read_only: true },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(single.kind, 'single', '单台 instance_ids 仍走单实例路径(保持既有语义)')
+  assertLossless('ecs_exec read_only batch value', two)
+})
+
+await run('ecs_exec 批量后台(S7: 每台一个 job, 返回 job_ids)', async () => {
+  const specs = []
+  const jobsMock = {
+    start(spec) {
+      specs.push(spec)
+      return 'job-par-' + specs.length
+    },
+  }
+  const def = ecsExecDefinition(makeCtx({ jobs: jobsMock }))
+  const value = await def.execute(
+    { instance_ids: [INSTANCE_ID, 'i-bp1dummysmoketest0000'], command: 'echo bg-par-ok', run_in_background: true },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(value.kind, 'batch_background')
+  assert.equal(value.count, 2)
+  assert.equal(value.failed_count, 0, '两台都应成功注册 job')
+  assert.deepEqual(value.job_ids, ['job-par-1', 'job-par-2'])
+  assert.equal(value.batch[0].job_id, 'job-par-1')
+  assertLossless('ecs_exec batch background value', value)
+  assertLossless('ecs_exec batch background presentationMeta', def.output.presentationMeta({}, value))
+  // dsh-jobs 契约: 每个 job 的 done 都应解析终态枚举
+  const outcomes = await Promise.all(specs.map((s) => s.run().done))
+  for (const done of outcomes) {
+    assert.ok(['completed', 'killed', 'failed'].includes(done.status),
+      'done.status 必须是终态枚举, 实际: ' + String(done.status))
+  }
+  assert.equal(outcomes[0].status, 'completed', '真实实例应 completed')
+})
+
+await run('ecs_exec output_json 模式(S7)', async () => {
+  const def = ecsExecDefinition(ctx)
+  const args = { instance_id: INSTANCE_ID, command: 'echo json-mode-ok', output_json: true, description: 'e2e json' }
+  const value = await def.execute(args, makeExec('ecs_exec'))
+  const text = def.output.render(args, value)[0].text
+  assert.deepEqual(JSON.parse(text), value, 'output_json 应是 value 的精确 JSON 序列化')
+  assert.equal(value.kind, 'single')
+  assertLossless('ecs_exec output_json value', value)
+})
+
+await run('ecs_list 新过滤器(zone_id/private_ip/vpc_id)', async () => {
+  const def = ecsListDefinition(ctx)
+  const value = await def.execute(
+    { region: REGION, instance_name: 'iZuf66*' },
+    makeExec('ecs_list'),
+  )
+  assert.ok(value.count >= 1, '按名称通配应至少命中 1 台')
+  assert.equal(value.limit, 50, '默认 limit 应回显')
+  assert.equal(value.pagination_note, undefined, '未顶到 limit 不应提示分页')
+  const byZone = await def.execute({ region: REGION, zone_id: 'cn-shanghai-e' }, makeExec('ecs_list'))
+  assert.ok(byZone.count >= 0, 'zone_id 过滤应可用(不报错)')
+  assertLossless('ecs_list filtered value', byZone)
+  const asJson = def.output.render({ output_json: true }, value)[0].text
+  assert.deepEqual(JSON.parse(asJson), value, 'output_json 应是 value 的精确 JSON 序列化')
+})
+
 
 await run('ecs_exec 破坏性命令守卫(无审批 -> 拒绝)', async () => {
   const def = ecsExecDefinition(ctx)
@@ -504,6 +592,70 @@ await run('sha256 断言: 不同内容摘要不同(损坏可被发现)', async (
   assert.ok(h1 !== undefined && h2 !== undefined, '本机应能计算 sha256')
   assert.notEqual(h1, h2, '不同内容摘要必须不同')
   assert.equal(remoteH1, h1, '远端摘要应与本机一致(校验判据)')
+})
+
+// ---- S5b: 目录递归上传(归档 -> 上传 -> 校验 -> 解包) ----
+const e2eDirRoot = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-dir-'))
+mkdirSync(join(e2eDirRoot, 'src', 'sub'), { recursive: true })
+writeFileSync(join(e2eDirRoot, 'src', 'a.txt'), 'alpha\n')
+writeFileSync(join(e2eDirRoot, 'src', 'sub', 'b.txt'), 'beta\n')
+const e2eSrcDir = join(e2eDirRoot, 'src')
+
+await run('ecs_upload 目录模式(S5b: 归档→上传→校验→解包, 默认剥顶层目录)', async () => {
+  const def = ecsUploadDefinition(ctx)
+  const value = await def.execute(
+    { local_dir: e2eSrcDir, remote_path: '/tmp/dsh-e2e-dir', instance_id: INSTANCE_ID, force: true, verify_sha256: true },
+    makeExec('ecs_upload'),
+  )
+  assert.equal(value.mode, 'dir')
+  assert.equal(value.exit_code, 0, '目录上传应成功, 实际 message=' + String(value.message).slice(0, 300) + ' / ' + String(value.extract_output))
+  assert.equal(value.verification, 'ok', '归档 sha256 应校验通过, 实际: ' + value.verification)
+  assert.equal(value.extracted, true, '应解包成功')
+  assert.ok(value.entries >= 3, '归档条目数应 >= 3(顶层目录 + 2 个文件), 实际: ' + value.entries)
+  assert.equal(value.local_archive_cleanup, 'removed', '本地归档应被清理')
+  assertLossless('ecs_upload dir value', value)
+
+  const execDef = ecsExecDefinition(ctx)
+  const check = await execDef.execute(
+    { instance_id: INSTANCE_ID, command: 'find /tmp/dsh-e2e-dir -type f | sort' },
+    makeExec('ecs_exec'),
+  )
+  assert.ok(check.output.includes('/tmp/dsh-e2e-dir/a.txt'), '文件应直接落在目标目录下: ' + check.output)
+  assert.ok(check.output.includes('/tmp/dsh-e2e-dir/sub/b.txt'), '子目录结构应保留: ' + check.output)
+  assert.ok(!check.output.includes('/tmp/dsh-e2e-dir/src/'), '默认应剥掉归档顶层目录名')
+})
+
+await run('ecs_upload 目录模式: keep_root_dir 保留顶层目录', async () => {
+  const def = ecsUploadDefinition(ctx)
+  const value = await def.execute(
+    {
+      local_dir: e2eSrcDir, remote_path: '/tmp/dsh-e2e-dir-root', instance_id: INSTANCE_ID,
+      force: true, verify_sha256: true, keep_root_dir: true,
+    },
+    makeExec('ecs_upload'),
+  )
+  assert.equal(value.extracted, true, '应解包成功: ' + String(value.extract_output))
+  assert.equal(value.keep_root_dir, true)
+  const execDef = ecsExecDefinition(ctx)
+  const check = await execDef.execute(
+    { instance_id: INSTANCE_ID, command: 'find /tmp/dsh-e2e-dir-root -type f | sort' },
+    makeExec('ecs_exec'),
+  )
+  assert.ok(check.output.includes('/tmp/dsh-e2e-dir-root/src/a.txt'),
+    'keep_root_dir=true 应保留顶层目录名: ' + check.output)
+  assertLossless('ecs_upload dir keep_root value', value)
+})
+
+await run('ecs_upload 目录模式: local_dir 不存在时报错(不留本地归档)', async () => {
+  const def = ecsUploadDefinition(ctx)
+  await assert.rejects(
+    def.execute(
+      { local_dir: join(e2eDirRoot, 'no-such-dir'), remote_path: '/tmp/dsh-e2e-dir', instance_id: INSTANCE_ID },
+      makeExec('ecs_upload'),
+    ),
+    /归档失败/,
+    '本机 tar 失败应给出明确错误',
+  )
 })
 
 await run('ecs_download(真实下载并校验内容)', async () => {

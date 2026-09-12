@@ -247,17 +247,21 @@ nohup bash -c 'bash /tmp/.dsh-ecs/<id>/run.sh; echo $? > /tmp/.dsh-ecs/<id>/exit
 
 ---
 
-### S7 [P1 / v0.5.0] 批量并行 + 结构化输出
+### S7 [P1 / ✅ v0.5.1 已交付] 批量并行 + 结构化输出
 
-- **批量并行**:`ecs_exec` 增加 `concurrency`(默认 1 保持现状;`read_only: true` 时默认 4);
-  受实例锁约束,跨实例天然安全。上限仍 20 台。
-- **批量后台**:放开 `instance_ids` + `run_in_background`(当前被显式拒绝,`ecs-exec.js:160`),
-  每台起一个 job,返回 `job_id` 数组。
-- **JSON 模式**:`output_json: true` 时 `render` 直接输出稳定 JSON 文本(便于下游自动化接线);
-  schema 不变。
-- **`ecs_list` 分页**:目前 `limit` 10~100,建议补 `next_token` 透传 + 汇总 `total`。
+- **批量并行** ✅:`ecs_exec` 增加 `concurrency`(默认 1 保持现状;`read_only: true` 时默认 4);
+  由 `runWithConcurrency` 在插件侧限制并发, 结果**按输入顺序**返回;同实例仍由实例锁串行,跨实例才真正并行。上限仍 20 台。
+- **批量后台** ✅:放开 `instance_ids` + `run_in_background`(此前被显式拒绝), 每台起一个 job,
+  返回 `kind: 'batch_background'` + `job_ids` 数组(脚本模式的前置投递先按并发在前台完成)。
+- **JSON 模式** ✅:`output_json: true` 时 `render` 直接输出稳定 JSON 文本(`ecs_exec` / `ecs_list`),schema 不变。
+- **`ecs_list` 分页** ⚠️ **部分完成 / 受 CLI 限制**:
+  - 输入侧 ✅ `next_token` 已透传为 `--next-token`;另补 `vpc_id`/`vswitch_id`/`zone_id`/`private_ip`/`image_id` 五个官方过滤器;
+  - 输出侧 ❌ **实测 `workbench list ecs --output json` 只返回 `{ instances: [...] }`,不返回 `NextToken`/`TotalCount`**
+    (用一个非法 token 复测同样静默返回首页),因此插件**无法自动翻页**;
+  - 缓解 ✅:返回条数顶到 `limit` 且 CLI 未给 token 时, 结果带 `pagination_note` 显式提示"可能有下一页",
+    避免模型误判为"就这么多";并提供收敛过滤条件的建议。
 
-**工作量**:M(1 天)。
+**工作量**:M(1 天)。**实际**:单迭代内完成(新增 unit 7 项 + e2e 5 项)。
 
 ---
 
@@ -300,7 +304,7 @@ ecs_deploy {
 | 子项 | 可行性 | 计划 |
 |---|---|---|
 | **sha256 校验** | ✅ 已完成(v0.4.0) | 实现选择:**不依赖 `node:crypto`**(动态 body 会被 `to-body.mjs` 剥掉 import),改为经 subprocess 调用平台工具 `sha256sum` → `shasum -a 256` → `certutil -hashfile`,三通道兜底;远端 `sha256sum \|\| shasum -a 256` 比对。`ecs_deploy` 校验失败会**中止发布**,不再用坏包重启 |
-| **目录递归上传** | ✅ 可做 | v0.5.0。插件侧本地 `tar`(Windows 10+ 自带)→ 上传 → 远端解包 → **校验 → 解包**顺序保证不落地坏包 |
+| **目录递归上传** | ✅ 已完成(v0.5.1) | 插件侧本地 `tar`(Windows 10+ 自带)→ 上传 → 远端解包 → **校验 → 解包**顺序保证不落地坏包。实现:归档/清理都经 subprocess 调平台工具(`tar`、`rm`/`cmd /c del`),不依赖 Node 模块;默认 `--strip-components=1` 把目录**内容**放到 `remote_path`(`keep_root_dir` 可保留顶层);sha256 不一致时**不下发解包命令**;本地归档在会话工作区根目录暂存并自动清理 |
 | **公网直连传输** | ❌ 本轮不可做 | CLI **没有**直连传输子命令(`upload/download` 固定走 OSS 中继,`connect` 是交互式终端),且插件侧拿不到 SSH 私钥/证书。**应从插件计划中移出,作为 CLI 上游需求单独立项**(反馈 §五 S5 的这一条建议改口径) |
 | 中继加速 | ⚠️ 待评估 | 同地域 OSS 中继的瓶颈通常在 CLI 分段策略,非插件可控;先做 sha256 + 并发分片上传的可行性调研 |
 
@@ -312,9 +316,9 @@ ecs_deploy {
 |---|---|---|---|
 | **v0.4.0** ✅ **已完成** | 投递与护栏(快赢) | S1 script 直送 / S6 read_only / S8' 小改进(含 **D1** timeout 修复)/ S5a sha256 / 补 0912+0909 回归断言;顺带修掉 **D5、D6、D7** | 已达成:e2e 20/20 通过,F1 的容器内 `node -e` 零转义直通 |
 | **v0.5.0** ✅ **已完成** | 长任务与会话 | S2 detach + `ecs_log` 游标 / S3 伪会话 / 解 **D2、D3** | 已达成:e2e 25/25(含 10s 长任务期间前台调用 < 6s 返回) |
-| **v0.5.1** | 批量与会话补完 | S7 并行批量 + 后台批量 + JSON 模式 / S5b 目录递归上传 | 集群排查不再逐台串行;目录上传省掉本地 tar |
+| **v0.5.1** ✅ **已完成** | 批量与会话补完 | S7 并行批量 + 后台批量 + JSON 模式 / S5b 目录递归上传 / `ecs_list` 补 5 个过滤器 + 分页提示;顺带修掉 **D8** | 已达成:unit 30/30、e2e 33/33(含目录上传远端 `find` 核对、坏包中止解包、批量并发与 `job_ids`) |
 | **v0.6.0** | 编排 | S4a `steps` 编排 → S4b 命名 Runbook(`release` 模板) | 15 次调用 → 1 次;发布契约离开人的记忆 |
-| **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
+| **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,
 而 S2/S3 都在 M 级且相互耦合(锁语义)。先拿下确定收益,再动结构。
@@ -337,14 +341,15 @@ ecs_deploy {
 7. **D2** ✅ *已解决(v0.5.0)*:detach 任务只在每次轮询期间短暂持锁;e2e 断言"10s detach 期间同实例前台调用 < 6s 返回";
 8. **D3/S2** ✅ *已覆盖(v0.5.0)*:远端日志文件是唯一事实源,`ecs_log` 按字节游标续读(重复读返回空、`max_bytes` 截断推进游标、`exit_file` 回报退出码);
 9. **S3** ✅ *已覆盖(v0.5.0)*:同 `session_id` 继承 `cd`/`export`,不同 `session_id` 隔离,标记行不出现在输出里,退出码仍透传;空闲 30 分钟重置并提示;
-10. **S7**:8 台实例 `concurrency=4` 的只读批量,总耗时显著低于串行且结果无串流 —— v0.5.1;
-11. **S5a** ✅ *部分覆盖*:`ecs_upload.verify_sha256` 与 `ecs_deploy` 默认校验在 e2e 中通过;
-    不同内容摘要不同(损坏可被判据发现)已断言;真正的"损坏注入"用例留待 S5b 目录上传时补;
-12. **lossless** ✅ *已覆盖*:新增分支的 value / presentationMeta / presentCall 均过 `isJsonValue`;
-13. **D5/D6/D7**(v0.4.0 新增缺陷)✅ *已覆盖*:`request_id` 带回;`ecs_deploy` 带 `local_file` 的三阶段全绿(此前恒失败);`ecs_deploy` 上传+校验+重启不再死锁。
+10. **S7** ✅ *已覆盖(v0.5.1)*:`concurrency` 生效且结果按输入顺序、只读批量默认并发 4、批量后台每台一个 job(`job_ids` + 每个 `done.status` 为终态枚举)、`output_json` 与 value 精确等价;`ecs_list` 新过滤器/`limit`/`next_token` 全部落到显式 argv,顶到 limit 且无 token 时给出 `pagination_note`;
+11. **S5a** ✅ *已覆盖*:`ecs_upload.verify_sha256` 与 `ecs_deploy` 默认校验在 e2e 中通过;不同内容摘要不同已断言;
+12. **S5b** ✅ *已覆盖(v0.5.1)*:目录上传 e2e 走通"归档→上传→校验→解包"(远端 `find` 核对顶层剥离与子目录保留)、`keep_root_dir` 保留顶层、目录不存在时报错;**损坏注入用例**在 unit 中以可编排 subprocess 构造"远端摘要不一致",断言 `aborted`/`extracted:false` 且**不再下发解包命令**(坏包不落地);
+13. **lossless** ✅ *已覆盖*:新增分支的 value / presentationMeta / presentCall 均过 `isJsonValue`;
+14. **D5/D6/D7**(v0.4.0 新增缺陷)✅ *已覆盖*:`request_id` 带回;`ecs_deploy` 带 `local_file` 的三阶段全绿(此前恒失败);`ecs_deploy` 上传+校验+重启不再死锁;
+15. **D8**(v0.5.1 新增缺陷)✅ *已覆盖*:`ecs_upload` 目录模式的解包结果曾取自 `decodeLoose().text` —— 而该字段在 stdout 是合法 JSON 时为**空串**(内容在 `.json.output`),导致 `entries` 恒为 undefined;已改为优先读 JSON 的 `output`/`exit_code`(与 D5 同类)。
 
-> 当前实际测试资产:`test/unit.mjs` 13 项(不触达实例,含护栏 47 条样例、base64/字节校验、sha256 链路);
-> `test/e2e-local.mjs` 20 项(真实实例,只读命令 + `/tmp` 临时文件)。`npm test` = unit + 冒烟 + 动态 body 一致性。
+> 当前实际测试资产:`test/unit.mjs` **30 项**(不触达实例:护栏 47 条样例、base64/字节校验、sha256 链路、并发闸门、归档/解包、output_json 渲染、分页提示、坏包中止);
+> `test/e2e-local.mjs` **33 项**(真实实例,只读命令 + `/tmp` 临时文件)。`npm test` = unit + 冒烟 + 动态 body 一致性。
 
 ---
 
@@ -357,6 +362,9 @@ ecs_deploy {
    但 `to-body.mjs` "同作用域 + 剥 import" 的约束仍在,新增模块级常量必须带模块前缀(见 D7 提示)。
 5. **奶龙 `deploy/release.sh` 作为模板契约来源**:是否同意"模板声明步骤与断言、脚本留在项目仓库"的分工(S4b 前提)。
 6. **是否保留 `run_in_background`**:S2 落地后建议保留为"本地 CLI 进程级后台",把远端长任务一律导向 `detach`;文档需明确二选一的使用判据。
+7. **CLI 应透出分页 token**(v0.5.1 实测新增):`workbench list ecs --output json` 只返回 `instances`,
+   不返回 `NextToken`/`TotalCount`,插件因此无法自动翻页(只能用 `pagination_note` 提示用户收紧过滤条件)。
+   需要 CLI 侧在 JSON 输出中包含 `NextToken`(建议同时给 `TotalCount`),否则 100 台以上的地域无法完整枚举。
 
 ---
 
@@ -365,18 +373,19 @@ ecs_deploy {
 | 反馈条目 | 现状核对 | 方案 | 版本 |
 |---|---|---|---|
 | F1 嵌套引号必炸 | 真缺口,根因修正为"远端两层"(D4) | S1 | ✅ **v0.4.0 已交付** |
-| F2 长命令软上限 + 日志不可续读 | 真缺口;机制解释见 D3,另发现 D1 | S2 + D1 | D1 ✅ v0.4.0 / S2 v0.5.0 |
-| F3 每次独立 shell | 真缺口,但 CLI 无可靠会话创建 | S3(伪会话) | v0.5.0 |
+| F2 长命令软上限 + 日志不可续读 | 真缺口;机制解释见 D3,另发现 D1 | S2 + D1 | D1 ✅ v0.4.0 / S2 ✅ v0.5.0 |
+| F3 每次独立 shell | 真缺口,但 CLI 无可靠会话创建 | S3(伪会话) | ✅ v0.5.0 |
 | F4 多步流水线零编排 | 真缺口,建议拆 S4a/S4b | S4 | v0.6.0 |
-| F5 传输无校验/无目录语义 | 部分真缺口;直连不可做 | S5a / S5b / S5c | S5a ✅ v0.4.0 / S5b v0.5.0 / S5c 上游 |
+| F5 传输无校验/无目录语义 | 部分真缺口;直连不可做 | S5a / S5b / S5c | S5a ✅ v0.4.0 / S5b ✅ v0.5.1 / S5c 上游 |
 | F6 无只读护栏 | 真缺口 | S6 | ✅ **v0.4.0 已交付** |
-| F7 小项(批量串行/无 description/timeout 偏短) | 真缺口 + D1 | S7 + S8' | S8' ✅ v0.4.0 / S7 v0.5.0 |
+| F7 小项(批量串行/无 description/timeout 偏短) | 真缺口 + D1 | S7 + S8' | S8' ✅ v0.4.0 / S7 ✅ v0.5.1(分页受 CLI 限制) |
 | 0909-1 undefined / 通知 | **已修**(v0.3.6+0.3.7) | 仅补断言 | ✅ v0.4.0(断言已加) |
 | 0909-2 并发串流 | **已修**(实例锁),但引入 D2 | S2 重构为短锁 | v0.5.0 |
 | §七-6 中文/ANSI/空输出健壮性 | 基本满足,发现进度帧污染(D6 关联) | strip_ansi + 用例 | ✅ **v0.4.0 已交付** |
 | (新)D5 远端退出码被覆盖 | 真缺陷 | 以 JSON `exit_code` 为准 | ✅ v0.4.0 |
 | (新)D6 `ecs_deploy` 上传阶段恒失败 | 真缺陷(自 v0.2.0) | 上传阶段改宽容解码 | ✅ v0.4.0 |
 | (新)D7 实例锁不可重入 → 死锁 | 真缺陷(v0.4.0 开发中暴露) | `locked: true` 复用锁 | ✅ v0.4.0 |
+| (新)D8 目录上传 `entries` 恒为 undefined | 真缺陷(`decodeLoose().text` 在 JSON 成功时为空串) | 改读 JSON 的 `output`/`exit_code` | ✅ v0.5.1 |
 
 ---
 

@@ -8,7 +8,7 @@
 import assert from 'node:assert'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -17,9 +17,13 @@ import {
   checkWriteCommand, guardReadOnly, resolveTimeout, buildScriptDelivery,
   localSha256, remoteSha256, SCRIPT_INLINE_LIMIT_BYTES,
   buildLogReadCommand, parseLogRead, buildDetachLaunch, parseDetachPid, hasLocalTimer, delay,
+  splitLocalPath, buildTarCreateArgv, buildArchiveExtractScript, parseArchiveEntries,
+  runWithConcurrency,
 } from '../lib/common.js'
 import { buildDiagnoseScript } from '../lib/tools/ecs-diagnose.js'
-import { buildSessionScript, extractSessionCwd } from '../lib/tools/ecs-exec.js'
+import { buildSessionScript, extractSessionCwd, ecsExecDefinition } from '../lib/tools/ecs-exec.js'
+import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
+import { ecsListDefinition } from '../lib/tools/ecs-list.js'
 
 let passed = 0
 let failed = 0
@@ -364,6 +368,253 @@ run('extractSessionCwd: 剥离标记并取回 cwd', () => {
   const mid = extractSessionCwd('a\n__DSH_ECS_CWD__/tmp\nb')
   assert.equal(mid.cwd, '/tmp')
   assert.equal(mid.text, 'a\nb')
+})
+
+// ---- S7: 并发闸门 ----
+await runAsync('runWithConcurrency: 保序 + 真实并发 + 上限', async () => {
+  const items = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  let active = 0
+  let peak = 0
+  const out = await runWithConcurrency(items, 3, async (n) => {
+    active += 1
+    peak = Math.max(peak, active)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    active -= 1
+    return n * 2
+  })
+  assert.deepEqual(out, [2, 4, 6, 8, 10, 12, 14, 16, 18], '结果必须按输入顺序')
+  assert.ok(peak <= 3, '并发不应超过上限, 实际 ' + peak)
+  assert.ok(peak >= 2, '应真正并发而不是串行, 实际 ' + peak)
+  assert.deepEqual(await runWithConcurrency([], 4, async () => 1), [], '空输入应立即返回')
+  assert.deepEqual(await runWithConcurrency([1], 8, async (n) => n + 1), [2], 'limit 大于条数时退化为串行')
+})
+
+// ---- S5b: 目录上传的归档/解包链路 ----
+run('splitLocalPath: 目录归档的 (父目录, 名字)', () => {
+  assert.deepEqual(splitLocalPath('deploy'), { parent: '.', base: 'deploy' })
+  assert.deepEqual(splitLocalPath('build/dist/'), { parent: 'build', base: 'dist' })
+  assert.deepEqual(splitLocalPath('a\\b\\c'), { parent: 'a/b', base: 'c' })
+  assert.deepEqual(splitLocalPath('/opt/app'), { parent: '/opt', base: 'app' })
+})
+
+run('buildTarCreateArgv: tar -czf <归档> -C <父> <名字>', () => {
+  assert.deepEqual(
+    buildTarCreateArgv('tar', '.dsh-ecs-upload-x.tar.gz', 'build/dist'),
+    ['tar', '-czf', '.dsh-ecs-upload-x.tar.gz', '-C', 'build', 'dist'],
+  )
+})
+
+run('buildArchiveExtractScript: 建目录→计数→解包→清理→透传退出码', () => {
+  const s = buildArchiveExtractScript({ archivePath: '/tmp/x.tar.gz', remoteDir: '/opt/app' })
+  assert.ok(s.includes("mkdir -p '/opt/app'"), '应建远端目录')
+  assert.ok(s.includes("tar -tzf '/tmp/x.tar.gz'"), '应先数条目')
+  assert.ok(s.includes("tar -xzf '/tmp/x.tar.gz' -C '/opt/app'"), '应解包到目标目录')
+  assert.ok(s.includes('--strip-components=1'), '默认应剥掉归档顶层目录')
+  assert.ok(s.includes('__DSH_ECS_ENTRIES__'), '应回报条目数')
+  assert.ok(s.includes("rm -f '/tmp/x.tar.gz'"), '默认应清理远端归档')
+  assert.ok(s.includes('exit $rc'), '应透传解包退出码')
+  assert.ok(s.includes('exit 95') && s.includes('exit 96'), '归档不可读/目录不可建应有独立退出码')
+  assert.notEqual(checkWriteCommand(s), undefined, '解包含 mkdir/rm, 应被只读护栏识别为写操作')
+
+  const keep = buildArchiveExtractScript({
+    archivePath: '/tmp/x.tar.gz', remoteDir: '/opt/app', keepRootDir: true, keepArchive: true,
+  })
+  assert.ok(!keep.includes('--strip-components'), 'keep_root_dir=true 不应剥离')
+  assert.ok(!keep.includes('rm -f'), 'keep_archive=true 不应删除归档')
+
+  const tricky = buildArchiveExtractScript({ archivePath: "/tmp/it's.tar.gz", remoteDir: '/opt/my app' })
+  assert.ok(tricky.includes("'/tmp/it'\\''s.tar.gz'"), '归档路径应经 shell 引用')
+  assert.ok(tricky.includes("'/opt/my app'"), '目标目录含空格应经 shell 引用')
+})
+
+run('parseArchiveEntries: 取出条目数并剥离标记', () => {
+  const r = parseArchiveEntries('__DSH_ECS_ENTRIES__42\n')
+  assert.equal(r.entries, 42)
+  assert.equal(r.text, '')
+  const r2 = parseArchiveEntries('some warning\n__DSH_ECS_ENTRIES__7\nmore')
+  assert.equal(r2.entries, 7)
+  assert.equal(r2.text, 'some warning\nmore')
+  assert.equal(parseArchiveEntries('no marker').entries, undefined)
+})
+
+await runAsync('ecs_upload: local_file/local_dir 二选一与目录前置校验', async () => {
+  const def = ecsUploadDefinition({ get: () => undefined })
+  const exec = { signal: { aborted: false } }
+  await assert.rejects(
+    () => def.execute({ remote_path: '/opt/app', instance_id: 'i-x' }, exec),
+    /必须提供 local_file 或 local_dir/,
+  )
+  await assert.rejects(
+    () => def.execute({ local_file: 'a.txt', local_dir: 'dist', remote_path: '/opt/app', instance_id: 'i-x' }, exec),
+    /只能二选一/,
+  )
+  await assert.rejects(
+    () => def.execute({ local_dir: '.', remote_path: '/opt/app', instance_id: 'i-x' }, exec),
+    /具体目录/,
+  )
+  await assert.rejects(
+    () => def.execute({ local_dir: 'dist', remote_path: '/opt/app', instance_id: 'i-x' }, exec),
+    /tar/,
+    '本机无 tar 时应给出可操作的报错',
+  )
+})
+
+run('ecs_upload render: 目录成功 / 中止 / 本地清理失败三种文案', () => {
+  const def = ecsUploadDefinition({ get: () => undefined })
+  const base = {
+    kind: 'upload', mode: 'dir', instance_id: 'i-x', local_dir: 'dist', remote_path: '/opt/app',
+    archive_local: '.dsh-ecs-upload-x.tar.gz', archive_remote: '/tmp/x.tar.gz', message: '', exit_code: 0,
+  }
+  const ok = def.output.render({}, {
+    ...base, verification: 'ok', sha256_local: 'a'.repeat(64), entries: 12, extracted: true,
+    local_archive_cleanup: 'removed',
+  })[0].text
+  assert.ok(ok.includes('目录上传完成'))
+  assert.ok(ok.includes('12 个归档条目'))
+  assert.ok(ok.includes('校验通过'), '应展示 sha256 校验结果')
+  assert.ok(!ok.includes('未清理'), '清理成功时不应提示残留')
+
+  const aborted = def.output.render({}, {
+    ...base, verification: 'mismatch', sha256_local: 'a'.repeat(64), sha256_remote: 'b'.repeat(64),
+    extracted: false, aborted: true, abort_reason: 'sha256-mismatch', local_archive_cleanup: 'failed',
+  })[0].text
+  assert.ok(aborted.includes('目录上传已中止'))
+  assert.ok(aborted.includes('未在远端解包'), '中止时应明确"远端目录未被改动"')
+  assert.ok(aborted.includes('本地归档未清理') && aborted.includes('.dsh-ecs-upload-x.tar.gz'),
+    '本地清理失败应给出残留路径')
+})
+
+// ---- S5b 不变式: 校验失败必须中止解包(坏包不落地) ----
+await runAsync('ecs_upload 目录模式: sha256 不一致时中止解包, 不下发解包命令', async () => {
+  const dirRoot = mkdtempSync(join(tmpdir(), 'dsh-wbecs-unit-dir-'))
+  mkdirSync(join(dirRoot, 'src', 'sub'), { recursive: true })
+  writeFileSync(join(dirRoot, 'src', 'a.txt'), 'alpha\n')
+  writeFileSync(join(dirRoot, 'src', 'sub', 'b.txt'), 'beta\n')
+
+  const issued = []
+  // workbench 调用被替换为可编排应答; tar/sha256sum/rm/cmd 等本机程序走真实进程
+  const hybrid = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) {
+      const exe = String(spec.argv[0])
+      if (exe !== 'workbench') return localSubprocess.spawn(spec)
+      const argv = spec.argv.slice(1)
+      issued.push(argv)
+      let body
+      if (argv[0] === 'upload') {
+        body = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: 'Upload complete', stderr: '', request_id: 'r-1', session_id: 's-1' })
+      } else if (argv.join(' ').includes('sha256sum')) {
+        // 远端摘要与本地必然不同 -> 模拟传输损坏
+        body = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: 'f'.repeat(64) + '  /tmp/dsh-ecs-upload-x.tar.gz\n', stderr: '' })
+      } else {
+        body = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: '__DSH_ECS_ENTRIES__3\n', stderr: '' })
+      }
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+
+  const ctx2 = { get: (n) => (n === 'subprocess' ? hybrid : undefined) }
+  const def = ecsUploadDefinition(ctx2)
+  const value = await def.execute(
+    { local_dir: join(dirRoot, 'src'), remote_path: '/opt/app', instance_id: 'i-x', force: true, verify_sha256: true },
+    { signal: { aborted: false } },
+  )
+  assert.equal(value.verification, 'mismatch', '本地/远端摘要不同应判为 mismatch')
+  assert.equal(value.aborted, true, '摘要不一致必须中止')
+  assert.equal(value.abort_reason, 'sha256-mismatch')
+  assert.equal(value.extracted, false, '中止时不得解包')
+  assert.ok(issued.some((argv) => argv[0] === 'upload'), '上传应已发生')
+  assert.ok(!issued.some((argv) => argv.join(' ').includes('tar -xzf')), '中止后不得下发解包命令: ' + JSON.stringify(issued))
+})
+
+// ---- S7: output_json 与批量渲染 ----
+run('ecs_exec render: output_json 返回稳定 JSON, 默认仍为可读文本', () => {
+  const def = ecsExecDefinition({ get: () => undefined })
+  const value = {
+    kind: 'batch', count: 1, failed_count: 0, concurrency: 2, command: 'df -h',
+    batch: [{ instance_id: 'i-x', is_error: false, exit_code: 0, output: 'ok' }],
+  }
+  const text = def.output.render({ output_json: true }, value)[0].text
+  assert.deepEqual(JSON.parse(text), value, 'output_json 应是 value 的稳定 JSON 序列化')
+  assert.ok(text.includes('\n  "kind"'), '应带缩进便于阅读')
+  const human = def.output.render({}, value)[0].text
+  assert.ok(human.includes('批量执行完成'))
+  assert.ok(human.includes('并发 2'), '并发度应出现在文本里: ' + human)
+
+  const bg = def.output.render({}, {
+    kind: 'batch_background', count: 2, failed_count: 1, concurrency: 2, command: 'uptime',
+    job_ids: ['j-1'],
+    batch: [{ instance_id: 'i-1', job_id: 'j-1', is_error: false }, { instance_id: 'i-2', is_error: true, error: 'boom' }],
+  })[0].text
+  assert.ok(bg.includes('批量后台任务已启动'))
+  assert.ok(bg.includes('j-1'))
+  assert.ok(bg.includes('i-2] 启动失败: boom'))
+})
+
+// ---- S7: ecs_list 过滤器与分页 ----
+function stubSubprocess(body) {
+  const calls = []
+  return {
+    calls,
+    subprocess: {
+      async resolveExecutable() { return 'workbench' },
+      spawn(spec) {
+        calls.push(spec.argv)
+        return {
+          pid: 1,
+          collected: {
+            stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+            stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+          },
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          terminate() {},
+          async waitForExit() { return true },
+        }
+      },
+    },
+  }
+}
+
+await runAsync('ecs_list: 新过滤器/limit/next_token 全部透传为显式 argv', async () => {
+  const stub = stubSubprocess(JSON.stringify({ instances: [] }))
+  const def = ecsListDefinition({ get: (n) => (n === 'subprocess' ? stub.subprocess : undefined) })
+  const value = await def.execute({
+    region: 'cn-shanghai', vpc_id: 'vpc-1', vswitch_id: 'vsw-1', zone_id: 'cn-shanghai-a',
+    private_ip: ['10.0.0.1', '10.0.0.2'], image_id: 'img-1', next_token: 'tok', limit: 20,
+  }, { signal: { aborted: false } })
+  const argv = stub.calls[0].join(' ')
+  for (const expected of ['--vpc-id vpc-1', '--vswitch-id vsw-1', '--zone-id cn-shanghai-a',
+    '--private-ip 10.0.0.1,10.0.0.2', '--image-id img-1', '--next-token tok', '--limit 20', '--output json']) {
+    assert.ok(argv.includes(expected), 'argv 应包含 ' + expected + ', 实际: ' + argv)
+  }
+  assert.equal(value.limit, 20)
+  assert.equal(value.pagination_note, undefined, '未顶到 limit 时不应提示分页')
+})
+
+await runAsync('ecs_list: 顶到 limit 且 CLI 未给 token 时显式提示分页', async () => {
+  const items = Array.from({ length: 10 }, (_, i) => ({ instance_id: 'i-' + i }))
+  const stub = stubSubprocess(JSON.stringify({ instances: items }))
+  const def = ecsListDefinition({ get: (n) => (n === 'subprocess' ? stub.subprocess : undefined) })
+  const value = await def.execute({ region: 'cn-shanghai', limit: 10 }, { signal: { aborted: false } })
+  assert.equal(value.count, 10)
+  assert.ok(typeof value.pagination_note === 'string' && value.pagination_note.includes('NextToken'),
+    '应提示 CLI 未返回 NextToken, 实际: ' + value.pagination_note)
+  assert.ok(def.output.render({}, value)[0].text.includes('NextToken'), '提示应出现在可读输出里')
+
+  const withToken = stubSubprocess(JSON.stringify({ instances: items, next_token: 'tok-2' }))
+  const def2 = ecsListDefinition({ get: (n) => (n === 'subprocess' ? withToken.subprocess : undefined) })
+  const v2 = await def2.execute({ region: 'cn-shanghai', limit: 10 }, { signal: { aborted: false } })
+  assert.equal(v2.next_token, 'tok-2', 'CLI 给出 token 时应透出')
+  assert.equal(v2.pagination_note, undefined, '有 token 时不应提示')
 })
 
 console.log('')
