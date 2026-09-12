@@ -31,6 +31,7 @@ import {
   loadRunbook, listRunbookNames, RUNBOOK_DIR, lintRunbook,
 } from '../lib/runbooks.js'
 import { ecsRunbookDefinition } from '../lib/tools/ecs-runbook.js'
+import { planSteps, stepTimeoutOf, STEPS_MAX_STEP_TIMEOUT } from '../lib/steps-engine.js'
 
 let passed = 0
 let failed = 0
@@ -1123,6 +1124,18 @@ await runAsync('设置页 runbook-plan: 预演给出计划; 缺参数显式报�
   assert.ok(String(miss.error).includes('缺少参数: sha'))
 })
 
+await runAsync('设置页 runbook-plan: 单步 timeout 一路进入预演(v0.6.6)', async () => {
+  const core = settingsCoreWith({
+    timed: JSON.stringify({ steps: [{ kind: 'exec', command: 'bash /opt/release.sh', timeout: 300 }] }),
+  }, () => '{}')
+  const plan = await core.runbookPlan({ instance_id: 'i-x', runbook: 'timed' })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.plan[0].timeout, 300, '预演应回报单步超时')
+  assert.ok(plan.plan[0].command_line.includes('--timeout 300'), '预演命令行应带 300: ' + plan.plan[0].command_line)
+  const fallback = await core.runbookPlan({ instance_id: 'i-x', runbook: 'timed', timeout: 60 })
+  assert.equal(fallback.plan[0].timeout, 300, '单步值优先于面板选的全局超时')
+})
+
 await runAsync('设置页 runbook-plan 与 ecs_deploy 工具的计划逐字一致(两条通道不漂移)', async () => {
   const steps = [
     { kind: 'exec', command: 'echo deploy latest', description: '部署 latest' },
@@ -1281,6 +1294,48 @@ run('lintRunbook: 解析失败与干净 runbook', () => {
   assert.equal(clean.error_count, 0)
   assert.equal(clean.warn_count, 0)
   assert.deepEqual(clean.missing_params, undefined)
+})
+
+// ---- v0.6.6: 单步超时(timeout)此前被静默忽略 ----
+run('steps: 单步 timeout 覆盖全局, 非法值退回全局, 超大值截断', () => {
+  const plan = planSteps([
+    { kind: 'exec', command: 'echo a' },
+    { kind: 'exec', command: 'echo b', timeout: 300 },
+    { kind: 'assert', command: 'echo c', expect: { stdout_contains: ['c'] }, timeout: '120' },
+    { kind: 'exec', command: 'echo d', timeout: 0 },
+    { kind: 'exec', command: 'echo e', timeout: 'soon' },
+    { kind: 'exec', command: 'echo f', timeout: 999999 },
+  ], { instance_id: 'i-x', timeout: 90 })
+  assert.equal(plan[0].timeout, '90', '未写 timeout 时用全局值')
+  assert.equal(plan[1].timeout, '300', '单步 timeout 必须覆盖全局值')
+  assert.equal(plan[2].timeout, '120', '数字字符串同样有效')
+  assert.equal(plan[3].timeout, '90', 'timeout=0 非法, 退回全局')
+  assert.equal(plan[4].timeout, '90', '非数字非法, 退回全局')
+  assert.equal(plan[5].timeout, String(STEPS_MAX_STEP_TIMEOUT), '超大值截断到上限')
+  const at = plan[1].argv.indexOf('--timeout')
+  assert.ok(at >= 0, '应显式下发 --timeout: ' + plan[1].argv.join(' '))
+  assert.equal(plan[1].argv[at + 1], '300', 'argv 里下发的必须是单步值')
+  assert.ok(plan[1].command_line.includes('--timeout 300'), '预演命令行应带单步值: ' + plan[1].command_line)
+  assert.equal(stepTimeoutOf({ timeout: 45 }, 180), '45')
+  assert.equal(stepTimeoutOf(undefined, 180), '180', 'step 不是对象时退回兜底值')
+})
+
+run('lintRunbook: timeout 写了却不生效的两种情形都要报出来', () => {
+  const report = lintRunbook(JSON.stringify({
+    steps: [
+      { kind: 'exec', command: 'echo a', timeout: -5 },
+      { kind: 'exec', command: 'echo b', timeout: 999999 },
+      { kind: 'exec', command: 'echo c', timeout: 300 },
+    ],
+  }), { name: 'to' })
+  assert.equal(report.error_count, 0, JSON.stringify(report.issues))
+  assert.equal(report.warn_count, 2, '合法 timeout 不应产生提醒: ' + JSON.stringify(report.issues))
+  const bad = report.issues.find((i) => i.code === 'bad_timeout')
+  assert.equal(bad.step, 0)
+  assert.match(bad.message, /不是正数/)
+  const clamped = report.issues.find((i) => i.code === 'timeout_clamped')
+  assert.equal(clamped.step, 1)
+  assert.match(clamped.message, /3600/)
 })
 
 await runAsync('ecs_runbook 工具: list / validate / plan(纯只读, 零远程调用)', async () => {

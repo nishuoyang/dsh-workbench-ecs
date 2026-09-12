@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.4 · MIT License
+> v0.6.6 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -423,7 +423,9 @@ All phases return their results (a failing phase does not stop later ones): uplo
 | `assert` | `command` \| `script`, `expect` | Assertions: `expect: { exit_code?, stdout_contains?, stdout_not_contains?, stderr_contains? }` |
 | `tail` | `path`, `after?`, `max_bytes?`, `exit_file?`, `wait_seconds?` | Read a remote log by **byte cursor**; `wait_seconds` waits for `exit_file` to appear |
 
-Run-level parameters: `dry_run` (print the plan without executing — and **without requesting approval**), `continue_on_error` (default false: the first failure stops the run and remaining steps are marked `skipped`), `read_only` (guard every exec/assert step), `timeout` (per step, default 180s). Maximum 20 steps.
+Run-level parameters: `dry_run` (print the plan without executing — and **without requesting approval**), `continue_on_error` (default false: the first failure stops the run and remaining steps are marked `skipped`), `read_only` (guard every exec/assert step), `timeout` (global default, 180s). Maximum 20 steps.
+
+**Per-step timeout (v0.6.6)**: a step's own `timeout` **overrides** the global value. Previously only the global value was honoured, so the per-step `timeout` promised by the tool schema was silently ignored: long steps (a release script, say) were still cut off by the CLI at the global 180s, and the plan preview showed a number you never wrote. The cap is 3600s (larger values are clamped) and non-positive values are ignored — lint warns about both, and previews report the `timeout` that will actually apply.
 
 ```jsonc
 // One call: upload → assert → restart → assert → read log

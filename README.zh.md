@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.4 · MIT License
+> v0.6.6 · MIT License
 
 [English](./README.md) | 中文
 
@@ -423,7 +423,9 @@ CLI 对应: 一次远程 `exec`(分号串联的只读命令集)
 | `assert` | `command` \| `script`, `expect` | 断言: `expect: { exit_code?, stdout_contains?, stdout_not_contains?, stderr_contains? }` |
 | `tail` | `path`, `after?`, `max_bytes?`, `exit_file?`, `wait_seconds?` | 按**字节游标**读远端日志; `wait_seconds` 可等待 `exit_file` 出现 |
 
-编排级参数:`dry_run`(只回显计划不执行, **不请求审批**)、`continue_on_error`(默认 false:任一步失败即中止并把余下步骤标记为 `skipped`)、`read_only`(对所有 exec/assert 步骤开只读护栏)、`timeout`(每步默认 180s)。上限 20 步。
+编排级参数:`dry_run`(只回显计划不执行, **不请求审批**)、`continue_on_error`(默认 false:任一步失败即中止并把余下步骤标记为 `skipped`)、`read_only`(对所有 exec/assert 步骤开只读护栏)、`timeout`(全局默认 180s)。上限 20 步。
+
+**单步超时(v0.6.6)**:步骤里的 `timeout` **覆盖**全局值 —— 此前只认全局值, 于是工具文档承诺的「本步骤命令超时」被静默忽略:长步骤(如发布脚本)仍会在全局 180s 处被 CLI 掐断, 预演里看到的也不是你写的那个数。上限 3600s(超出截断)、非正数忽略, 两种"写了却不按你写的执行"lint 都会提前提醒;预演与 `ecs_runbook plan` 逐条回报**实际生效**的 `timeout`。
 
 ```jsonc
 // 一次调用完成"上传 → 断言 → 重启 → 断言 → 读日志"
@@ -467,7 +469,7 @@ runbook 文件形状:
 }
 ```
 
-**边界(有意为之)**:插件只提供**机制** —— 读取 / 校验 / 参数替换 / 展开成 `steps`;**内容**(步骤与断言、脚本本体)留在项目仓库,插件不硬编码任何项目逻辑。占位符 `${name}` 在任意字符串里替换;整串恰好是一个占位符时**保留原始类型**(`"timeout": "${t}"` + `t=300` → 数字 300);缺少参数会直接报错并列出该 runbook 声明的占位符;多余的入参会在结果里以 `unused_params` 提示。runbook 名字只允许 `[A-Za-z0-9._-]`(挡住路径穿越)。需要 `fs` 服务;未挂载时请改用内联 `runbook` 对象。
+**边界(有意为之)**:插件只提供**机制** —— 读取 / 校验 / 参数替换 / 展开成 `steps`;**内容**(步骤与断言、脚本本体)留在项目仓库,插件不硬编码任何项目逻辑。占位符 `${name}` 在任意字符串里替换;整串恰好是一个占位符时**保留原始类型**(`"timeout": "${t}"` + `t=300` → 数字 300),因此单步超时也能由参数驱动;缺少参数会直接报错并列出该 runbook 声明的占位符;多余的入参会在结果里以 `unused_params` 提示。runbook 名字只允许 `[A-Za-z0-9._-]`(挡住路径穿越)。需要 `fs` 服务;未挂载时请改用内联 `runbook` 对象。
 
 - **跑书目录 = 会话工作区**:插件按 `exec.agent.session.header.cwd` 解析 `<工作区>/.dsh/workbench-ecs/runbooks/`(与 DSH 内置工具同源),因此放在**项目仓库**里的跑书能被直接看见;相对路径的 `local_file` 也以该目录为 cwd。设置页没有会话上下文,默认**跟随最近一次 Agent 会话的工作区**,卡片里可手动指定目录(留空即跟随)。
 

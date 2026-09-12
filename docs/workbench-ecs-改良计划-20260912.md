@@ -1,4 +1,4 @@
-# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.4)
+# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.6)
 
 > 输入: `E:\AiProject\nailong\docs\workbench-ecs-反馈与改进建议-20260912.md`(奶龙生产运维 ~30 次真实调用)
 > 核对基线: 插件源码 v0.3.7(commit `324d979`)+ 本机 Workbench CLI **v1.0.1**(commit `86c0aff`)
@@ -415,6 +415,8 @@ runbook 是**纯数据**, 因此"哪里写错了"完全可以在下发任何命�
 | **v0.6.2** ✅ **S4b' 面板化已交付** | 跑书进面板 | 抽出 `lib/steps-engine.js`(工具与面板共用同一引擎);设置页新增 `runbook-list` / `runbook-plan` / `runbook-run`;面板新增 Runbook 卡片(列出/预演/执行)+ 发布向导 runbook 模式;`to-body` 模块发现改递归 | 已达成:unit 52/52(含跨通道"计划逐字一致")、ui-rpc 22/22(含真机 `runbook-run`)、e2e 45/45(含面板路径真机执行与"预演不改动远端") |
 | **v0.6.3** ✅ **S4b'' 静态校验已交付** | 跑书 lint | 新工具 `ecs_runbook`(list/validate/plan, 只读零远程调用);`lintRunbook` 纯函数(结构复用执行期校验 + 字段笔误/弱断言/护栏矛盾/破坏性命令/tail 语义/参数齐备);`$${name}` 转义解决 shell 变量与占位符同写法;RPC `runbook-validate` + 面板「校验」按钮与校验徽标 | 已达成:unit 58/58、ui-rpc 25/25、e2e 46/46(含真实工作区 lint 与"字段笔误→提示是否想写 command") |
 | **v0.6.4** ✅ **D11 已修复** | 会话工作区 | 新增 `common.resolveWorkspaceRoot(ctx, exec)`(与 DSH 内置工具同源: `sandboxPolicy.resolve({session})` → `session.header.cwd` → 部署兜底);各工具的 CLI/本机子进程透传 `exec`,工作目录与会话工作区一致;跑书目录取会话工作区;设置页默认跟随最近一次工具调用解析出的会话工作区,并支持 `dir` 显式覆盖(卡片带目录输入框 + [跟随会话]) | 已达成:unit 62/62、ui-rpc 25/25、e2e 47/47(含"会话 cwd 优先于部署兜底"的真机断言) |
+| **v0.6.5** ✅ **收尾打磨** | 显示噪声 | 真机核对 D11 时顺手修掉两处:① `ecs_upload` 的 message 未过 `cleanOutput`, 卡片被几百个 spinner/百分比帧淹没(与 `ecs_deploy` 上传阶段口径统一);② `ecs_runbook` 校验报告重复前缀(`steps[2] steps[2] …`) | 已达成:unit 62/62、ui-rpc 25/25、e2e 47/47 |
+| **v0.6.6** ✅ **真缺陷(D12)** | 单步超时 | 写奶龙发布跑书时发现:步骤里的 `timeout` **被静默忽略**(`planSteps` 只把全局值算一次发给每步),而工具 schema 明确承诺"本步骤命令超时(秒), 默认 180" —— 长步骤(发布脚本)仍会在全局 180s 处被 CLI 掐断, 预演显示的也不是调用方写的那个数。修复: `stepTimeoutOf(step, fallback)` 单步优先、上限 3600s 截断、非法值退回全局;`planPreview` 与 `ecs_deploy` dry_run 输出补 `timeout`(预演里能看见**实际生效**的值);lint 新增 `bad_timeout` / `timeout_clamped` 两条提醒(杜绝"写了却不按你写的执行"再次静默) | 已达成:unit 65/65、ui-rpc 25/25、e2e 47/47 |
 | **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,
