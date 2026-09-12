@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import {
   base64Encode, utf8ByteLength, cleanOutput, shellQuote, baseName, remoteJoin,
   checkWriteCommand, guardReadOnly, resolveTimeout, buildScriptDelivery,
-  localSha256, remoteSha256, SCRIPT_INLINE_LIMIT_BYTES,
+  localSha256, remoteSha256, SCRIPT_INLINE_LIMIT_BYTES, resolveWorkspaceRoot, sessionOf,
   buildLogReadCommand, parseLogRead, buildDetachLaunch, parseDetachPid, hasLocalTimer, delay,
   splitLocalPath, buildTarCreateArgv, buildArchiveExtractScript, parseArchiveEntries,
   runWithConcurrency,
@@ -1372,6 +1372,99 @@ await runAsync('设置页 runbook-validate: 单份静态校验(含参数齐备�
   const inline = await core.runbookValidate({ runbook: { name: 'inline', steps: [{ path: '/x' }] } })
   assert.equal(inline.source, 'inline')
   assert.equal(inline.ok, false)
+})
+
+// ---- D11(v0.6.4): 工作目录 / 跑书目录必须取**会话工作区**, 而不是部署兜底 ----
+run('resolveWorkspaceRoot: 会话 cwd 优先于部署兜底(两条来源)', () => {
+  const session = { header: { cwd: 'E:/proj' } }
+  const execWith = { agent: { session } }
+  // 1. policy.resolve 给出会话 cwd(与 DSH 内置工具同源的做法)
+  const policyCtx = {
+    get: (n) => (n === 'sandboxPolicy'
+      ? { workspaceRoot: 'C:/fallback', resolve: (req) => ({ workspaceRoot: req.session !== undefined ? req.session.header.cwd : 'C:/fallback' }) }
+      : undefined),
+  }
+  assert.equal(resolveWorkspaceRoot(policyCtx, execWith), 'E:/proj', '有会话时应取会话 cwd')
+  assert.equal(resolveWorkspaceRoot(policyCtx, undefined), 'C:/fallback', '无会话时应回落部署兜底')
+  // 2. policy 只有裸属性(无 resolve)时, 用 session.header.cwd
+  const bareCtx = { get: (n) => (n === 'sandboxPolicy' ? { workspaceRoot: 'C:/fallback' } : undefined) }
+  assert.equal(resolveWorkspaceRoot(bareCtx, execWith), 'E:/proj')
+  assert.equal(resolveWorkspaceRoot(bareCtx, undefined), 'C:/fallback')
+  // 3. 完全没有 policy 时: 有会话用会话, 无会话返回 undefined(调用方兜底 '.')
+  assert.equal(resolveWorkspaceRoot({ get: () => undefined }, execWith), 'E:/proj')
+  assert.equal(resolveWorkspaceRoot({ get: () => undefined }, undefined), undefined)
+  assert.equal(sessionOf(execWith), session)
+  assert.equal(sessionOf(undefined), undefined)
+  assert.equal(sessionOf({ agent: {} }), undefined)
+})
+
+await runAsync('D11: 工具子进程的工作目录取会话工作区(CLI 相对路径不再落到 $HOME)', async () => {
+  const seen = []
+  const subprocess = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) { seen.push({ cwd: spec.cwd }); return cannedHandle(JSON.stringify({ instances: [] })) },
+  }
+  const ctx = {
+    get: (n) => {
+      if (n === 'subprocess') return subprocess
+      if (n === 'sandboxPolicy') {
+        return {
+          workspaceRoot: 'C:/deploy-fallback',
+          resolve: (req) => ({ workspaceRoot: req.session !== undefined ? req.session.header.cwd : 'C:/deploy-fallback' }),
+        }
+      }
+      return undefined
+    },
+  }
+  const def = ecsListDefinition(ctx)
+  const exec = { name: 'ecs_list', signal: { aborted: false }, agent: { session: { header: { cwd: 'E:/proj' } } } }
+  await def.execute({ region: 'cn-shanghai' }, exec)
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].cwd, 'E:/proj', '有会话时应以会话工作区为 cwd, 实际 ' + seen[0].cwd)
+  seen.length = 0
+  await def.execute({ region: 'cn-shanghai' }, { name: 'ecs_list', signal: { aborted: false } })
+  assert.equal(seen[0].cwd, 'C:/deploy-fallback', '无会话时回落部署兜底')
+})
+
+await runAsync('D11: ecs_runbook 按会话工作区找跑书(不再去 $HOME)', async () => {
+  const files = {
+    ['E:/proj/' + RUNBOOK_DIR + '/release.json']: JSON.stringify({ name: 'release', steps: [{ command: 'echo hi' }] }),
+    ['C:/home/' + RUNBOOK_DIR + '/other.json']: JSON.stringify({ name: 'other', steps: [{ command: 'echo other' }] }),
+  }
+  const ctx = {
+    get: (n) => {
+      if (n === 'fs') return fakeFs(files)
+      if (n === 'sandboxPolicy') return { workspaceRoot: 'C:/home' }
+      return undefined
+    },
+  }
+  const def = ecsRunbookDefinition(ctx)
+  const withSession = await def.execute({ action: 'list' }, {
+    name: 'ecs_runbook', signal: { aborted: false }, agent: { session: { header: { cwd: 'E:/proj' } } },
+  })
+  assert.equal(withSession.count, 1, '应只在会话工作区里找: ' + JSON.stringify(withSession.runbooks.map((r) => r.name)))
+  assert.equal(withSession.runbooks[0].name, 'release')
+  assert.ok(String(withSession.dir).replace(/\\/g, '/').startsWith('E:/proj/'), '目录应来自会话工作区: ' + withSession.dir)
+  const fallback = await def.execute({ action: 'list' }, { name: 'ecs_runbook', signal: { aborted: false } })
+  assert.equal(fallback.runbooks[0].name, 'other')
+  assert.ok(String(fallback.dir).replace(/\\/g, '/').startsWith('C:/home/'), fallback.dir)
+})
+
+await runAsync('D11: 设置页 runbook 目录可显式覆盖(dir 参数), 且优先于跟随值', async () => {
+  const core = createSettingsCore(async () => ({ exitCode: 0, stdout: '{}', stderr: '' }), {
+    runbookDirOf: (args) => (args.dir !== undefined ? String(args.dir) : '/followed/' + RUNBOOK_DIR),
+    listRunbooks: async (args) => (args.dir !== undefined ? ['from-override'] : ['from-followed']),
+    loadRunbook: async (name, args) => ({ text: JSON.stringify({ steps: [{ command: 'echo ' + name }] }), path: args.dir + '/' + name + '.json' }),
+  })
+  const followed = await core.runbookList()
+  assert.equal(followed.dir, '/followed/' + RUNBOOK_DIR)
+  assert.deepEqual(followed.runbooks.map((r) => r.name), ['from-followed'])
+  const override = await core.runbookList({ dir: 'E:/AiProject/nailong/' + RUNBOOK_DIR })
+  assert.equal(override.dir, 'E:/AiProject/nailong/' + RUNBOOK_DIR)
+  assert.deepEqual(override.runbooks.map((r) => r.name), ['from-override'])
+  const plan = await core.runbookPlan({ instance_id: 'i-x', runbook: 'release', dir: 'E:/proj/' + RUNBOOK_DIR })
+  assert.equal(plan.ok, true)
+  assert.ok(String(plan.runbook.path).startsWith('E:/proj/'), 'loadRunbook 应拿到同一目录: ' + plan.runbook.path)
 })
 
 console.log('')

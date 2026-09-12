@@ -1145,6 +1145,35 @@ await run('ecs_runbook: 工作区清点 + 静态校验 + 预演(全程零远程�
   assertLossless('ecs_runbook presentCall', def.presentCall({ action: 'plan', runbook: 'e2e-smoke' }))
 })
 
+await run('D11: 跑书目录取会话工作区(而非部署兜底), 面板 dir 覆盖同样生效', async () => {
+  // ctx 的 sandboxPolicy 指向"部署兜底"(故意指向一个空的 runbook 目录),
+  // 靠 exec.agent.session.header.cwd 指到真实工作区 —— 正是 D11 修复的行为。
+  const misleading = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-fallback-'))
+  mkdirSync(join(misleading, '.dsh', 'workbench-ecs', 'runbooks'), { recursive: true })
+  const ctxFallback = makeCtx({ fs: nodeFsAdapter(e2eRbRoot), workspaceRoot: misleading })
+  const execWithSession = {
+    name: 'ecs_runbook',
+    signal: new AbortController().signal,
+    agent: { session: { header: { cwd: e2eRbRoot } } },
+  }
+  const def = ecsRunbookDefinition(ctxFallback)
+  const bySession = await def.execute({ action: 'list' }, execWithSession)
+  assert.ok(bySession.count >= 3, '应按会话工作区找到跑书: ' + JSON.stringify(bySession.runbooks.map((r) => r.name)))
+  assert.ok(String(bySession.dir).replace(/\\/g, '/').startsWith(e2eRbRoot.replace(/\\/g, '/')),
+    '目录应来自会话工作区: ' + bySession.dir)
+  const withoutSession = await def.execute({ action: 'list' }, makeExec('ecs_runbook'))
+  assert.equal(withoutSession.count, 0, '无会话时应回落部署兜底(那个目录是空的)')
+  // 面板侧: 显式 dir 覆盖(设置页没有会话上下文时的逃生门)
+  const coreWithDir = createSettingsCore(async () => ({ exitCode: 0, stdout: '{}', stderr: '' }), {
+    runbookDirOf: (args) => String(args.dir),
+    listRunbooks: async (args) => readdirSync(args.dir).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, '')),
+    loadRunbook: async (name, args) => ({ text: readFileSync(join(args.dir, name + '.json'), 'utf8'), path: join(args.dir, name + '.json') }),
+  })
+  const overridden = await coreWithDir.runbookList({ dir: e2eRbDir })
+  assert.ok(overridden.ok === true && overridden.runbooks.length >= 3, JSON.stringify(overridden).slice(0, 200))
+  assert.ok(String(overridden.dir).replace(/\\/g, '/').endsWith('.dsh/workbench-ecs/runbooks'), overridden.dir)
+})
+
 console.log('')
 console.log('== 结果: ' + passed + ' 通过, ' + failed + ' 失败 ==')
 process.exit(failed > 0 ? 1 : 0)

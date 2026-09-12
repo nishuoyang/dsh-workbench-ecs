@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.3 · MIT License
+> v0.6.4 · MIT License
 
 [English](./README.md) | 中文
 
@@ -469,11 +469,13 @@ runbook 文件形状:
 
 **边界(有意为之)**:插件只提供**机制** —— 读取 / 校验 / 参数替换 / 展开成 `steps`;**内容**(步骤与断言、脚本本体)留在项目仓库,插件不硬编码任何项目逻辑。占位符 `${name}` 在任意字符串里替换;整串恰好是一个占位符时**保留原始类型**(`"timeout": "${t}"` + `t=300` → 数字 300);缺少参数会直接报错并列出该 runbook 声明的占位符;多余的入参会在结果里以 `unused_params` 提示。runbook 名字只允许 `[A-Za-z0-9._-]`(挡住路径穿越)。需要 `fs` 服务;未挂载时请改用内联 `runbook` 对象。
 
+- **跑书目录 = 会话工作区**:插件按 `exec.agent.session.header.cwd` 解析 `<工作区>/.dsh/workbench-ecs/runbooks/`(与 DSH 内置工具同源),因此放在**项目仓库**里的跑书能被直接看见;相对路径的 `local_file` 也以该目录为 cwd。设置页没有会话上下文,默认**跟随最近一次 Agent 会话的工作区**,卡片里可手动指定目录(留空即跟随)。
+
 **(D) 面板里跑同一份 runbook(v0.6.2+)** —— 设置页的「Runbook（发布跑书）」卡片会扫描工作区 runbook 目录,列出名称/说明/步数/类型/参数占位,逐条提供 **预演**(只回显命令行,零副作用)与 **执行**;发布向导也可直接切换为「Runbook」模式。
 
 - 面板与 Agent **共用同一个编排引擎**(`lib/steps-engine.js`),因此预演出来的命令行与 Agent 真正下发的逐字一致 —— 不会出现"面板能跑、工具跑不通"的漂移;
 - **守卫口径差异(有意)**:面板没有审批上下文,命中破坏性命令模式**直接拒绝**并把错误定位到具体步骤(要审批放行请走 Agent 的 `ecs_deploy`);`read_only` 步骤按只读护栏预检;
-- 面板侧 RPC 操作:`runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run`(同源路由 `/dsh-workbench-ecs/rpc`)。
+- 面板侧 RPC 操作:`runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run`(同源路由 `/dsh-workbench-ecs/rpc`),均可传 `dir` 指定跑书目录;
 
 ### `ecs_runbook` —— 工作区跑书的只读清点与静态校验(v0.6.3+)
 
@@ -500,7 +502,7 @@ CLI 对应: **无** —— 本工具不调用任何 CLI 命令, 也不触达 ECS
 
 ```
 # 建议顺序: 先只读校验, 再预演, 最后才执行
-ecs_runbook { action: "validate", runbook: "release", runbook_params: { sha: "abc123" } }
+ecs_runbook { action: "validate", runbook: "release", runbook_params: { sha: "abc123" } }   # 读 <会话工作区>/.dsh/workbench-ecs/runbooks/
 ecs_runbook { action: "plan",     runbook: "release", instance_id: "i-xxx", runbook_params: { sha: "abc123" } }
 ecs_deploy  { instance_id: "i-xxx", runbook: "release", runbook_params: { sha: "abc123" } }
 ```

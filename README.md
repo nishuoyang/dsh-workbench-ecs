@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.3 · MIT License
+> v0.6.4 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -464,11 +464,13 @@ Returns `mode` (`legacy` / `steps`), `ok`, `done_stage`/`total_stage`, `stopped_
 
 **Deliberate boundary**: the plugin supplies the *mechanism* (load / validate / substitute params / expand into `steps`); the *content* — steps, assertions, and script bodies — stays in the project repository. `${name}` is substituted inside any string, and a string that is exactly one placeholder **keeps its original type** (`"timeout": "${t}"` with `t=300` yields the number 300); a missing parameter fails loudly and lists the runbook's declared placeholders; unused inputs are reported as `unused_params`. Names are restricted to `[A-Za-z0-9._-]` (no path traversal). Requires the `fs` service; without it, use an inline `runbook` object.
 
+- **Runbook directory = the session workspace**: the plugin resolves `<workspace>/.dsh/workbench-ecs/runbooks/` from `exec.agent.session.header.cwd` (the same source DSH built-in tools use), so runbooks living in your **project repository** are found, and relative `local_file` paths run with that directory as cwd. The settings panel has no session context, so it **follows the most recent agent session workspace** by default and lets you type an explicit directory (leave it empty to follow).
+
 **(D) Run the same runbook from the panel (v0.6.2+)** — the settings panel's "Runbook" card scans the workspace runbook directory, lists name / description / step count / kinds / declared params, and offers per-row **Preview** (echoes the command lines only, zero side effects) and **Execute**; the publish wizard can also switch into "Runbook" mode.
 
 - The panel and the Agent share **one orchestration engine** (`lib/steps-engine.js`), so a previewed command line is byte-for-byte what the Agent would send — no "works in the panel, fails through the tool" drift;
 - **Guard difference (intentional)**: the panel has no approval context, so a destructive command pattern is **rejected outright** with the offending step index (use the Agent's `ecs_deploy` for approval-gated execution); `read_only` steps are pre-checked by the read-only guard;
-- Panel-side RPC operations: `runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run` (same-origin route `/dsh-workbench-ecs/rpc`).
+- Panel-side RPC operations: `runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run` (same-origin route `/dsh-workbench-ecs/rpc`), each accepting `dir` to point at an explicit runbook directory;
 
 ### `ecs_runbook` — read-only inventory & static checks for workspace runbooks (v0.6.3+)
 

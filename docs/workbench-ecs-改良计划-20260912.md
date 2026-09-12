@@ -1,4 +1,4 @@
-# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.3)
+# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.4)
 
 > 输入: `E:\AiProject\nailong\docs\workbench-ecs-反馈与改进建议-20260912.md`(奶龙生产运维 ~30 次真实调用)
 > 核对基线: 插件源码 v0.3.7(commit `324d979`)+ 本机 Workbench CLI **v1.0.1**(commit `86c0aff`)
@@ -119,6 +119,31 @@ v0.4.0 给 `remoteSha256` 增加 `locked: true`(调用方已持锁时不再重�
 2. 你的命令内部自己再套的一层(`docker exec ... node -e "..."`)。
 
 只有两层,但足以炸 —— 所以 S1 的方案只需**让命令内容不进入第 1 层**,不必处理本地转义。
+
+---
+
+### D11. 跑书目录与 CLI 工作目录取的是"部署兜底"而不是"会话工作区" —— 真缺陷(v0.6.4 修复)
+
+- **怎么发现的**: v0.6.3 重启后在**真实进程**里核对 `ecs_runbook { action: "list" }`,
+  输出的目录是 `C:\Users\ASUS/.dsh/workbench-ecs/runbooks` —— 而不是当前会话工作区。
+  单测里传的是显式 `workspaceRoot`, 所以 unit/e2e/ui 全绿也照不出这个问题。
+- **根因**: DSH 的 `sandboxPolicy` 是**会话感知的服务** ——
+  `resolve({ session }).workspaceRoot === session.header.cwd`,仅在无会话时回落部署配置
+  (`config.workspaceRoot ?? process.cwd()`)。插件此前读的是**裸属性** `sandboxPolicy.workspaceRoot`,
+  拿到的正是那个**部署兜底值**,于是:
+  1. `ecs_deploy { runbook }` / `ecs_runbook` 去 `$HOME/.dsh/...` 找跑书 ——
+     放在项目仓库里的跑书**根本看不见**(对"跑书留在项目仓库"这个设计目标是致命的);
+  2. CLI 子进程的 cwd 同样是 `$HOME`, `ecs_upload { local_file: 'dist/app.jar' }`
+     这类**相对路径**全部指错地方(上传、目录 tar 归档、本地 sha256 同源受影响)。
+- **修复(与 DSH 内置工具同源)**: 新增 `common.resolveWorkspaceRoot(ctx, exec)`,
+  解析顺序 = `sandboxPolicy.resolve({session}).workspaceRoot` → `session.header.cwd` → 部署兜底;
+  各工具把 `exec` 透传给 `spawnProcess` / `runWorkbench` / `localSha256` / `removeLocalFile`
+  (opts.exec),跑书目录 = **会话工作区** + `RUNBOOK_DIR`。
+- **设置页没有会话上下文**: 默认跟随**最近一次工具调用解析出的会话工作区**
+  (index.js 在注册工具时记录),并允许 RPC 用 `dir` 参数显式覆盖 ——
+  面板卡片里是「目录输入框 + [跟随会话]」,并把当前生效目录显示出来。
+- **教训**: 服务对象的**裸属性**常常只是"兜底值/默认值",会话相关语义要走它的
+  `resolve()` / 查询方法;这类缺陷只有"在真实进程里跑一次并核对输出"才暴露得出来。
 
 ---
 
@@ -389,6 +414,7 @@ runbook 是**纯数据**, 因此"哪里写错了"完全可以在下发任何命�
 | **v0.6.1** ✅ **S4b 机制已交付** | 跑书机制 | Runbook: `runbook` + `runbook_params`(工作区 `.dsh/workbench-ecs/runbooks/*.json` 或内联)、`${参数}` 替换(整串保留类型)、隐式 `instance_id`/`region`、名字白名单、缺参数/缺文件的可操作报错;顺带修掉 **D10**(to-body 模块清单硬编码) | 已达成:unit 45/45、e2e 41/41;内容侧按约定留在项目仓库 |
 | **v0.6.2** ✅ **S4b' 面板化已交付** | 跑书进面板 | 抽出 `lib/steps-engine.js`(工具与面板共用同一引擎);设置页新增 `runbook-list` / `runbook-plan` / `runbook-run`;面板新增 Runbook 卡片(列出/预演/执行)+ 发布向导 runbook 模式;`to-body` 模块发现改递归 | 已达成:unit 52/52(含跨通道"计划逐字一致")、ui-rpc 22/22(含真机 `runbook-run`)、e2e 45/45(含面板路径真机执行与"预演不改动远端") |
 | **v0.6.3** ✅ **S4b'' 静态校验已交付** | 跑书 lint | 新工具 `ecs_runbook`(list/validate/plan, 只读零远程调用);`lintRunbook` 纯函数(结构复用执行期校验 + 字段笔误/弱断言/护栏矛盾/破坏性命令/tail 语义/参数齐备);`$${name}` 转义解决 shell 变量与占位符同写法;RPC `runbook-validate` + 面板「校验」按钮与校验徽标 | 已达成:unit 58/58、ui-rpc 25/25、e2e 46/46(含真实工作区 lint 与"字段笔误→提示是否想写 command") |
+| **v0.6.4** ✅ **D11 已修复** | 会话工作区 | 新增 `common.resolveWorkspaceRoot(ctx, exec)`(与 DSH 内置工具同源: `sandboxPolicy.resolve({session})` → `session.header.cwd` → 部署兜底);各工具的 CLI/本机子进程透传 `exec`,工作目录与会话工作区一致;跑书目录取会话工作区;设置页默认跟随最近一次工具调用解析出的会话工作区,并支持 `dir` 显式覆盖(卡片带目录输入框 + [跟随会话]) | 已达成:unit 62/62、ui-rpc 25/25、e2e 47/47(含"会话 cwd 优先于部署兜底"的真机断言) |
 | **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,
@@ -451,7 +477,7 @@ runbook 是**纯数据**, 因此"哪里写错了"完全可以在下发任何命�
     - e2e 1 项(真实工作区):`ecs_runbook` 清点 + 校验(字段笔误提示)+ 预演(脚本正文不入计划、默认超时 180、
       明确"未执行任何命令")+ 全部出口过 `isJsonValue`。
 
-> 当前实际测试资产:`test/unit.mjs` **58 项**(不触达实例)、`test/e2e-local.mjs` **46 项**(真实实例)、
+> 当前实际测试资产:`test/unit.mjs` **62 项**(不触达实例)、`test/e2e-local.mjs` **47 项**(真实实例)、
 > `test/ui-rpc.mjs` **25 项**(真实 CLI + 内存 fake ctx,含真机 runbook);
 > `npm test` = unit + 冒烟(含动态 body 一致性与完整性守卫)。
 
