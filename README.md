@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.4.0 · MIT License
+> v0.5.0 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -10,7 +10,9 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 
 ## Features
 
-- **7 Agent-native tools**: `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, integrated with the Harness tool pipeline
+- **8 Agent-native tools**: `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, integrated with the Harness tool pipeline
+- **Detached long tasks + log cursor** (v0.5.0+): `ecs_exec { detach: true }` starts the job with remote `nohup`, writes a log file, and immediately returns `job_id`/`log_path`/`exit_path`; the plugin polls increments on an interval, so it never holds the instance for the whole run (other calls on the same instance interleave normally) and the remote log file stays the single source of truth — a slow reader can no longer lose or duplicate segments. `ecs_log` reads any remote file by **byte cursor**, so release-log polling no longer needs repeated full `tail`s
+- **Pseudo-sessions** (v0.5.0+): `ecs_exec { session_id: "deploy" }` keeps the working directory and environment across calls (`cd`/`export` carry over), different session ids stay isolated, and an idle session resets after 30 minutes with an explicit notice
 - **Visual settings panel** (v0.3.0+): CLI status with 20s host cache + instant local render, instance browser (search / batch / 30s auto-refresh), one-click diagnostics with disk & memory gauges, guarded publish wizard with templates, session management, operation timeline — auto-adapts to light/dark themes
 - **Real API calls**: tools run the local `workbench` command and reach instances through the Alibaba Cloud Workbench backend (works for instances **without public IPs**)
 - **JSON parsing + readable rendering**: parses CLI JSON output into tables/text/terminal cards; CLI-level errors (`{code, message}`) become readable messages
@@ -20,7 +22,7 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Transfer integrity** (v0.4.0+): `ecs_upload.verify_sha256` compares local/remote digests after upload; `ecs_deploy` enables it by default and **aborts before restart** on a mismatch. Local hashing uses `sha256sum`/`shasum`/`certutil`, so no extra runtime is required
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (serial; per-instance failures do not stop others)
-- **Per-instance serialization**: operations touching the same instance run one at a time (FIFO), so concurrent calls can never interleave output through the shared Workbench session; different instances still run in parallel. A long background task holds its instance's slot until it finishes
+- **Per-instance serialization**: operations touching the same instance run one at a time (FIFO), so concurrent calls can never interleave output through the shared Workbench session; different instances still run in parallel. Detached tasks only hold the lock during each poll instead of for the whole run (v0.5.0+)
 - **Large-output spill**: oversized stdout spills to disk with the full path returned, so log triage never loses the head
 - **Output cleanup**: ANSI escapes, control characters and CLI progress frames (spinners, percentage bars) are stripped by default, so logs and upload results stay readable (`strip_ansi: false` opts out)
 - **Reliable exit codes**: the remote `exit_code` from the CLI's JSON is authoritative (rather than the local process status), and `request_id`/`session_id` come back for after-the-fact isolation checks
@@ -49,7 +51,7 @@ That's it — the bundle layer inserts the plugin row into the web profile: the 
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.4.0"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.0"}
 ```
 
 Then ask the Agent:
@@ -292,8 +294,14 @@ CLI equivalent: `workbench exec --instance-id <id> --command <cmd> [--timeout <s
 | `timeout` | integer | | Remote command timeout in seconds, default 60 (always sent explicitly; the CLI default is only 30) |
 | `region` | string | | Region, optional (CLI infers it from the instance ID) |
 | `run_in_background` | boolean | | Run long commands in the background: returns a `job_id`, read with `job_output` (not for batches) |
+| `detach` | boolean | | **Remote detached task** (recommended for release/build work lasting minutes to hours): remote `nohup` + log file, returns `job_id`/`log_path`/`exit_path` immediately; polls increments without holding the instance |
+| `poll_interval` | integer | | Detach poll interval in seconds, default 2 |
+| `max_duration` | integer | | How long the plugin tracks a detached task, default 3600s; on expiry it stops tracking (the remote task keeps running) |
+| `session_id` | string | | **Pseudo-session**: keeps cwd/env across calls with the same id; single-instance foreground only |
+| `session_reset` | boolean | | Clear this session's cwd/env before executing |
+| `env` | array\<string\> | | Session-persistent environment entries, each `K=V`, merged with existing ones |
 
-Returns `{ kind: single|batch|background, ... }` (including `exit_code` / `request_id` / `session_id`).
+Returns `{ kind: single|batch|background|detached, ... }` (including `exit_code` / `request_id` / `cli_session_id`, plus `session_cwd` / `env_keys` in session mode).
 
 **When to use `script`**: whenever the command contains nested quotes. Compare —
 
@@ -304,6 +312,21 @@ ecs_exec { instance_id: "i-xxx", command: "docker exec app node -e \"console.log
 # Zero escaping (recommended)
 ecs_exec { instance_id: "i-xxx", script: "docker exec app node -e \"console.log('hi')\"" }
 ```
+
+### `ecs_log` — read a remote file by byte cursor (read-only)
+
+CLI equivalent: `workbench exec` (only `wc -c` / `tail -c` / `head -c` / `cat` — strictly read-only)
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `instance_id` | string | ✅ | Target instance ID |
+| `path` | string | ✅ | Remote file path, e.g. `/tmp/.dsh-ecs-xxx/out.log` |
+| `after` | integer | | Starting byte offset (the previous `next_offset`; 0 on the first read) |
+| `max_bytes` | integer | | Maximum bytes per read, default 262144; when `truncated=true`, read again immediately |
+| `exit_file` | string | | Optional remote exit-code file; when present, its value is returned as `exit_code` |
+| `region` / `timeout` | | | Region / timeout in seconds (default 60) |
+
+**Usage**: polling a release/build log is `ecs_log { path: "<log>", after: <last next_offset> }` — no more full `tail`s plus eyeballing the delta. Combined with a detached task's `log_path`, arbitrarily long logs stay fully readable from the start.
 
 ### `ecs_upload` — upload a local file to an instance
 
@@ -453,7 +476,7 @@ ecs_exec: workbench CLI 错误 (code 1): session resolve: login instance: SDKErr
 
 ```bash
 npm install          # install devDependencies (@deepseek-ai/dsh-tools)
-npm test             # unit regressions (no instance needed) + smoke test: module exports + 7-tool contract + body consistency
+npm test             # unit regressions (no instance needed) + smoke test: module exports + 8-tool contract + body consistency
 npm run test:unit    # unit regressions only: base64 / read-only guard / timeout defaults / output cleanup / sha256
 npm run test:e2e     # real-CLI end-to-end test (needs local Workbench CLI, valid credentials, a reachable instance)
 npm run build:body   # generate the dynamic-mount body (same origin as lib/)

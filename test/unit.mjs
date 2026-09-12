@@ -16,8 +16,10 @@ import {
   base64Encode, utf8ByteLength, cleanOutput, shellQuote, baseName, remoteJoin,
   checkWriteCommand, guardReadOnly, resolveTimeout, buildScriptDelivery,
   localSha256, remoteSha256, SCRIPT_INLINE_LIMIT_BYTES,
+  buildLogReadCommand, parseLogRead, buildDetachLaunch, parseDetachPid, hasLocalTimer, delay,
 } from '../lib/common.js'
 import { buildDiagnoseScript } from '../lib/tools/ecs-diagnose.js'
+import { buildSessionScript, extractSessionCwd } from '../lib/tools/ecs-exec.js'
 
 let passed = 0
 let failed = 0
@@ -267,6 +269,101 @@ await runAsync('remoteSha256: 解析 CLI JSON 的输出并复用实例锁', asyn
   assert.equal(digest, expectedHash)
   assert.ok(calls[0].join(' ').includes('--timeout 60'), '应显式下发默认超时: ' + calls[0].join(' '))
   assert.ok(calls[0].join(' ').includes('sha256sum'), '应优先使用 sha256sum')
+})
+
+// ---- detach / 日志游标(S2) ----
+run('buildLogReadCommand: 含 meta/游标/退出码探测, 且都是只读命令', () => {
+  const cmd = buildLogReadCommand({ logPath: '/tmp/x/out.log', exitPath: '/tmp/x/exit', after: 100, maxBytes: 4096 })
+  assert.ok(cmd.includes('wc -c <'), '应报告总字节数')
+  assert.ok(cmd.includes('__DSH_ECS_META__'), '应有 meta 标记')
+  assert.ok(cmd.includes('tail -c +101'), '游标应为 after+1(1-based), 实际: ' + cmd)
+  assert.ok(cmd.includes('head -c 4096'), '应限制单次读取字节数')
+  assert.ok(cmd.includes('__DSH_ECS_EXIT__'), '应探测退出码文件')
+  assert.equal(checkWriteCommand(cmd), undefined, '游标读命令必须是只读命令')
+  // 路径包含单引号/空格时仍应安全引用
+  const tricky = buildLogReadCommand({ logPath: "/tmp/it's a log.log", after: 0 })
+  assert.ok(tricky.includes("'/tmp/it'\\''s a log.log'"), '路径应经 shell 引用')
+  assert.equal(checkWriteCommand(tricky), undefined, '引用后不应命中写模式')
+})
+
+run('parseLogRead: 提取增量/游标/总长/退出码', () => {
+  const output = '__DSH_ECS_META__ 120\nline-a\nline-b\n__DSH_ECS_EXIT__ 7\n'
+  const p = parseLogRead(output, 0, 4096)
+  assert.equal(p.total_bytes, 120)
+  assert.equal(p.text, 'line-a\nline-b')
+  assert.equal(p.bytes, 120, '可用字节数应为 total-after')
+  assert.equal(p.next_offset, 120)
+  assert.equal(p.exit_code, 7)
+  assert.equal(p.truncated, false)
+  // 续读: 已到末尾则没有增量
+  const p2 = parseLogRead('__DSH_ECS_META__ 120\n', 120, 4096)
+  assert.equal(p2.text, '')
+  assert.equal(p2.bytes, 0)
+  assert.equal(p2.next_offset, 120)
+  assert.equal(p2.exit_code, undefined)
+  // 超过 max_bytes 时按上限推进游标并标记 truncated
+  const p3 = parseLogRead('__DSH_ECS_META__ 1000\n' + 'x'.repeat(100), 0, 100)
+  assert.equal(p3.bytes, 100)
+  assert.equal(p3.next_offset, 100)
+  assert.equal(p3.truncated, true)
+})
+
+run('buildDetachLaunch: 前置投递 + nohup 启动 + 日志/退出码路径', () => {
+  const d = buildDetachLaunch('echo hello', { id: 'fixedid' })
+  assert.ok(d.dir.includes('.dsh-ecs-fixedid'), '应有独立任务目录')
+  assert.equal(d.log_path, d.dir + '/out.log')
+  assert.equal(d.exit_path, d.dir + '/exit')
+  assert.ok(d.prepare_commands[0].includes('mkdir -p '), '自定义目录应先建目录')
+  assert.ok(d.prepare_commands.join('\n').includes('base64 -d'), '应先落盘脚本')
+  assert.ok(d.prepare_commands.join('\n').includes('wc -c'), '应有字节数校验')
+  assert.ok(d.launch_command.includes('nohup'), '应 nohup 启动')
+  assert.ok(d.launch_command.includes('__DSH_ECS_PID__$!'), '应回报远端 pid')
+  assert.ok(d.launch_command.includes(d.log_path), '应重定向到日志文件')
+  assert.ok(d.launch_command.includes(d.exit_path), '应写退出码文件')
+  assert.equal(parseDetachPid('__DSH_ECS_PID__4321\n'), 4321)
+  assert.equal(parseDetachPid('no pid here'), undefined)
+})
+
+await runAsync('delay/hasLocalTimer: 本机 Node 环境可用', async () => {
+  assert.equal(hasLocalTimer(undefined), true)
+  const t0 = Date.now()
+  await delay(undefined, 20)
+  assert.ok(Date.now() - t0 >= 15, 'delay 应实际等待')
+})
+
+// ---- 伪会话(S3) ----
+run('buildSessionScript: 继承 cwd/环境变量 + 回传 cwd 标记', () => {
+  const s1 = buildSessionScript('echo hi', undefined, ['FOO=bar'])
+  assert.ok(s1.script.includes("export FOO='bar'"), '应导出会话变量')
+  assert.ok(s1.script.includes('echo hi'), '应包含原始 payload')
+  assert.ok(s1.script.includes('__DSH_ECS_CWD__'), '应回传 cwd 标记')
+  assert.ok(s1.script.includes('exit $rc'), '应透传退出码')
+  assert.ok(!s1.script.includes('cd '), '无会话状态时不应 cd')
+  assert.equal(s1.env.FOO, 'bar')
+
+  const s2 = buildSessionScript('pwd', { cwd: '/opt/app', env: { FOO: 'bar' } }, ['BAZ=a b'])
+  assert.ok(s2.script.startsWith("cd '/opt/app'"), '应继承上次 cwd, 实际: ' + s2.script.split('\n')[0])
+  assert.ok(s2.script.includes("export FOO='bar'"), '应继承上次环境变量')
+  assert.ok(s2.script.includes("export BAZ='a b'"), '新变量应经 shell 引用')
+  assert.equal(s2.env.BAZ, 'a b')
+  // 非法变量名应被忽略, 避免注入
+  const s3 = buildSessionScript('echo x', undefined, ['BAD-NAME=v', "INJ=x'; rm -rf /; echo '"])
+  assert.ok(!s3.script.includes('export BAD-NAME'), '非法变量名应被忽略')
+  assert.ok(s3.script.includes("'\\''"), '变量值应被安全引用')
+})
+
+run('extractSessionCwd: 剥离标记并取回 cwd', () => {
+  const r = extractSessionCwd('/opt/app\n__DSH_ECS_CWD__/opt/app\n')
+  assert.equal(r.cwd, '/opt/app')
+  assert.equal(r.text, '/opt/app')
+  assert.ok(!r.text.includes('__DSH_ECS_CWD__'), '标记不应残留在输出里')
+  const none = extractSessionCwd('no marker here')
+  assert.equal(none.cwd, undefined)
+  assert.equal(none.text, 'no marker here')
+  // 标记在中间时也要能处理
+  const mid = extractSessionCwd('a\n__DSH_ECS_CWD__/tmp\nb')
+  assert.equal(mid.cwd, '/tmp')
+  assert.equal(mid.text, 'a\nb')
 })
 
 console.log('')

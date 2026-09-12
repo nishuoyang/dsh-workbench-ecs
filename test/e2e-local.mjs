@@ -16,6 +16,7 @@ import { isJsonValue } from '@deepseek-ai/dsh-session'
 
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
 import { ecsExecDefinition } from '../lib/tools/ecs-exec.js'
+import { ecsLogDefinition } from '../lib/tools/ecs-log.js'
 import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
 import { ecsDownloadDefinition } from '../lib/tools/ecs-download.js'
 import { ecsDiagnoseDefinition } from '../lib/tools/ecs-diagnose.js'
@@ -135,9 +136,9 @@ await run('ecs_exec 单实例(真实命令)', async () => {
   assert.equal(value.exit_code, 0)
   // D1 回归: 工具声明的默认超时必须显式下发(CLI 默认仅 30s)
   assert.ok(value.command_line.includes('--timeout 60'), '默认超时应显式下发 60, 实际: ' + value.command_line)
-  // 排障字段: request_id/session_id 便于事后核对隔离性
+  // 排障字段: request_id/cli_session_id 便于事后核对隔离性(CLI 侧共享会话)
   assert.ok(typeof value.request_id === 'string' && value.request_id.startsWith('r-'), '应带回 request_id, 实际: ' + value.request_id)
-  assert.ok(typeof value.session_id === 'string', '应带回 session_id')
+  assert.ok(typeof value.cli_session_id === 'string', '应带回 cli_session_id')
   assertLossless('ecs_exec single value', value)
   assertLossless('ecs_exec single presentationMeta', def.output.presentationMeta(args, value))
   assertLossless('ecs_exec single presentCall', def.presentCall(args))
@@ -316,6 +317,152 @@ await run('同实例并发不串流(后台 + 前台)', async () => {
   assert.ok(!fg.output.includes('done-bg'), '前台输出不应含后台结束标记, 实际: ' + fg.output)
   assert.ok(bgOut.includes('done-bg'), '后台输出应完整, 实际: ' + bgOut)
   assert.ok(!bgOut.includes('fg-only-marker'), '后台输出不应混入前台内容, 实际: ' + bgOut)
+})
+
+// ---- S2: detach 长任务 + 字节游标日志 + D2 不再长期占锁 ----
+await run('ecs_exec detach: 远端长任务 + 增量日志', async () => {
+  let jobRun
+  const jobsMock = { start(spec) { jobRun = spec.run(); return 'job-detach-1' } }
+  const def = ecsExecDefinition(makeCtx({ jobs: jobsMock }))
+  const value = await def.execute(
+    {
+      instance_id: INSTANCE_ID,
+      script: 'for i in 1 2 3; do echo tick-$i; sleep 1; done; echo DETACH-DONE',
+      detach: true,
+      poll_interval: 1,
+      description: 'e2e detach 长任务',
+    },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(value.kind, 'detached')
+  assert.equal(value.job_id, 'job-detach-1')
+  assert.ok(typeof value.pid === 'number' && value.pid > 0, '应回报远端 pid, 实际: ' + value.pid)
+  assert.ok(String(value.log_path).includes('/.dsh-ecs-'), '应回报日志路径: ' + value.log_path)
+  assert.ok(String(value.exit_path).endsWith('/exit'), '应回报退出码文件: ' + value.exit_path)
+  assertLossless('ecs_exec detach value', value)
+  assertLossless('ecs_exec detach presentationMeta', def.output.presentationMeta({}, value))
+  assertLossless('ecs_exec detach presentCall', def.presentCall({ instance_id: INSTANCE_ID, script: 'echo x', detach: true }))
+
+  const done = await jobRun.done
+  const out = jobRun.readOutput()
+  assert.equal(done.status, 'completed', 'detach 任务应结算为 completed, 实际: ' + JSON.stringify(done))
+  assert.match(String(done.detail), /exit code: 0/)
+  for (const marker of ['tick-1', 'tick-2', 'tick-3', 'DETACH-DONE']) {
+    assert.ok(out.includes(marker), '增量输出应含 ' + marker + ', 实际: ' + out)
+  }
+  assertLossless('jobs detach outcome', done)
+
+  // 字节游标读: 从 0 读全文 → 再按 next_offset 续读应为空(不重复)
+  const logDef = ecsLogDefinition(ctx)
+  const first = await logDef.execute({ instance_id: INSTANCE_ID, path: value.log_path, after: 0 }, makeExec('ecs_log'))
+  assert.ok(first.text.includes('DETACH-DONE'), '从头读应拿到完整日志')
+  assert.ok(first.next_offset > 0)
+  assert.equal(first.eof, true, '任务已结束, 应到末尾')
+  assertLossless('ecs_log value', first)
+  const second = await logDef.execute({ instance_id: INSTANCE_ID, path: value.log_path, after: first.next_offset }, makeExec('ecs_log'))
+  assert.equal(second.text, '', '续读不应重复已读内容, 实际: ' + second.text)
+  assert.equal(second.next_offset, first.next_offset)
+  // 分片读: max_bytes 限定 + truncated 提示 + 游标推进
+  const slice = await logDef.execute({ instance_id: INSTANCE_ID, path: value.log_path, after: 0, max_bytes: 8 }, makeExec('ecs_log'))
+  assert.equal(slice.bytes, 8, '应按 max_bytes 截断, 实际: ' + slice.bytes)
+  assert.equal(slice.next_offset, 8)
+  assert.equal(slice.truncated, true)
+  // 退出码文件: 存在即回报 exit_code
+  const withExit = await logDef.execute({ instance_id: INSTANCE_ID, path: value.log_path, after: first.next_offset, exit_file: value.exit_path }, makeExec('ecs_log'))
+  assert.equal(withExit.exit_code, 0, '应读到退出码 0')
+})
+
+await run('detach 期间同实例调用不被长期阻塞(D2)', async () => {
+  let jobRun
+  const jobsMock = { start(spec) { jobRun = spec.run(); return 'job-detach-2' } }
+  const detachDef = ecsExecDefinition(makeCtx({ jobs: jobsMock }))
+  const value = await detachDef.execute(
+    {
+      instance_id: INSTANCE_ID,
+      script: 'for i in $(seq 1 10); do echo long-$i; sleep 1; done; echo LONG-DONE',
+      detach: true,
+      poll_interval: 1,
+    },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(value.kind, 'detached')
+  // 远端任务约 10s, 但实例锁只在每次轮询期间短暂持有 → 前台调用应很快返回
+  const t0 = Date.now()
+  const fg = await ecsExecDefinition(ctx).execute({ instance_id: INSTANCE_ID, command: 'echo fg-during-detach' }, makeExec('ecs_exec'))
+  const elapsed = Date.now() - t0
+  assert.ok(fg.output.includes('fg-during-detach'), '前台调用应正常返回: ' + fg.output)
+  assert.ok(elapsed < 6000, '前台调用不应等待 detach 任务结束(实际 ' + elapsed + 'ms)')
+  const done = await jobRun.done
+  assert.equal(done.status, 'completed', 'detach 任务最终应完成: ' + JSON.stringify(done))
+  const out = jobRun.readOutput()
+  assert.ok(out.includes('LONG-DONE'), '增量输出应含结束标记')
+  assert.ok(!out.includes('fg-during-detach'), 'detach 输出不应混入同实例前台调用内容')
+})
+
+await run('ecs_exec: detach 与批量/后台互斥校验', async () => {
+  const def = ecsExecDefinition(makeCtx({ jobs: { start() { return 'job-x' } } }))
+  await assert.rejects(
+    def.execute({ instance_ids: [INSTANCE_ID, 'i-bp1dummysmoketest0000'], command: 'echo a', detach: true }, makeExec('ecs_exec')),
+    /detach/,
+  )
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID, command: 'echo a', detach: true, run_in_background: true }, makeExec('ecs_exec')),
+    /二选一/,
+  )
+})
+
+// ---- S3: 伪会话(cwd/环境变量继承 + 隔离) ----
+await run('ecs_exec session_id: cwd 与环境变量跨调用继承', async () => {
+  const def = ecsExecDefinition(ctx)
+  const key = 'e2e-sess-' + Date.now()
+  const first = await def.execute(
+    { instance_id: INSTANCE_ID, command: 'cd /tmp && pwd', session_id: key, session_reset: true },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(first.session_id, key)
+  assert.equal(first.session_cwd, '/tmp', '第一条应把 cwd 记为 /tmp, 实际: ' + first.session_cwd)
+  assert.ok(first.output.includes('/tmp'), '输出应含 pwd 结果')
+  assert.ok(!first.output.includes('__DSH_ECS_CWD__'), 'cwd 标记不应出现在模型可见输出中')
+  assertLossless('ecs_exec session value', first)
+  assertLossless('ecs_exec session presentationMeta', def.output.presentationMeta({}, first))
+
+  const second = await def.execute(
+    { instance_id: INSTANCE_ID, command: 'pwd; echo "FOO=$FOO"', session_id: key, env: ['FOO=bar'] },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(second.session_cwd, '/tmp', '第二条应继承 /tmp, 实际: ' + second.session_cwd)
+  assert.ok(second.output.includes('/tmp'), '第二条 pwd 应为 /tmp, 实际: ' + second.output)
+  assert.ok(second.output.includes('FOO=bar'), '会话内环境变量应生效, 实际: ' + second.output)
+
+  const third = await def.execute(
+    { instance_id: INSTANCE_ID, command: 'cd /var && pwd', session_id: key },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(third.session_cwd, '/var', '第三条应把 cwd 更新为 /var')
+
+  // 标记行剥离 + 退出码仍透传
+  const failing = await def.execute({ instance_id: INSTANCE_ID, command: 'exit 4', session_id: key }, makeExec('ecs_exec'))
+  assert.equal(failing.exit_code, 4, '会话模式下退出码应透传')
+  assert.ok(!failing.output.includes('__DSH_ECS_CWD__'), '标记不应残留')
+})
+
+await run('ecs_exec session_id: 不同会话互不干扰 + 与批量/detach 互斥', async () => {
+  const def = ecsExecDefinition(ctx)
+  const keyA = 'e2e-sessA-' + Date.now()
+  const keyB = 'e2e-sessB-' + Date.now()
+  await def.execute({ instance_id: INSTANCE_ID, command: 'cd /tmp', session_id: keyA, session_reset: true }, makeExec('ecs_exec'))
+  const b = await def.execute({ instance_id: INSTANCE_ID, command: 'pwd', session_id: keyB, session_reset: true }, makeExec('ecs_exec'))
+  assert.notEqual(b.session_cwd, '/tmp', '不同会话不应共享 cwd, 实际: ' + b.session_cwd)
+  const a = await def.execute({ instance_id: INSTANCE_ID, command: 'pwd', session_id: keyA }, makeExec('ecs_exec'))
+  assert.equal(a.session_cwd, '/tmp', 'A 会话应仍是 /tmp')
+  await assert.rejects(
+    def.execute({ instance_ids: [INSTANCE_ID, 'i-bp1dummysmoketest0000'], command: 'pwd', session_id: keyA }, makeExec('ecs_exec')),
+    /session_id/,
+  )
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID, command: 'pwd', session_id: keyA, detach: true }, makeExec('ecs_exec')),
+    /session_id/,
+  )
 })
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-'))

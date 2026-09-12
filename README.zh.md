@@ -1,16 +1,18 @@
 # dsh-workbench-ecs
 
-> v0.4.0 · MIT License
+> v0.5.0 · MIT License
 
 [English](./README.md) | 中文
 
 > 阿里云 Workbench CLI 包装插件 —— 让 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Agent 直接控制远程 ECS 实例。
 
-它在本机驱动官方阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances), 内置 **7 个 Agent 原生工具** —— `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 覆盖「列表 → 体检 → 执行 → 上传 → 重启 → 验证」完整闭环; 并附带**可视化设置面板**(CLI 状态、实例管理、受控发布向导、会话、操作时间线)。实例经 Workbench 后端通道连接, **无需公网 IP**; 破坏性命令走 Harness 审批守卫, 未获明确放行一律拒绝(fail closed)。
+它在本机驱动官方阿里云 [Workbench CLI](https://help.aliyun.com/zh/ecs/user-guide/use-workbench-cli-to-manage-ecs-instances), 内置 **8 个 Agent 原生工具** —— `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 覆盖「列表 → 体检 → 执行 → 长任务 → 上传 → 重启 → 验证」完整闭环; 并附带**可视化设置面板**(CLI 状态、实例管理、受控发布向导、会话、操作时间线)。实例经 Workbench 后端通道连接, **无需公网 IP**; 破坏性命令走 Harness 审批守卫, 未获明确放行一律拒绝(fail closed)。
 
 ## 特性
 
-- **7 个 Agent 原生工具**: `ecs_list` / `ecs_exec` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 与 Harness 工具体系无缝集成
+- **8 个 Agent 原生工具**: `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_session`, 与 Harness 工具体系无缝集成
+- **detach 长任务 + 日志游标**(v0.5.0+): `ecs_exec { detach: true }` 在远端 `nohup` 启动并写日志文件, 立即返回 `job_id`/`log_path`/`exit_path`; 插件按间隔轮询增量, **不长期占用实例**(期间同实例其它调用可正常插空执行), 远端日志文件是唯一事实源, 模型读得慢也不会丢段或重复。配套 `ecs_log` 用**字节游标**从头续读任意远端文件(发布日志轮询不再需要反复整段 tail)
+- **伪会话**(v0.5.0+): `ecs_exec { session_id: "deploy" }` 在同一会话内保留工作目录与环境变量(`cd`/`export` 跨调用继承), 不同 session_id 互不影响; 状态由插件持有, 空闲 30 分钟自动重置并显式提示
 - **可视化设置面板**(v0.3.0+): CLI 状态(20s Host 缓存 + 本地秒显)、实例浏览(搜索/批量/30s 自动刷新)、一键诊断(磁盘·内存仪表盘)、受控发布向导+模板、会话管理、操作时间线; 自动适配深/浅色主题
 - **真实 API 调用**: 工具执行本机 `workbench` 命令, 经阿里云 Workbench 后端连接实例(支持无公网 IP 的实例)
 - **JSON 解析 + 可读渲染**: 解析 CLI 的 JSON 输出, 渲染为表格/文本/终端卡片; CLI 层错误(`{code, message}`)转成可读报错
@@ -20,7 +22,7 @@
 - **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(串行, 单台失败不中断), 适合集群排查
-- **同实例串行化**: 同一实例上的操作按 FIFO 逐个执行, 并发调用不会经由共享的 Workbench 会话互相串流; 不同实例仍可并行。长时间后台任务会一直占用该实例的名额直到结束
+- **同实例串行化**: 同一实例上的操作按 FIFO 逐个执行, 并发调用不会经由共享的 Workbench 会话互相串流; 不同实例仍可并行。detach 任务只在每次轮询期间短暂持锁, 不再长期占用实例名额(v0.5.0+)
 - **大输出 spill**: stdout 超限自动落盘并返回完整输出路径, 日志排查不再截断丢头
 - **输出清洗**: 默认剔除 ANSI 转义、控制字符与 CLI 进度帧(spinner/百分比条), 日志与上传结果直接可读(`strip_ansi: false` 可关闭)
 - **可靠退出码**: 以 CLI JSON 中的远端 `exit_code` 为准(而非本地进程退出码), 并带回 `request_id`/`session_id` 便于事后核对隔离性
@@ -40,7 +42,7 @@
 dsh plugin --profile web add dsh-workbench-ecs
 ```
 
-就这一条 —— bundle 层会把插件行写入 web profile: 7 个工具对 Agent 立即可用, Harness 设置(齿轮图标)里出现 **「Workbench ECS」** 标签页。不支持热重载的部署请重启 `dsh web`。
+就这一条 —— bundle 层会把插件行写入 web profile: 8 个工具对 Agent 立即可用, Harness 设置(齿轮图标)里出现 **「Workbench ECS」** 标签页。不支持热重载的部署请重启 `dsh web`。
 
 > 本地从仓库开发时改用链接方式:
 > `dsh plugin --profile web add link:<仓库绝对路径>` —— 之后修改 `lib/client.js` 刷新页面即生效(无需重启服务)。
@@ -49,7 +51,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.4.0"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.0"}
 ```
 
 然后让 Agent 调用:
@@ -292,8 +294,14 @@ CLI 对应: `workbench exec --instance-id <id> --command <cmd> [--timeout <s>] -
 | `timeout` | integer | | 远端命令超时(秒), 默认 60(显式下发; CLI 自身默认仅 30) |
 | `region` | string | | 地域, 可缺省(CLI 从实例 ID 自动推断) |
 | `run_in_background` | boolean | | 后台执行长命令: 立即返回 `job_id`, `job_output` 增量读取(不适用于批量) |
+| `detach` | boolean | | **远端 detach 长任务**(发布/构建等分钟~小时级操作推荐): 远端 `nohup` + 日志文件, 立即返回 `job_id`/`log_path`/`exit_path`; 轮询增量且不长期占锁 |
+| `poll_interval` | integer | | detach 轮询间隔(秒), 默认 2 |
+| `max_duration` | integer | | detach 最长跟踪时长(秒), 默认 3600; 超时停止跟踪(远端任务继续跑) |
+| `session_id` | string | | **伪会话**: 同一 id 下保留 cwd/环境变量; 仅单实例前台(不能与批量/detach/后台同用) |
+| `session_reset` | boolean | | 先清空该会话的 cwd/环境变量再执行 |
+| `env` | array\<string\> | | 会话内持久环境变量, 每项 `K=V`, 与已有会话变量合并 |
 
-返回 `{ kind: single|batch|background, ... }`(含 `exit_code` / `request_id` / `session_id`)。
+返回 `{ kind: single|batch|background|detached, ... }`(含 `exit_code` / `request_id` / `cli_session_id`, 会话模式下还有 `session_cwd` / `env_keys`)。
 
 **什么时候用 `script`**: 命令里出现任何嵌套引号就一律用它。典型对比 ——
 
@@ -304,6 +312,22 @@ ecs_exec { instance_id: "i-xxx", command: "docker exec app node -e \"console.log
 # 零转义(推荐)
 ecs_exec { instance_id: "i-xxx", script: "docker exec app node -e \"console.log('hi')\"" }
 ```
+
+### `ecs_log` —— 远端文件按字节游标续读(只读)
+
+CLI 对应: `workbench exec`(仅 `wc -c` / `tail -c` / `head -c` / `cat`, 全程只读)
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `instance_id` | string | ✅ | 目标实例 ID |
+| `path` | string | ✅ | 远端文件路径, 如 `/tmp/.dsh-ecs-xxx/out.log` |
+| `after` | integer | | 起始字节偏移(上次返回的 `next_offset`; 首次为 0) |
+| `max_bytes` | integer | | 单次最多读取字节数, 默认 262144; `truncated=true` 时应立即续读 |
+| `exit_file` | string | | 可选: 远端退出码文件, 存在时返回 `exit_code` |
+| `region` / `timeout` | | | 地域 / 超时(秒, 默认 60) |
+
+**用法**: 发布/构建日志轮询的标准动作是 `ecs_log { path: "<log>", after: <上次 next_offset> }`,
+不再需要"整段 tail 再肉眼找增量";配合 `detach` 的 `log_path` 可从头完整翻阅任意长度的日志。
 
 ### `ecs_upload` —— 上传本地文件到实例
 

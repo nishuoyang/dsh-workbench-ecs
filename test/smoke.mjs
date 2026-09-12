@@ -17,6 +17,7 @@ import { name, inject, apply } from '../lib/index.js'
 const EXPECTED = {
   ecs_list: ['region'],
   ecs_exec: [],
+  ecs_log: ['instance_id', 'path'],
   ecs_upload: ['local_file', 'remote_path', 'instance_id'],
   ecs_download: ['remote_path', 'instance_id'],
   ecs_diagnose: ['instance_id'],
