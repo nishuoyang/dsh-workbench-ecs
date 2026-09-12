@@ -13,7 +13,9 @@
 import assert from 'node:assert'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join } from 'node:path'
 import { apply } from '../lib/index.js'
 
 // 版本漂移防护: /health 的 version 必须与发布包 package.json 一致
@@ -21,6 +23,35 @@ const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url),
 
 const CLI = 'C:\\Program Files\\workbench\\workbench.exe'
 const REGION = 'cn-shanghai'
+
+// ---- 临时工作区(v0.6.2: 面板侧 runbook 从 <workspaceRoot>/.dsh/... 读取) ----
+const workspace = mkdtempSync(join(tmpdir(), 'dsh-wbecs-ui-'))
+const runbookDir = join(workspace, '.dsh', 'workbench-ecs', 'runbooks')
+mkdirSync(runbookDir, { recursive: true })
+writeFileSync(join(runbookDir, 'ui-smoke.json'), JSON.stringify({
+  name: 'ui-smoke',
+  description: 'ui-rpc 面板侧 runbook 验证(纯数据)',
+  params: { tag: 'ui' },
+  steps: [
+    { kind: 'exec', command: 'echo rb-${tag}', description: '回显 ${tag}' },
+    { kind: 'assert', command: 'echo rb-assert-${tag}', expect: { exit_code: 0, stdout_contains: ['rb-assert-ui'] } },
+  ],
+}, null, 2))
+writeFileSync(join(runbookDir, 'ui-broken.json'), '{ not json }')
+
+// 最小 fs 服务替身(真实文件系统): 只实现 runbook 机制用到的 resolve/readText/listDir
+const fsStub = {
+  async resolve(p) {
+    const abs = isAbsolute(String(p)) ? String(p) : join(workspace, String(p))
+    return { targetKey: abs.replace(/\\/g, '/') }
+  },
+  async readText(target) {
+    return readFileSync(target.targetKey, 'utf8')
+  },
+  async listDir(target) {
+    return readdirSync(target.targetKey, { withFileTypes: true }).map((e) => ({ name: e.name }))
+  },
+}
 
 // ---- 最小 subprocess stub: 真正在本机执行 workbench ----
 const subprocessStub = {
@@ -59,7 +90,8 @@ const ctx = {
   webServer: { register(route) { routes.push(route); return () => { /* noop */ } } },
   get(name) {
     if (name === 'subprocess') return subprocessStub
-    if (name === 'sandboxPolicy') return { workspaceRoot: process.cwd() }
+    if (name === 'sandboxPolicy') return { workspaceRoot: workspace }
+    if (name === 'fs') return fsStub
     return undefined
   },
   effect(fn) { return fn() },
@@ -146,6 +178,34 @@ ok('deploy 两阶段成功', dep1 != null && dep1.ok === true && dep1.stages != 
 // 9. session-list 形状
 const sess = await rpc('session-list')
 ok('session-list 返回数组', Array.isArray(sess), sess)
+
+// 9b. runbook-list(v0.6.2): 列出工作区跑书, 坏文件标为无效
+const rbList = await rpc('runbook-list')
+ok('runbook-list 列出工作区 runbook', rbList != null && rbList.ok === true && Array.isArray(rbList.runbooks), rbList)
+ok('runbook-list 回报目录', typeof rbList.dir === 'string' && rbList.dir.endsWith('runbooks'), rbList.dir)
+const rbSmoke = rbList.runbooks.find((r) => r.name === 'ui-smoke')
+ok('runbook-list 给出步数/类型/参数占位', rbSmoke != null && rbSmoke.valid === true &&
+  rbSmoke.step_count === 2 && rbSmoke.declared_params.indexOf('tag') >= 0, rbSmoke)
+const rbBroken = rbList.runbooks.find((r) => r.name === 'ui-broken')
+ok('runbook-list 坏文件标为无效且不抛错', rbBroken != null && rbBroken.valid === false && /JSON/.test(String(rbBroken.error)), rbBroken)
+
+// 9c. runbook-plan: 只回显计划, 不触碰实例(此处连实例都不需要能给出计划)
+const rbPlan = await rpc('runbook-plan', { instance_id: sample != null ? sample.instance_id : 'i-test', runbook: 'ui-smoke', params: { tag: 'plan' } })
+ok('runbook-plan 预演给出计划', rbPlan != null && rbPlan.ok === true && rbPlan.dry_run === true && rbPlan.total_stage === 2, rbPlan)
+ok('runbook-plan 参数已替换进命令行', rbPlan.plan[0].command_line.includes('echo rb-plan'), rbPlan.plan[0])
+ok('runbook-plan 缺参数时显式报告', (await rpc('runbook-plan', { instance_id: 'i-test', runbook: 'no-such-rb' })).ok === false)
+
+// 9d. runbook-run(真机): 走与 ecs_deploy 相同的编排引擎
+if (sample !== undefined) {
+  const rbRun = await rpc('runbook-run', { instance_id: sample.instance_id, runbook: 'ui-smoke', params: { tag: 'ui' }, region: REGION })
+  ok('runbook-run 真机执行成功', rbRun != null && rbRun.ok === true && rbRun.stages.length === 2 &&
+    rbRun.stages.every((s) => s.ok === true), rbRun)
+  ok('runbook-run 断言逐条回报', rbRun.stages[1].assertions != null &&
+    rbRun.stages[1].assertions.every((a) => a.ok === true), rbRun.stages[1])
+  ok('runbook-run 带回 runbook 来源', rbRun.runbook.name === 'ui-smoke' && rbRun.runbook.source === 'workspace', rbRun.runbook)
+} else {
+  console.log('  · 无运行中实例, 跳过真机 runbook-run')
+}
 
 // 10. 未知操作
 const unknown = await rpc('no-such-op', undefined, false)

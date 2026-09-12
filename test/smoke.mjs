@@ -123,23 +123,32 @@ assert.deepEqual(
 // ---- 动态 body 完整性守卫:D10 回归 ----
 // v0.6.1 曾出现: 新增 lib/runbooks.js 但 to-body.mjs 的模块清单是硬编码的,
 // body 里引用到未拼入的符号(ReferenceError: RUNBOOK_DIR is not defined)。
-// 这里按"谁 import 了谁"反查: 每个被 import 的本地模块都必须真的出现在 body 里。
-const libConsumers = [readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')]
-for (const f of readdirSync(new URL('../lib/tools/', import.meta.url))) {
-  if (f.endsWith('.js')) libConsumers.push(readFileSync(new URL('../lib/tools/' + f, import.meta.url), 'utf8'))
+// 这里按"谁 import 了谁"**递归**反查: 每个被 import 的本地模块都必须真的出现
+// 在 body 里(v0.6.2 起 to-body.mjs 同样递归发现, 两层守卫互为对照)。
+const libDirUrl = new URL('../lib/', import.meta.url)
+const libConsumers = [readFileSync(new URL('index.js', libDirUrl), 'utf8')]
+for (const f of readdirSync(new URL('tools/', libDirUrl))) {
+  if (f.endsWith('.js')) libConsumers.push(readFileSync(new URL('tools/' + f, libDirUrl), 'utf8'))
 }
 const localModules = new Set()
-for (const text of libConsumers) {
-  const re = /from\s+['"]\.\.?\/([A-Za-z0-9._-]+)\.js['"]/g
-  let match = re.exec(text)
+const pending = libConsumers.slice()
+const importRe = /from\s+['"]\.\.?\/([A-Za-z0-9._-]+)\.js['"]/g
+while (pending.length > 0) {
+  const text = pending.shift()
+  importRe.lastIndex = 0
+  let match = importRe.exec(text)
   while (match !== null) {
-    localModules.add(match[1] + '.js')
-    match = re.exec(text)
+    const file = match[1] + '.js'
+    if (!localModules.has(file)) {
+      localModules.add(file)
+      pending.push(readFileSync(new URL(file, libDirUrl), 'utf8'))
+    }
+    match = importRe.exec(text)
   }
 }
-assert.ok(localModules.size >= 2, '应至少发现 common.js 与其余共享模块, 实际: ' + [...localModules].join(','))
+assert.ok(localModules.size >= 3, '应至少发现 common.js / runbooks.js / steps-engine.js, 实际: ' + [...localModules].join(','))
 for (const file of localModules) {
-  const src = readFileSync(new URL('../lib/' + file, import.meta.url), 'utf8')
+  const src = readFileSync(new URL(file, libDirUrl), 'utf8')
   const marker = /export (?:async )?(?:function|const) ([A-Za-z0-9_$]+)/.exec(src)
   assert.ok(marker !== null, 'lib/' + file + ' 应有可识别的导出符号')
   assert.ok(bodyText.includes(marker[1]), 'lib/' + file + ' 未拼进动态 body(缺符号 ' + marker[1] + ')')

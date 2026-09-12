@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.1 · MIT License
+> v0.6.2 · MIT License
 
 [English](./README.md) | 中文
 
@@ -21,7 +21,7 @@
 - **只读护栏**(v0.4.0+): `ecs_exec` / `ecs_diagnose` 的 `read_only` 在命令进入 shell 之前拒绝写操作(重定向、`rm`/`mv`/`cp`/`chmod`、`docker` 变更、`systemctl` 变更、`nohup` 等); `ecs_diagnose` **默认开启**, 且预置诊断脚本零误杀
 - **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止; 批量时每台实例各起一个 job 并返回 `job_ids`(v0.5.1+)
-- **Runbook / 跑书**(v0.6.1+): 把编排存成**纯数据**放在工作区 `.dsh/workbench-ecs/runbooks/*.json`,`ecs_deploy { runbook: "release", runbook_params: { sha } }` 一次调用跑完;插件只做机制(读取/校验/`${参数}` 替换/展开),**内容与脚本本体留在项目仓库** —— 发布契约可评审、可版本化, 插件里没有项目逻辑
+- **Runbook / 跑书**(v0.6.1+ 机制, v0.6.2+ 面板): 把编排存成**纯数据**放在工作区 `.dsh/workbench-ecs/runbooks/*.json`,`ecs_deploy { runbook: "release", runbook_params: { sha } }` 一次调用跑完;插件只做机制(读取/校验/`${参数}` 替换/展开),**内容与脚本本体留在项目仓库** —— 发布契约可评审、可版本化, 插件里没有项目逻辑。设置面板里也能**列出 / 预演 / 执行**同一份跑书(与 Agent 共用同一引擎, 预演的命令行逐字一致)
 - **多步编排**(v0.6.0+): `ecs_deploy { steps: [...] }` 把「上传 → 执行 → 断言 → 读日志」写成一次调用, `assert` 用 `expect` 逐条判定并在失败时**精确标出是哪一条断言、期望什么、实际什么**; `dry_run` 可先预演命令而不执行。一次发布从十余次调用收敛为一次
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(单台失败不中断), 适合集群排查; `concurrency` 控制并发(默认只读 4 / 写 1 串行), 同实例仍由实例锁串行 —— 集群排查不再逐台排队(v0.5.1+)
 - **目录递归上传**(v0.5.1+): `ecs_upload { local_dir: "dist" }` 一次调用完成「本机 `tar` 归档 → 上传 → sha256 校验 → 远端解包」, 省掉手工打包; 校验失败**中止解包**, 坏包不会改写远端目录
@@ -55,7 +55,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.1"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.2"}
 ```
 
 然后让 Agent 调用:
@@ -245,7 +245,8 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 | ECS 实例 | 地域/状态筛选 + 名称/ID 搜索 + 状态分布条 + 复选框(批量执行) + **30s 自动刷新** |
 | 实例行操作 | [执行] 选中目标 / [诊断] 一键体检(磁盘·内存仪表盘) / [发布] 受控发布向导 / [详情] 属性 + 最近日志 |
 | 远程命令 | 命令历史(datalist)、破坏性命令两次点击确认(Host 端仍二次拦截); 批量执行逐台结果表 |
-| 受控发布 | 上传本地文件(OSS 中继 ≤1GB) + 重启/生效命令 + 健康检查, 三阶段进度; 可保存/复用模板 |
+| 受控发布 | 上传本地文件(OSS 中继 ≤1GB) + 重启/生效命令 + 健康检查, 三阶段进度; 可保存/复用模板; **模式可切换为「Runbook」**(直接跑工作区跑书, 带预演)(v0.6.2+) |
+| Runbook(发布跑书) | 扫描 `<工作区>/.dsh/workbench-ecs/runbooks/*.json`, 列出名称/说明/步数/类型/参数占位(坏文件标为无效而不影响其它条目); 填目标实例与参数 JSON 后可 **预演**(零副作用)或 **执行**; 结果按步骤渲染(含 `skipped` 标记与断言逐条 ✔/✘)(v0.6.2+) |
 | Workbench 会话 | 会话列表 / 关闭单会话 / 关闭全部(排障与资源回收) |
 | 操作时间线 | 本次会话面板内所有操作留痕 |
 
@@ -257,7 +258,7 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 
 | 半 | 文件 | 职责 |
 |---|---|---|
-| Host 半(Node) | `lib/index.js` | 通过 `tools` 注册 7 个模型工具; 通过 `webServer` 注册同源路由 `/dsh-workbench-ecs/health` 与 `/dsh-workbench-ecs/rpc`; 设置页 RPC 经 `subprocess` 执行本机 CLI(共享 `lib/common.js` / `lib/settings-api.js`) |
+| Host 半(Node) | `lib/index.js` | 通过 `tools` 注册 8 个模型工具; 通过 `webServer` 注册同源路由 `/dsh-workbench-ecs/health` 与 `/dsh-workbench-ecs/rpc`; 设置页 RPC 经 `subprocess` 执行本机 CLI(共享 `lib/common.js` / `lib/settings-api.js` / `lib/steps-engine.js`; runbook 机制在 `lib/runbooks.js`) |
 | 浏览器半 | `lib/client.js` | 单文件 client bundle(`window.__ModuleLoader__` 工厂形式): 注册「Workbench ECS」设置页标签, 经同源 RPC 路由与 Host 通信 |
 | 组合层 | `cordis.patch.yml` | `dsh.bundle` patch: 把插件行插入 profile 组合 —— `dsh web` 启动即生效, 由 `dsh plugin --profile web add` 自动装载 |
 
@@ -467,6 +468,12 @@ runbook 文件形状:
 ```
 
 **边界(有意为之)**:插件只提供**机制** —— 读取 / 校验 / 参数替换 / 展开成 `steps`;**内容**(步骤与断言、脚本本体)留在项目仓库,插件不硬编码任何项目逻辑。占位符 `${name}` 在任意字符串里替换;整串恰好是一个占位符时**保留原始类型**(`"timeout": "${t}"` + `t=300` → 数字 300);缺少参数会直接报错并列出该 runbook 声明的占位符;多余的入参会在结果里以 `unused_params` 提示。runbook 名字只允许 `[A-Za-z0-9._-]`(挡住路径穿越)。需要 `fs` 服务;未挂载时请改用内联 `runbook` 对象。
+
+**(D) 面板里跑同一份 runbook(v0.6.2+)** —— 设置页的「Runbook（发布跑书）」卡片会扫描工作区 runbook 目录,列出名称/说明/步数/类型/参数占位,逐条提供 **预演**(只回显命令行,零副作用)与 **执行**;发布向导也可直接切换为「Runbook」模式。
+
+- 面板与 Agent **共用同一个编排引擎**(`lib/steps-engine.js`),因此预演出来的命令行与 Agent 真正下发的逐字一致 —— 不会出现"面板能跑、工具跑不通"的漂移;
+- **守卫口径差异(有意)**:面板没有审批上下文,命中破坏性命令模式**直接拒绝**并把错误定位到具体步骤(要审批放行请走 Agent 的 `ecs_deploy`);`read_only` 步骤按只读护栏预检;
+- 面板侧 RPC 操作:`runbook-list` / `runbook-plan` / `runbook-run`(同源路由 `/dsh-workbench-ecs/rpc`)。
 
 ### `ecs_session` —— 会话管理
 

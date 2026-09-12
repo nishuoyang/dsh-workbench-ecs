@@ -5,7 +5,7 @@
 //       本脚本把 lib/ 下的共享模块(自动发现) + lib/tools/*.js + lib/index.js
 //       按依赖顺序拼接, 去除 import/export 外壳, 生成与发布源码同源的单一 body。
 // 用法: node scripts/to-body.mjs [输出路径] [--tools=a,b] [--pretty]
-// 注意: 共享模块**从 index.js 与 tools/*.js 的 import 自动发现** —— 新增一个
+// 注意: 共享模块**从 index.js 与 tools/*.js 的 import 递归自动发现** —— 新增
 //       lib/xxx.js 无需改本脚本(此前是硬编码清单, 漏加会让动态挂载 body 里
 //       引用到未拼入的符号, 表现为 ReferenceError)。
 // ============================================================================
@@ -18,19 +18,28 @@ const toolsDir = readdirSync(new URL('tools/', libUrl)).filter((f) => f.endsWith
 const toolSrcTexts = toolsDir.map((f) => readFileSync(new URL('tools/' + f, libUrl), 'utf8'))
 const indexSrc = readFileSync(new URL('index.js', libUrl), 'utf8')
 
-// 从消费者(index.js 与 tools/*.js)的本地 import 里发现共享模块
-function discoverSharedModules(consumers) {
+// 从消费者(index.js 与 tools/*.js)的本地 import 里**递归**发现共享模块。
+// 递归很关键: lib/settings-api.js 这类"只被共享模块引用"的文件, 若只扫一层
+// 就会被漏掉, 表现为动态挂载 body 里的 ReferenceError(D10 的同类问题)。
+function discoverSharedModules(seeds) {
   const found = new Set()
+  const queue = seeds.slice()
   const re = /from\s+['"]\.\.?\/([A-Za-z0-9._-]+)\.js['"]/g
-  for (const text of consumers) {
+  while (queue.length > 0) {
+    const text = queue.shift()
     re.lastIndex = 0
     let match = re.exec(text)
     while (match !== null) {
-      found.add(match[1] + '.js')
+      const file = match[1] + '.js'
+      if (!found.has(file)) {
+        found.add(file)
+        queue.push(readFileSync(new URL(file, libUrl), 'utf8'))
+      }
       match = re.exec(text)
     }
   }
-  // 依赖顺序: common.js 必须最先(其余共享模块都依赖它), 之后按字母序稳定排列
+  // 依赖顺序: common.js 必须最先(其余共享模块都依赖它), 之后按字母序稳定排列。
+  // 注意: 共享模块之间只在**函数体**内互相引用, 因此字母序不会造成 TDZ 问题。
   return Array.from(found).sort((a, b) => {
     if (a === 'common.js') return -1
     if (b === 'common.js') return 1

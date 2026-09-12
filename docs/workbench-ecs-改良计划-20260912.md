@@ -1,4 +1,4 @@
-# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.0)
+# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.2)
 
 > 输入: `E:\AiProject\nailong\docs\workbench-ecs-反馈与改进建议-20260912.md`(奶龙生产运维 ~30 次真实调用)
 > 核对基线: 插件源码 v0.3.7(commit `324d979`)+ 本机 Workbench CLI **v1.0.1**(commit `86c0aff`)
@@ -269,12 +269,6 @@ nohup bash -c 'bash /tmp/.dsh-ecs/<id>/run.sh; echo $? > /tmp/.dsh-ecs/<id>/exit
 
 反馈把 S4 定为"长期、单独排期"。核对后建议**拆两步**,先把 80% 收益用 20% 成本拿到:
 
-**S4a [v0.6.0] `ecs_deploy` 泛化为 `steps` 编排(中工作量)**
-
-```
-ecs_deploy {
-  instance_id, dry_run?,
-  steps: [
 **S4a [v0.6.0 / ✅ 已交付] `ecs_deploy` 泛化为 `steps` 编排**
 
 ```
@@ -323,7 +317,29 @@ ecs_deploy {
 现改为**从 index.js 与 tools/*.js 的 import 自动发现**共享模块,并在 `test/smoke.mjs` 加守卫:
 凡被本地 import 的模块,其导出符号必须真的出现在 body 里。
 
-**工作量**:S4a 2 天;S4b 3~5 天 + 每项目适配。
+**S4b' [v0.6.2 / ✅ 已交付] 面板化:把跑书接进设置页**
+
+机制在 v0.6.1 已经有了,但只有 Agent 能用,而"发布"恰恰是最该有可视界面的动作。v0.6.2 补上:
+
+- **引擎抽取(先决条件)**:把 steps 的纯逻辑(结构校验/计划/断言求值/执行循环)从
+  `lib/tools/ecs-deploy.js` 抽到 **`lib/steps-engine.js`**,一切与本机进程、审批、实例锁相关的
+  部分改为由调用方注入 `adapter`(`run(argv)` / `localSha256` / `remoteSha256` / `sleep` / `hasTimer`)。
+  于是**模型工具**与**设置页 RPC**跑的是同一份代码 —— 这是"面板预演的命令行与 Agent 真正下发的
+  逐字一致"的结构性保证,而不是靠两处人肉同步。unit 里专门加了跨通道断言:
+  `runbookPlan` 与 `ecs_deploy dry_run` 的计划逐字相等。
+- **设置页新增 3 个 RPC 操作**:`runbook-list`(扫工作区,坏文件标无效而不影响其它条目)、
+  `runbook-plan`(预演,零副作用)、`runbook-run`(真执行)。
+- **面板新增「Runbook（发布跑书）」卡片**:列出名称/说明/步数/类型/参数占位,支持填目标实例与
+  参数 JSON(也接受 JSON 文本),逐条「预演」/「执行」,执行结果按步骤渲染(含 `skipped` 标记与
+  断言逐条 ✔/✘)。**发布向导**里也加了模式切换:手动三阶段 ↔ 选择工作区跑书(带预演按钮)。
+- **面板侧守卫口径**:面板没有审批上下文,因此破坏性命令**直接拒绝**(错误信息定位到具体步骤
+  `[i]`),`read_only` 步骤按只读护栏预检;这与面板既有的 `exec` 操作口径一致。
+- **顺带把 D10 的守卫加固**:`to-body.mjs` 的模块发现改为**递归**(此前只扫一层,
+  而 `lib/settings-api.js` 这类"只被共享模块引用"的文件会被漏掉)。
+- **踩坑记录**:引擎抽取时把 `remoteJoin` 从 `ecs-deploy.js` 的 import 里删掉了,而老三阶段路径仍在用 ——
+  e2e 的"上传 + 默认 sha256 校验"用例立刻红。说明**重构必须全量回归**(unit 只覆盖 steps 路径,抓不到)。
+
+**工作量**:S4a 2 天;S4b 3~5 天 + 每项目适配;S4b' 1 天。
 
 ---
 
@@ -347,6 +363,7 @@ ecs_deploy {
 | **v0.5.1** ✅ **已完成** | 批量与会话补完 | S7 并行批量 + 后台批量 + JSON 模式 / S5b 目录递归上传 / `ecs_list` 补 5 个过滤器 + 分页提示;顺带修掉 **D8** | 已达成:unit 30/30、e2e 33/33(含目录上传远端 `find` 核对、坏包中止解包、批量并发与 `job_ids`) |
 | **v0.6.0** ✅ **S4a 已完成** | 编排 | S4a `ecs_deploy { steps }` 编排(upload/exec/assert/tail + dry_run + continue_on_error)/ 老三阶段保持兼容 | 已达成:unit 38/38、e2e 38/38(含 dry_run 不落地、断言失败中止且远端验证后续步骤未执行、`continue_on_error`、tail `wait_seconds` 等到退出码文件) |
 | **v0.6.1** ✅ **S4b 机制已交付** | 跑书机制 | Runbook: `runbook` + `runbook_params`(工作区 `.dsh/workbench-ecs/runbooks/*.json` 或内联)、`${参数}` 替换(整串保留类型)、隐式 `instance_id`/`region`、名字白名单、缺参数/缺文件的可操作报错;顺带修掉 **D10**(to-body 模块清单硬编码) | 已达成:unit 45/45、e2e 41/41;内容侧按约定留在项目仓库 |
+| **v0.6.2** ✅ **S4b' 面板化已交付** | 跑书进面板 | 抽出 `lib/steps-engine.js`(工具与面板共用同一引擎);设置页新增 `runbook-list` / `runbook-plan` / `runbook-run`;面板新增 Runbook 卡片(列出/预演/执行)+ 发布向导 runbook 模式;`to-body` 模块发现改递归 | 已达成:unit 52/52(含跨通道"计划逐字一致")、ui-rpc 22/22(含真机 `runbook-run`)、e2e 45/45(含面板路径真机执行与"预演不改动远端") |
 | **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,
@@ -391,9 +408,18 @@ ecs_deploy {
       默认参数生效 + dry_run 预演不改动远端、名字不存在时报错并列出可用 runbook、路径穿越被拒;
 19. **D10**(v0.6.1 新增缺陷)✅ *已覆盖*:`scripts/to-body.mjs` 的共享模块清单硬编码,新增 `lib/runbooks.js` 后
     动态挂载 body 报 `RUNBOOK_DIR is not defined`(npm 包通道却正常)。已改为从 import 自动发现,
-    并在 smoke 中加"被本地 import 的模块必须出现在 body 里"的守卫(防同类回归)。
+    并在 smoke 中加"被本地 import 的模块必须出现在 body 里"的守卫(防同类回归);v0.6.2 进一步改为**递归**发现。
+20. **S4b'** ✅ *已覆盖(v0.6.2)*:
+    - unit 7 项:面板 `runbook-list`(形状/参数占位/坏文件标无效)、`runbook-plan`(计划与缺参数)、
+      **跨通道计划逐字一致**(面板预演 vs 工具 `dry_run`)、`runbook-run`(真执行 + 断言逐条)、
+      参数接受 JSON 文本且非法时明确报错、破坏性命令直接拒绝(含步骤定位)、`read_only` 预检、缺 `instance_id`/形状非法;
+    - ui-rpc 10 项(真实 CLI):`runbook-list`(含坏文件)、`runbook-plan`(参数替换进命令行)、
+      **真机 `runbook-run`**(2 步全绿 + 断言 + `runbook.source=workspace`);
+    - e2e 4 项(真实实例 + 真实工作区):工作区扫描(坏文件不炸)、**预演前后远端文件内容完全一致**(零副作用)、
+      面板侧真机执行(参数替换 + 断言 + lossless JSON)、被拒的破坏性 runbook **远端核对无痕迹**。
 
-> 当前实际测试资产:`test/unit.mjs` **45 项**(不触达实例)、`test/e2e-local.mjs` **41 项**(真实实例);
+> 当前实际测试资产:`test/unit.mjs` **52 项**(不触达实例)、`test/e2e-local.mjs` **45 项**(真实实例)、
+> `test/ui-rpc.mjs` **22 项**(真实 CLI + 内存 fake ctx,含真机 runbook);
 > `npm test` = unit + 冒烟(含动态 body 一致性与完整性守卫)。
 
 ---
@@ -420,7 +446,7 @@ ecs_deploy {
 | F1 嵌套引号必炸 | 真缺口,根因修正为"远端两层"(D4) | S1 | ✅ **v0.4.0 已交付** |
 | F2 长命令软上限 + 日志不可续读 | 真缺口;机制解释见 D3,另发现 D1 | S2 + D1 | D1 ✅ v0.4.0 / S2 ✅ v0.5.0 |
 | F3 每次独立 shell | 真缺口,但 CLI 无可靠会话创建 | S3(伪会话) | ✅ v0.5.0 |
-| F4 多步流水线零编排 | 真缺口,建议拆 S4a/S4b | S4 | S4a ✅ **v0.6.0 已交付** / S4b 待排期 |
+| F4 多步流水线零编排 | 真缺口,建议拆 S4a/S4b | S4 | S4a ✅ **v0.6.0** / S4b ✅ **v0.6.1 机制** + **v0.6.2 面板化** |
 | F5 传输无校验/无目录语义 | 部分真缺口;直连不可做 | S5a / S5b / S5c | S5a ✅ v0.4.0 / S5b ✅ v0.5.1 / S5c 上游 |
 | F6 无只读护栏 | 真缺口 | S6 | ✅ **v0.4.0 已交付** |
 | F7 小项(批量串行/无 description/timeout 偏短) | 真缺口 + D1 | S7 + S8' | S8' ✅ v0.4.0 / S7 ✅ v0.5.1(分页受 CLI 限制) |

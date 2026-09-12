@@ -22,6 +22,9 @@ import { ecsDownloadDefinition } from '../lib/tools/ecs-download.js'
 import { ecsDiagnoseDefinition } from '../lib/tools/ecs-diagnose.js'
 import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
 import { ecsSessionDefinition } from '../lib/tools/ecs-session.js'
+import { createSettingsCore } from '../lib/settings-api.js'
+import { runWorkbench, localSha256, remoteSha256, delay, hasLocalTimer } from '../lib/common.js'
+import { RUNBOOK_DIR } from '../lib/runbooks.js'
 
 const INSTANCE_ID = process.argv[2] ?? 'i-uf66ct2o35p7fjcd0sru'
 const REGION = 'cn-shanghai'
@@ -993,6 +996,108 @@ await run('ecs_deploy runbook: 名字不存在时报错并列出可用 runbook',
     /名字非法/,
     '路径穿越必须被拒绝',
   )
+})
+
+// ---- v0.6.2: 设置页面板路径(createSettingsCore + 真实 CLI) ----
+// 面板侧与 Agent 侧共用 steps 引擎, 这里用真实实例验证"面板也能跑通",
+// 并确认预演(dry_run)确实不触碰实例。
+const panelCore = createSettingsCore(
+  async (argv) => {
+    const r = await runWorkbench(runbookCtx, argv, undefined)
+    return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, stdoutTruncated: r.stdoutTruncated, stdoutSpillPath: r.stdoutSpillPath }
+  },
+  {
+    runbookDir: join(e2eRbRoot, RUNBOOK_DIR),
+    listRunbooks: async () => readdirSync(e2eRbDir).filter((f) => f.endsWith('.json')).map((f) => f.replace(/\.json$/, '')).sort(),
+    loadRunbook: async (name) => ({
+      text: readFileSync(join(e2eRbDir, name + '.json'), 'utf8'),
+      path: join(e2eRbDir, name + '.json'),
+    }),
+    makeStepsAdapter: (args) => ({
+      run: async (argv) => {
+        const r = await runWorkbench(runbookCtx, argv, undefined)
+        return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, stdoutTruncated: r.stdoutTruncated, stdoutSpillPath: r.stdoutSpillPath }
+      },
+      localSha256: async (file) => await localSha256(runbookCtx, file, undefined),
+      remoteSha256: async (remotePath, opts = {}) => await remoteSha256(runbookCtx, args.instance_id, remotePath,
+        { region: args.region, timeout: opts.timeout, locked: true }),
+      sleep: (ms) => delay(runbookCtx, ms),
+      hasTimer: hasLocalTimer(runbookCtx),
+    }),
+  },
+)
+
+const panelLog = '/tmp/dsh-e2e-panel-runbook.log'
+writeFileSync(join(e2eRbDir, 'panel-smoke.json'), JSON.stringify({
+  name: 'panel-smoke',
+  description: '设置页面板路径验证',
+  params: { tag: 'panel-default', log: panelLog },
+  steps: [
+    { kind: 'exec', description: '写入 ${tag}', script: "printf 'panel-%s\\n' '${tag}' > ${log}\necho panel-wrote-${tag}" },
+    { kind: 'assert', command: 'cat ${log}', expect: { exit_code: 0, stdout_contains: ['panel-'] } },
+  ],
+}, null, 2))
+writeFileSync(join(e2eRbDir, 'panel-danger.json'), JSON.stringify({
+  name: 'panel-danger',
+  steps: [{ kind: 'exec', command: 'rm -rf /tmp/dsh-e2e-never' }],
+}, null, 2))
+
+await run('设置页 runbook-list: 真实工作区扫描(含坏文件不炸)', async () => {
+  writeFileSync(join(e2eRbDir, 'panel-broken.json'), '{ broken json }')
+  const res = await panelCore.runbookList()
+  assert.equal(res.ok, true)
+  assert.ok(res.dir.replace(/\\/g, '/').endsWith(RUNBOOK_DIR), '应回报 runbook 目录: ' + res.dir)
+  const names = res.runbooks.map((r) => r.name)
+  assert.ok(names.includes('e2e-smoke') && names.includes('panel-smoke'), '应列出工作区 runbook: ' + names.join(','))
+  assert.equal(res.runbooks.find((r) => r.name === 'panel-broken').valid, false, '坏文件应标为无效')
+  const smoke = res.runbooks.find((r) => r.name === 'panel-smoke')
+  assert.equal(smoke.valid, true)
+  assert.deepEqual(smoke.declared_params, ['log', 'tag'])
+  assertLossless('runbook-list result', res)
+})
+
+await run('设置页 runbook-plan: 预演不触碰实例', async () => {
+  const before = await ecsExecDefinition(runbookCtx).execute(
+    { instance_id: INSTANCE_ID, command: 'cat ' + panelLog + ' 2>/dev/null || echo ABSENT' },
+    makeExec('ecs_exec'),
+  )
+  const plan = await panelCore.runbookPlan({ instance_id: INSTANCE_ID, runbook: 'panel-smoke', region: REGION })
+  assert.equal(plan.ok, true, JSON.stringify(plan))
+  assert.equal(plan.dry_run, true)
+  assert.equal(plan.total_stage, 2)
+  assert.ok(plan.plan[0].command_line.includes('<script'), '脚本步骤在计划里不应内联正文: ' + plan.plan[0].command_line)
+  const after = await ecsExecDefinition(runbookCtx).execute(
+    { instance_id: INSTANCE_ID, command: 'cat ' + panelLog + ' 2>/dev/null || echo ABSENT' },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(after.output, before.output, '预演不得改动远端文件内容')
+  assertLossless('runbook-plan value', plan)
+})
+
+await run('设置页 runbook-run: 面板侧真实执行(与工具同一引擎)', async () => {
+  const res = await panelCore.runbookRun({
+    instance_id: INSTANCE_ID, runbook: 'panel-smoke', params: { tag: 'panel-live' }, region: REGION,
+  })
+  assert.equal(res.ok, true, '面板侧执行应成功: ' + JSON.stringify(res.stages.map((s) => [s.name, s.ok, s.error])))
+  assert.equal(res.mode, 'steps')
+  assert.equal(res.total_stage, 2)
+  assert.equal(res.stages[0].name, '写入 panel-live', '参数应已替换')
+  assert.ok(String(res.stages[0].output).includes('panel-wrote-panel-live'), res.stages[0].output)
+  assert.ok(res.stages[1].assertions.every((a) => a.ok === true), JSON.stringify(res.stages[1].assertions))
+  assert.equal(res.runbook.name, 'panel-smoke')
+  assert.equal(res.runbook.source, 'workspace')
+  assertLossless('runbook-run value', res)
+})
+
+await run('设置页 runbook-run: 破坏性命令被直接拒绝(面板无审批上下文)', async () => {
+  const res = await panelCore.runbookRun({ instance_id: INSTANCE_ID, runbook: 'panel-danger', region: REGION })
+  assert.equal(res.ok, false)
+  assert.match(String(res.error), /已拦截破坏性命令/)
+  const probe = await ecsExecDefinition(runbookCtx).execute(
+    { instance_id: INSTANCE_ID, command: 'test -e /tmp/dsh-e2e-never && echo EXISTS || echo ABSENT' },
+    makeExec('ecs_exec'),
+  )
+  assert.ok(probe.output.includes('ABSENT'), '被拒的 runbook 不得在远端留下任何痕迹')
 })
 
 console.log('')

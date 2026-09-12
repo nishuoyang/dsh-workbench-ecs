@@ -25,6 +25,7 @@ import { buildSessionScript, extractSessionCwd, ecsExecDefinition } from '../lib
 import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
 import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
+import { createSettingsCore } from '../lib/settings-api.js'
 import {
   isValidRunbookName, substituteParams, collectParamNames, parseRunbook, buildRunbookRun,
   loadRunbook, listRunbookNames, RUNBOOK_DIR,
@@ -1026,6 +1027,175 @@ await runAsync('ecs_deploy runbook: 缺参数 / 与 steps 同用 / 内联形式'
   assert.equal(plan.runbook.name, 'inline-demo')
   assert.ok(plan.plan[0].command_line.includes('echo on i-x'), '隐式 instance_id 应可用: ' + plan.plan[0].command_line)
   assert.equal(stub.calls.length, 0, 'dry_run 不得下发命令')
+})
+
+// ---- v0.6.2: 设置页 RPC 的 runbook 操作(面板侧列出/预演/执行) ----
+// 用与 lib/index.js 同形的装配: runCli 走 CLI 输出, makeStepsAdapter 复用它,
+// 因此这里验证的就是面板真实路径(而不只是引擎本身)。
+function panelRunCli(handler) {
+  return async (argv) => {
+    const argvList = argv.map((a) => String(a))
+    const reply = handler(argvList)
+    const text = typeof reply === 'string' ? reply : JSON.stringify(reply)
+    return { exitCode: 0, stdout: text, stderr: '' }
+  }
+}
+
+function settingsCoreWith(files, handler, opts = {}) {
+  const runCli = panelRunCli(handler)
+  return createSettingsCore(runCli, {
+    runbookDir: '/ws/' + RUNBOOK_DIR,
+    listRunbooks: async () => Object.keys(files),
+    loadRunbook: async (name) => {
+      if (!Object.prototype.hasOwnProperty.call(files, name)) throw new Error('FS_NOT_FOUND: ' + name)
+      return { text: files[name], path: '/ws/' + RUNBOOK_DIR + '/' + name + '.json' }
+    },
+    makeStepsAdapter: opts.noAdapter === true ? undefined : () => ({
+      run: (argv) => runCli(argv),
+      localSha256: async () => undefined,
+      remoteSha256: async () => undefined,
+      sleep: async () => {},
+      hasTimer: false,
+    }),
+  })
+}
+
+// 面板用的小 CLI 替身: exec 回显命令行(便于断言"下发的是什么"), 其余命令回 JSON
+function panelCliEcho() {
+  return panelRunCli((argv) => {
+    const ci = argv.indexOf('--command')
+    const command = ci >= 0 ? argv[ci + 1] : ''
+    return { instance_id: 'i-x', exit_code: 0, output: 'ran: ' + command, stderr: '', request_id: 'r-1', session_id: 's-1' }
+  })
+}
+
+const RB_FILES = {
+  release: JSON.stringify({
+    name: 'release',
+    description: '演示发布跑书',
+    params: { sha: 'latest' },
+    steps: [
+      { kind: 'exec', command: 'echo deploy ${sha}', description: '部署 ${sha}' },
+      { kind: 'assert', command: 'curl -fsS http://127.0.0.1/health', expect: { stdout_contains: ['ran:'] } },
+    ],
+  }),
+  broken: '{ this is not json }',
+}
+
+await runAsync('设置页 runbook-list: 列出名称/形状, 坏文件标为无效而不影响其它条目', async () => {
+  const core = settingsCoreWith(RB_FILES, () => '{}')
+  const res = await core.runbookList()
+  assert.equal(res.ok, true)
+  assert.ok(String(res.dir).endsWith(RUNBOOK_DIR), '应回报 runbook 目录: ' + res.dir)
+  const release = res.runbooks.find((r) => r.name === 'release')
+  assert.equal(release.valid, true)
+  assert.equal(release.step_count, 2)
+  assert.deepEqual(release.kinds.map((k) => k.kind + '×' + k.count), ['assert×1', 'exec×1'])
+  assert.deepEqual(release.declared_params, ['sha'])
+  assert.equal(release.description, '演示发布跑书')
+  const broken = res.runbooks.find((r) => r.name === 'broken')
+  assert.equal(broken.valid, false)
+  assert.match(String(broken.error), /JSON 解析失败/)
+})
+
+await runAsync('设置页 runbook-plan: 预演给出计划; 缺参数显式报告而不是静默执行', async () => {
+  const core = settingsCoreWith(RB_FILES, () => '{}')
+  const plan = await core.runbookPlan({ instance_id: 'i-x', runbook: 'release' })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.dry_run, true)
+  assert.equal(plan.total_stage, 2)
+  assert.equal(plan.runbook.name, 'release')
+  assert.equal(plan.runbook.source, 'workspace')
+  assert.ok(plan.plan[0].command_line.includes('echo deploy latest'), '应使用默认参数: ' + plan.plan[0].command_line)
+  assert.equal(plan.valid, true)
+
+  const missing = await core.runbookPlan({ instance_id: 'i-x', runbook: 'no-default', params: {} })
+  assert.equal(missing.ok, false, '未知 runbook 应返回 ok:false 而不是抛错')
+  assert.match(String(missing.error), /FS_NOT_FOUND|可用的 runbook|读取 runbook 失败/)
+
+  const noDefault = settingsCoreWith({
+    x: JSON.stringify({ steps: [{ command: 'echo ${sha}' }] }),
+  }, () => '{}')
+  const miss = await noDefault.runbookPlan({ instance_id: 'i-x', runbook: 'x' })
+  assert.equal(miss.ok, false)
+  assert.deepEqual(miss.missing, ['sha'])
+  assert.ok(String(miss.error).includes('缺少参数: sha'))
+})
+
+await runAsync('设置页 runbook-plan 与 ecs_deploy 工具的计划逐字一致(两条通道不漂移)', async () => {
+  const steps = [
+    { kind: 'exec', command: 'echo deploy latest', description: '部署 latest' },
+    { kind: 'assert', command: 'curl -fsS http://127.0.0.1/health', expect: { stdout_contains: ['ran:'] } },
+  ]
+  const toolPlan = await ecsDeployDefinition({ get: () => undefined }).execute(
+    { instance_id: 'i-x', region: 'cn-shanghai', dry_run: true, timeout: 90, steps },
+    stubExec(),
+  )
+  const core = settingsCoreWith(RB_FILES, () => '{}')
+  const panelPlan = await core.runbookPlan({ instance_id: 'i-x', region: 'cn-shanghai', timeout: 90, runbook: 'release' })
+  assert.equal(panelPlan.ok, true)
+  assert.deepEqual(
+    panelPlan.plan.map((p) => p.kind + ' ' + p.command_line),
+    toolPlan.plan.map((p) => p.kind + ' ' + p.command_line),
+    '面板预演与工具预演必须逐字一致',
+  )
+})
+
+await runAsync('设置页 runbook-run: 真实执行(引擎+适配器), 断言逐条回报', async () => {
+  const core = settingsCoreWith(RB_FILES, (argv) => {
+    const ci = argv.indexOf('--command')
+    return {
+      instance_id: 'i-x', exit_code: 0,
+      output: ci >= 0 ? 'ran: ' + argv[ci + 1] : '', stderr: '', request_id: 'r-1', session_id: 's-1',
+    }
+  })
+  const res = await core.runbookRun({ instance_id: 'i-x', runbook: 'release', params: { sha: 'deadbeef' } })
+  assert.equal(res.ok, true, JSON.stringify(res))
+  assert.equal(res.mode, 'steps')
+  assert.equal(res.total_stage, 2)
+  assert.equal(res.stages.length, 2)
+  assert.equal(res.stages[0].name, '部署 deadbeef', '参数应已替换')
+  assert.ok(String(res.stages[0].output).includes('echo deploy deadbeef'))
+  assert.ok(res.stages[1].assertions.every((a) => a.ok === true), JSON.stringify(res.stages[1].assertions))
+  assert.equal(res.runbook.name, 'release')
+  assert.equal(res.runbook.param_keys.join(','), 'sha')
+})
+
+await runAsync('设置页 runbook-run: 参数可直接传 JSON 文本(面板输入框), 非法 JSON 明确报错', async () => {
+  const core = settingsCoreWith(RB_FILES, () => '{}', { noAdapter: true })
+  const bad = await core.runbookRun({ instance_id: 'i-x', runbook: 'release', params: '{oops' })
+  assert.equal(bad.ok, false)
+  assert.match(String(bad.error), /不是合法 JSON/)
+  const later = await core.runbookRun({ instance_id: 'i-x', runbook: 'release', params: '[1,2]' })
+  assert.match(String(later.error), /必须是 JSON 对象/)
+  const okText = await core.runbookRun({ instance_id: 'i-x', runbook: 'release', params: '{"sha":"abc"}' })
+  assert.equal(okText.ok, false, '无执行适配器时应拒绝执行')
+  assert.match(String(okText.error), /未提供本机执行适配器/)
+})
+
+await runAsync('设置页 runbook-run: 破坏性命令直接拒绝(面板无审批上下文)', async () => {
+  const files = {
+    danger: JSON.stringify({ steps: [{ kind: 'exec', command: 'echo prepare' }, { kind: 'exec', command: 'rm -rf /var/lib/x' }] }),
+    readonly: JSON.stringify({ steps: [{ kind: 'exec', command: 'rm -rf /tmp/x', read_only: true }] }),
+  }
+  const core = settingsCoreWith(files, () => ({}))
+  const danger = await core.runbookRun({ instance_id: 'i-x', runbook: 'danger' })
+  assert.equal(danger.ok, false)
+  assert.match(String(danger.error), /已拦截破坏性命令/)
+  assert.ok(String(danger.error).includes('步骤 [1]'), '错误信息应定位到具体步骤: ' + danger.error)
+  const ro = await core.runbookRun({ instance_id: 'i-x', runbook: 'readonly' })
+  assert.equal(ro.ok, false)
+  assert.match(String(ro.error), /写操作模式/)
+})
+
+await runAsync('设置页 runbook-run: 缺少 instance_id / 未知 runbook 都返回 ok:false', async () => {
+  const core = settingsCoreWith(RB_FILES, () => '{}')
+  const noInstance = await core.runbookRun({ runbook: 'release' })
+  assert.equal(noInstance.ok, false)
+  assert.match(String(noInstance.error), /需要 instance_id/)
+  const badShape = await core.runbookRun({ instance_id: 'i-x', runbook: ['nope'] })
+  assert.equal(badShape.ok, false)
+  assert.match(String(badShape.error), /runbook 必须是名字字符串/)
 })
 
 console.log('')
