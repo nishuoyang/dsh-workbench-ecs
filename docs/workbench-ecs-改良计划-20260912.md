@@ -494,4 +494,31 @@ runbook 是**纯数据**, 因此"哪里写错了"完全可以在下发任何命�
 
 ---
 
+## 九、发版记录(2026-09-12)
+
+v0.4.0 → v0.6.3 一次性补齐 tag 与 npm 发布(此前只提交、未打 tag):
+
+| 版本 | commit | npm |
+|---|---|---|
+| v0.4.0 | `c720364` | ✅ 0.4.0 |
+| v0.5.0 | `892b940` | ✅ 0.5.0 |
+| v0.5.1 | `7343b91` | ✅ 0.5.1 |
+| v0.6.0 | `aeddeeb` | ✅ 0.6.0 |
+| v0.6.1 | `b61cd66` | ✅ 0.6.1 |
+| v0.6.2 | `b149817` | ✅ 0.6.2 |
+| v0.6.3 | `ae73864` | ✅ 0.6.3(`latest`) |
+
+每个 tag 都有一次成功的 CI 运行(Test ✅ / Publish ✅ 或"已发布, 跳过")。三个坑记在这里备查:
+
+1. **CI 发布依赖 `NPM_TOKEN` secret**:仓库未配置该 secret 时,tag 流水线的 Publish 步骤会以
+   `ENEEDAUTH` 失败(Test 步骤是通过的)。已在 `.github/workflows/ci.yml` 加入守卫:
+   未配置 token 时打 warning 并跳过发布,tag 仍有效、流水线不再变红。
+   本轮因该 secret 缺失,改用本机 `npm publish` 完成发布(发布内容与本仓库 `files` 白名单一致)。
+2. **单次推送超过 3 个 tag 时 GitHub 完全不触发 workflow**(既不报错也不排队)——
+   批量补 tag 必须分批(每次 ≤3),否则 tag 有了、CI 却静默没有运行。
+3. **回填历史版本用 `npm publish --tag backfill`**:直接 publish 会把 `latest` 指回旧版本;
+   回填完成后清理该临时 tag(`npm dist-tag rm`;若 token 无 dist-tag 权限, 需在 npm 网页端操作)。
+
+---
+
 *本文件位于插件仓库 `docs/`,随代码演进维护;反馈原文仍保留在 `E:\AiProject\nailong\docs\`。*
