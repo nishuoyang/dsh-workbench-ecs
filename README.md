@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.0 · MIT License
+> v0.6.1 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -21,6 +21,7 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Read-only guard** (v0.4.0+): `read_only` on `ecs_exec` / `ecs_diagnose` rejects write operations before they reach a shell (redirects, `rm`/`mv`/`cp`/`chmod`, `docker`/`systemctl` mutations, `nohup`, …); on by default for `ecs_diagnose`, with zero false positives on the built-in diagnostic script
 - **Transfer integrity** (v0.4.0+): `ecs_upload.verify_sha256` compares local/remote digests after upload; `ecs_deploy` enables it by default and **aborts before restart** on a mismatch. Local hashing uses `sha256sum`/`shasum`/`certutil`, so no extra runtime is required
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
+- **Runbooks** (v0.6.1+): keep an orchestration as **pure data** in `<workspace>/.dsh/workbench-ecs/runbooks/*.json` and run it with `ecs_deploy { runbook: "release", runbook_params: { sha } }` in one call; the plugin only supplies the mechanism (load / validate / `${param}` substitution / expansion) while **the content and script bodies stay in the project repository** — reviewable, versioned, and free of plugin-side project logic
 - **Multi-step orchestration** (v0.6.0+): `ecs_deploy { steps: [...] }` expresses "upload → run → assert → read log" as one call; `assert` evaluates `expect` checks and reports **exactly which assertion failed, what was expected, and what actually happened**; `dry_run` previews the commands without executing. A release drops from a dozen calls to one
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (per-instance failures do not stop others); `concurrency` controls parallelism (default 4 when `read_only`, otherwise serial) while the same instance still serializes behind its lock — cluster triage no longer queues one host at a time (v0.5.1+)
 - **Recursive directory upload** (v0.5.1+): `ecs_upload { local_dir: "dist" }` does "local `tar` → upload → sha256 verify → remote extract" in one call; a checksum mismatch **aborts the extract**, so a corrupt archive never rewrites the remote directory
@@ -55,7 +56,7 @@ That's it — the bundle layer inserts the plugin row into the web profile: the 
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.0"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.1"}
 ```
 
 Then ask the Agent:
@@ -439,6 +440,28 @@ Run-level parameters: `dry_run` (print the plan without executing — and **with
 ```
 
 Returns `mode` (`legacy` / `steps`), `ok`, `done_stage`/`total_stage`, `stopped_at`/`stopped_reason`/`failed_steps`, and per-step `stages` (assert steps carry per-check `assertions`; tail steps carry `next_offset`/`total_bytes`/`eof`). **Failures point at the exact step and the exact assertion** instead of requiring someone to read the log.
+
+**(C) Runbooks (v0.6.1+)** — store an orchestration as **pure data**; the plugin supplies only the mechanism:
+
+| Parameter | Description |
+|---|---|
+| `runbook` | `"name"` → reads `<workspace>/.dsh/workbench-ecs/runbooks/<name>.json`; or an inline object `{ name?, description?, params?, steps }` |
+| `runbook_params` | Parameter object: overrides the runbook's `params` defaults and substitutes `${name}` placeholders; `${instance_id}` / `${region}` are implicit |
+
+```jsonc
+{
+  "name": "release",
+  "params": { "sha": "latest", "log": "/tmp/release.log" },
+  "steps": [
+    { "kind": "upload", "local_file": "dist/app.jar", "remote_path": "/opt/app/app.jar", "force": true },
+    { "kind": "exec", "script": "bash /opt/app/deploy/release.sh ${sha} > ${log} 2>&1; echo $? > ${log}.exit", "timeout": 600 },
+    { "kind": "assert", "command": "curl -fsS http://127.0.0.1/health", "expect": { "stdout_contains": ["\"ok\":true"] } },
+    { "kind": "tail", "path": "${log}", "exit_file": "${log}.exit", "wait_seconds": 300 }
+  ]
+}
+```
+
+**Deliberate boundary**: the plugin supplies the *mechanism* (load / validate / substitute params / expand into `steps`); the *content* — steps, assertions, and script bodies — stays in the project repository. `${name}` is substituted inside any string, and a string that is exactly one placeholder **keeps its original type** (`"timeout": "${t}"` with `t=300` yields the number 300); a missing parameter fails loudly and lists the runbook's declared placeholders; unused inputs are reported as `unused_params`. Names are restricted to `[A-Za-z0-9._-]` (no path traversal). Requires the `fs` service; without it, use an inline `runbook` object.
 
 ### `ecs_session` — session management
 

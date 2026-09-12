@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.0 · MIT License
+> v0.6.1 · MIT License
 
 [English](./README.md) | 中文
 
@@ -21,6 +21,7 @@
 - **只读护栏**(v0.4.0+): `ecs_exec` / `ecs_diagnose` 的 `read_only` 在命令进入 shell 之前拒绝写操作(重定向、`rm`/`mv`/`cp`/`chmod`、`docker` 变更、`systemctl` 变更、`nohup` 等); `ecs_diagnose` **默认开启**, 且预置诊断脚本零误杀
 - **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止; 批量时每台实例各起一个 job 并返回 `job_ids`(v0.5.1+)
+- **Runbook / 跑书**(v0.6.1+): 把编排存成**纯数据**放在工作区 `.dsh/workbench-ecs/runbooks/*.json`,`ecs_deploy { runbook: "release", runbook_params: { sha } }` 一次调用跑完;插件只做机制(读取/校验/`${参数}` 替换/展开),**内容与脚本本体留在项目仓库** —— 发布契约可评审、可版本化, 插件里没有项目逻辑
 - **多步编排**(v0.6.0+): `ecs_deploy { steps: [...] }` 把「上传 → 执行 → 断言 → 读日志」写成一次调用, `assert` 用 `expect` 逐条判定并在失败时**精确标出是哪一条断言、期望什么、实际什么**; `dry_run` 可先预演命令而不执行。一次发布从十余次调用收敛为一次
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(单台失败不中断), 适合集群排查; `concurrency` 控制并发(默认只读 4 / 写 1 串行), 同实例仍由实例锁串行 —— 集群排查不再逐台排队(v0.5.1+)
 - **目录递归上传**(v0.5.1+): `ecs_upload { local_dir: "dist" }` 一次调用完成「本机 `tar` 归档 → 上传 → sha256 校验 → 远端解包」, 省掉手工打包; 校验失败**中止解包**, 坏包不会改写远端目录
@@ -54,7 +55,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.0"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.1"}
 ```
 
 然后让 Agent 调用:
@@ -439,6 +440,33 @@ CLI 对应: 一次远程 `exec`(分号串联的只读命令集)
 ```
 
 返回 `mode`(`legacy` / `steps`)、`ok`、`done_stage`/`total_stage`、`stopped_at`/`stopped_reason`/`failed_steps`,以及逐步的 `stages`(断言步骤带 `assertions` 逐条结果,tail 步骤带 `next_offset`/`total_bytes`/`eof`)。**失败定位到具体步骤与具体断言**,不再靠人肉翻日志。
+
+**(C) Runbook(跑书,v0.6.1+)** —— 把编排存成**纯数据**,插件只做机制:
+
+| 参数 | 说明 |
+|---|---|
+| `runbook` | `"名字"` → 读工作区 `.dsh/workbench-ecs/runbooks/<name>.json`;或直接内联对象 `{ name?, description?, params?, steps }` |
+| `runbook_params` | 参数对象:覆盖 runbook 的 `params` 默认值,替换 `${name}` 占位符;隐式可用 `${instance_id}` / `${region}` |
+
+runbook 文件形状:
+
+```jsonc
+{
+  "name": "release",
+  "description": "奶龙发布",
+  "params": { "sha": "latest", "log": "/tmp/release.log" },   // 默认值, 可被 runbook_params 覆盖
+  "steps": [
+    { "kind": "upload", "local_file": "dist/app.jar", "remote_path": "/opt/app/app.jar", "force": true },
+    { "kind": "exec", "script": "bash /opt/app/deploy/release.sh ${sha} > ${log} 2>&1; echo $? > ${log}.exit",
+      "timeout": 600, "description": "执行仓库里的发布脚本 ${sha}" },
+    { "kind": "assert", "command": "curl -fsS http://127.0.0.1/health",
+      "expect": { "stdout_contains": ["\"ok\":true"] } },
+    { "kind": "tail", "path": "${log}", "exit_file": "${log}.exit", "wait_seconds": 300 }
+  ]
+}
+```
+
+**边界(有意为之)**:插件只提供**机制** —— 读取 / 校验 / 参数替换 / 展开成 `steps`;**内容**(步骤与断言、脚本本体)留在项目仓库,插件不硬编码任何项目逻辑。占位符 `${name}` 在任意字符串里替换;整串恰好是一个占位符时**保留原始类型**(`"timeout": "${t}"` + `t=300` → 数字 300);缺少参数会直接报错并列出该 runbook 声明的占位符;多余的入参会在结果里以 `unused_params` 提示。runbook 名字只允许 `[A-Za-z0-9._-]`(挡住路径穿越)。需要 `fs` 服务;未挂载时请改用内联 `runbook` 对象。
 
 ### `ecs_session` —— 会话管理
 

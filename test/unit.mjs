@@ -25,6 +25,10 @@ import { buildSessionScript, extractSessionCwd, ecsExecDefinition } from '../lib
 import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
 import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
+import {
+  isValidRunbookName, substituteParams, collectParamNames, parseRunbook, buildRunbookRun,
+  loadRunbook, listRunbookNames, RUNBOOK_DIR,
+} from '../lib/runbooks.js'
 
 let passed = 0
 let failed = 0
@@ -828,6 +832,200 @@ await runAsync('ecs_deploy steps: 上传步骤 sha256 不一致时中止编排',
   assert.equal(value.stages[0].ok, false)
   assert.equal(value.stages[1].skipped, true)
   assert.ok(!stub.calls.some((argv) => argv.join(' ').includes('docker compose restart')), '校验失败后不得下发重启命令')
+})
+
+// ---- S4b: Runbook 机制(v0.6.1) ----
+run('runbook 名字白名单: 挡住路径穿越', () => {
+  assert.equal(isValidRunbookName('release'), true)
+  assert.equal(isValidRunbookName('nailong-release.v2'), true)
+  assert.equal(isValidRunbookName('a_b-c'), true)
+  for (const bad of ['../secret', 'a/b', 'a\\b', '.hidden', '', '-x', 'x'.repeat(65), 'a b']) {
+    assert.equal(isValidRunbookName(bad), false, '应拒绝非法名字: ' + JSON.stringify(bad))
+  }
+})
+
+run('substituteParams: 字符串/嵌套/数组/整串保留类型', () => {
+  const params = { sha: 'abc123', t: 300, flag: true }
+  assert.equal(substituteParams('img:${sha}', params), 'img:abc123')
+  assert.equal(substituteParams('${sha}-${sha}', params), 'abc123-abc123')
+  assert.equal(substituteParams('${t}', params), 300, '整串占位符应保留数字类型')
+  assert.equal(substituteParams('${flag}', params), true, '整串占位符应保留布尔类型')
+  assert.equal(substituteParams('timeout=${t}', params), 'timeout=300', '混合文本应转成字符串')
+  const nested = substituteParams({ a: ['${sha}', { b: 'x-${sha}' }] }, params)
+  assert.deepEqual(nested, { a: ['abc123', { b: 'x-abc123' }] })
+  assert.deepEqual(substituteParams(5, params), 5, '非字符串原样返回')
+  // 未知占位符: 收集进 missing, 且原文保留(不静默变空)
+  const missing = new Set()
+  assert.equal(substituteParams('v-${nope}', params, missing), 'v-${nope}')
+  assert.deepEqual(Array.from(missing), ['nope'])
+  // 非法占位符写法不参与替换(避免误伤 shell 的 ${...})
+  assert.equal(substituteParams('${1bad}', params), '${1bad}')
+  assert.deepEqual(Array.from(collectParamNames({ x: '${a}', y: ['${b}', '${a}'] })).sort(), ['a', 'b'])
+})
+
+run('parseRunbook: 形状校验', () => {
+  assert.throws(() => parseRunbook('not json', 'rb'), /JSON 解析失败/)
+  assert.throws(() => parseRunbook('[]', 'rb'), /顶层必须是对象/)
+  assert.throws(() => parseRunbook('{"steps":[]}', 'rb'), /缺少非空的 steps/)
+  assert.throws(() => parseRunbook('{"steps":{}}', 'rb'), /缺少非空的 steps/)
+  assert.throws(() => parseRunbook(JSON.stringify({ steps: Array.from({ length: 21 }, () => ({ command: 'x' })) }), 'rb'), /上限为 20 步/)
+  assert.throws(() => parseRunbook('{"steps":[{"command":"x"}],"params":[]}', 'rb'), /params 必须是对象/)
+  const rb = parseRunbook('{"name":"release","description":"d","params":{"sha":"latest"},"steps":[{"command":"echo ${sha}"}]}', 'rb')
+  assert.equal(rb.name, 'release')
+  assert.deepEqual(rb.params, { sha: 'latest' })
+  assert.equal(rb.steps.length, 1)
+})
+
+run('buildRunbookRun: 隐式 < 默认值 < 调用方; 缺参/多余参数都报告', () => {
+  const rb = parseRunbook(JSON.stringify({
+    params: { sha: 'latest', keep: 3 },
+    steps: [{ kind: 'exec', command: 'deploy ${sha} on ${instance_id}', timeout: '${keep}' }],
+  }), 'rb')
+  const run = buildRunbookRun(rb, { sha: 'deadbeef' }, { instance_id: 'i-1', region: 'cn-shanghai' })
+  assert.equal(run.steps[0].command, 'deploy deadbeef on i-1', '调用方参数应覆盖默认值, 隐式变量应可用')
+  assert.equal(run.steps[0].timeout, 3, '整串占位符应保留数字类型')
+  assert.deepEqual(run.missing, [])
+  assert.deepEqual(run.declared, ['instance_id', 'keep', 'sha'])
+
+  const noDefault = parseRunbook(JSON.stringify({ steps: [{ command: 'echo ${sha}' }] }), 'rb')
+  const missingRun = buildRunbookRun(noDefault, {}, { instance_id: 'i-1' })
+  assert.deepEqual(missingRun.missing, ['sha'], '既无默认值也未传入的参数应报缺失')
+  const withDefault = buildRunbookRun(rb, {}, { instance_id: 'i-1' })
+  assert.deepEqual(withDefault.missing, [], '有默认值的参数不应报缺失(sha 默认 latest, keep 默认 3)')
+  assert.equal(withDefault.steps[0].command, 'deploy latest on i-1', '无入参时应使用默认值')
+  const unusedRun = buildRunbookRun(rb, { sha: 'x', nope: 1 }, { instance_id: 'i-1' })
+  assert.deepEqual(unusedRun.unused, ['nope'], '未使用的入参应被指出')
+})
+
+// 最小 fs 服务替身: 只实现 runbook 机制用到的 resolve/readText/listDir
+function fakeFs(files) {
+  const targets = new Map()
+  const key = (p) => String(p).replace(/[\\/]+/g, '/').replace(/\/+$/, '')
+  const make = (p) => {
+    if (!targets.has(key(p))) targets.set(key(p), { targetKey: key(p), path: p })
+    return targets.get(key(p))
+  }
+  return {
+    async resolve(path) { return make(path) },
+    async readText(target) {
+      const p = targets.get(target.targetKey).targetKey
+      if (!Object.prototype.hasOwnProperty.call(files, p)) {
+        throw new Error('FS_NOT_FOUND: ' + p)
+      }
+      return files[p]
+    },
+    async listDir(target) {
+      const dir = targets.get(target.targetKey).targetKey
+      const prefix = dir + '/'
+      const names = Object.keys(files)
+        .filter((f) => f.startsWith(prefix) && !f.slice(prefix.length).includes('/'))
+        .map((f) => f.slice(prefix.length))
+      if (names.length === 0 && !Object.keys(files).some((f) => f.startsWith(prefix))) {
+        throw new Error('FS_NOT_FOUND: ' + dir)
+      }
+      return names.map((name) => ({ name }))
+    },
+  }
+}
+
+await runAsync('loadRunbook: 从工作区读取 / 缺文件时列出可用名字 / 无 fs 时给出替代方案', async () => {
+  const root = '/ws'
+  const rbPath = root + '/' + RUNBOOK_DIR + '/release.json'
+  const goodCtx = { get: (n) => (n === 'fs' ? fakeFs({ [rbPath]: '{"steps":[{"command":"echo hi"}]}' }) : undefined) }
+  const loaded = await loadRunbook(goodCtx, 'release', { workspaceRoot: root })
+  assert.ok(loaded.path.endsWith(RUNBOOK_DIR + '/release.json'), '路径应为工作区下的 runbook 目录: ' + loaded.path)
+  assert.equal(parseRunbook(loaded.text, 'rb').steps.length, 1)
+
+  const listingCtx = {
+    get: (n) => (n === 'fs' ? fakeFs({
+      [root + '/' + RUNBOOK_DIR + '/release.json']: '{}',
+      [root + '/' + RUNBOOK_DIR + '/rollback.json']: '{}',
+    }) : undefined),
+  }
+  assert.deepEqual(await listRunbookNames(listingCtx, { workspaceRoot: root }), ['release', 'rollback'])
+  await assert.rejects(
+    () => loadRunbook(listingCtx, 'nope', { workspaceRoot: root }),
+    /可用的 runbook: release, rollback/,
+    '读不到时应把可用名字告诉模型',
+  )
+  await assert.rejects(() => loadRunbook({ get: () => undefined }, 'release', {}), /未挂载 fs 服务/)
+  await assert.rejects(() => loadRunbook(listingCtx, '../etc/passwd', { workspaceRoot: root }), /名字非法/)
+})
+
+await runAsync('ecs_deploy runbook: 展开后执行 + 结果带回 runbook 元信息', async () => {
+  const stub = deployStub({
+    body: ({ command }) => (command.includes('${') ? JSON.stringify({
+      instance_id: 'i-x', exit_code: 1, output: 'UNSUBSTITUTED', stderr: '',
+    }) : undefined),
+  })
+  const fsStub = fakeFs({
+    ['/ws/' + RUNBOOK_DIR + '/release.json']: JSON.stringify({
+      name: 'release',
+      description: '演示 runbook',
+      params: { keep: 2 },
+      steps: [
+        { kind: 'exec', command: 'echo deploy ${sha}', description: '部署 ${sha}' },
+        { kind: 'assert', command: 'curl -fsS http://127.0.0.1/health', expect: { stdout_contains: ['ready'] } },
+      ],
+    }),
+  })
+  const def = ecsDeployDefinition({
+    get: (n) => {
+      if (n === 'subprocess') return stub.subprocess
+      if (n === 'fs') return fsStub
+      if (n === 'sandboxPolicy') return { workspaceRoot: '/ws' }
+      return undefined
+    },
+  })
+  const value = await def.execute(
+    { instance_id: 'i-x', runbook: 'release', runbook_params: { sha: 'deadbeef' } },
+    stubExec(),
+  )
+  assert.equal(value.mode, 'steps')
+  assert.equal(value.ok, true)
+  assert.equal(value.total_stage, 2)
+  assert.equal(value.stages.length, 2)
+  assert.equal(value.runbook.name, 'release')
+  assert.equal(value.runbook.source, 'workspace')
+  assert.ok(String(value.runbook.path).endsWith('/release.json'))
+  assert.deepEqual(value.runbook.param_keys, ['sha'])
+  assert.equal(value.stages[0].name, '部署 deadbeef', '步骤描述里的占位符也应被替换')
+  assert.ok(stub.calls.some((argv) => argv.join(' ').includes('echo deploy deadbeef')), '命令应已完成参数替换')
+  assert.ok(!stub.calls.some((argv) => argv.join(' ').includes('${sha}')), '不得把未替换的占位符下发到远端')
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('runbook: release'), '渲染应标注 runbook 来源')
+})
+
+await runAsync('ecs_deploy runbook: 缺参数 / 与 steps 同用 / 内联形式', async () => {
+  const def = ecsDeployDefinition({ get: () => undefined })
+  const exec = stubExec()
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', runbook: { steps: [{ command: 'echo ${sha}' }] } }, exec),
+    /缺少参数: sha/,
+  )
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', runbook: 'x', steps: [{ command: 'echo a' }] }, exec),
+    /runbook 与 steps 不能同时使用/,
+  )
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', runbook: 'x', local_file: 'a.tgz', remote_path: '/a' }, exec),
+    /不要再传 local_file/,
+  )
+  await assert.rejects(() => def.execute({ instance_id: 'i-x', runbook: ['not', 'allowed'] }, exec), /runbook 必须是名字字符串/)
+
+  // 内联 runbook + 隐式 instance_id + dry_run 预演
+  const stub = deployStub()
+  const def2 = deployDefWith(stub)
+  const plan = await def2.execute({
+    instance_id: 'i-x',
+    dry_run: true,
+    runbook: { name: 'inline-demo', steps: [{ kind: 'exec', command: 'echo on ${instance_id}' }] },
+  }, stubExec())
+  assert.equal(plan.dry_run, true)
+  assert.equal(plan.runbook.source, 'inline')
+  assert.equal(plan.runbook.name, 'inline-demo')
+  assert.ok(plan.plan[0].command_line.includes('echo on i-x'), '隐式 instance_id 应可用: ' + plan.plan[0].command_line)
+  assert.equal(stub.calls.length, 0, 'dry_run 不得下发命令')
 })
 
 console.log('')

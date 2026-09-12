@@ -8,9 +8,9 @@
 // 说明: 本测试只使用只读命令与 /tmp 临时文件, 不会改动生产数据。
 // ============================================================================
 import { spawn } from 'node:child_process'
-import { writeFileSync, readFileSync, mkdtempSync, mkdirSync } from 'node:fs'
+import { writeFileSync, readFileSync, mkdtempSync, mkdirSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, isAbsolute, normalize } from 'node:path'
 import assert from 'node:assert'
 import { isJsonValue } from '@deepseek-ai/dsh-session'
 
@@ -75,10 +75,29 @@ function makeCtx(overrides = {}) {
   return {
     get(name) {
       if (name === 'subprocess') return fakeSubprocess
-      if (name === 'sandboxPolicy') return { workspaceRoot: process.cwd() }
+      if (name === 'sandboxPolicy') {
+        return { workspaceRoot: overrides.workspaceRoot !== undefined ? overrides.workspaceRoot : process.cwd() }
+      }
       if (name === 'approval') return overrides.approval
       if (name === 'jobs') return overrides.jobs
+      if (name === 'fs') return overrides.fs
       return undefined
+    },
+  }
+}
+
+// 最小 fs 服务替身(真实文件系统): 只实现 runbook 机制用到的 resolve/readText/listDir
+function nodeFsAdapter(root) {
+  return {
+    async resolve(p) {
+      const abs = isAbsolute(String(p)) ? String(p) : join(root, String(p))
+      return { targetKey: normalize(abs) }
+    },
+    async readText(target) {
+      return readFileSync(target.targetKey, 'utf8')
+    },
+    async listDir(target) {
+      return readdirSync(target.targetKey, { withFileTypes: true }).map((e) => ({ name: e.name }))
     },
   }
 }
@@ -748,13 +767,15 @@ await run('ecs_deploy(上传 + 默认开启 sha256 校验)', async () => {
 // ---- S4a: steps 编排(v0.6.0) ----
 await run('ecs_deploy steps: dry_run 预演(不执行, 计划可读)', async () => {
   const def = ecsDeployDefinition(ctx)
+  // 用一次性路径做判据: dry_run 绝不落盘, 因此这个文件必须不存在(跨运行也成立)
+  const dryProbe = '/tmp/dsh-e2e-dryrun-' + Date.now().toString(36) + '.txt'
   const args = {
     instance_id: INSTANCE_ID,
     dry_run: true,
     steps: [
-      { kind: 'upload', local_file: localFile, remote_path: '/tmp/dsh-e2e-steps.txt', force: true },
+      { kind: 'upload', local_file: localFile, remote_path: dryProbe, force: true },
       { kind: 'exec', command: 'echo steps-dry' },
-      { kind: 'assert', command: 'cat /tmp/dsh-e2e-steps.txt', expect: { exit_code: 0, stdout_contains: ['hello-from-dsh-e2e'] } },
+      { kind: 'assert', command: 'cat ' + dryProbe, expect: { exit_code: 0, stdout_contains: ['hello-from-dsh-e2e'] } },
       { kind: 'tail', path: '/tmp/dsh-e2e-steps.log' },
     ],
   }
@@ -773,7 +794,7 @@ await run('ecs_deploy steps: dry_run 预演(不执行, 计划可读)', async () 
   // 预演没有执行任何东西: 远端文件不应存在
   const execDef = ecsExecDefinition(ctx)
   const check = await execDef.execute(
-    { instance_id: INSTANCE_ID, command: 'ls /tmp/dsh-e2e-steps.txt 2>/dev/null || echo ABSENT' },
+    { instance_id: INSTANCE_ID, command: 'ls ' + dryProbe + ' 2>/dev/null || echo ABSENT' },
     makeExec('ecs_exec'),
   )
   assert.ok(check.output.includes('ABSENT'), 'dry_run 后远端不应出现上传文件: ' + check.output)
@@ -887,6 +908,91 @@ await run('ecs_deploy steps: tail 等待退出码文件(wait_seconds)', async ()
   assert.equal(tail.eof, true, '退出码文件出现后应标记 eof')
   assert.equal(tail.exit_code, 0)
   assertLossless('ecs_deploy tail wait value', value)
+})
+
+// ---- S4b: Runbook 机制(工作区文件 → 参数替换 → 展开执行) ----
+const e2eRbRoot = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-rb-'))
+const e2eRbDir = join(e2eRbRoot, '.dsh', 'workbench-ecs', 'runbooks')
+mkdirSync(e2eRbDir, { recursive: true })
+writeFileSync(join(e2eRbDir, 'e2e-smoke.json'), JSON.stringify({
+  name: 'e2e-smoke',
+  description: 'e2e runbook 机制验证(纯数据, 无项目逻辑)',
+  params: { tag: 'default-tag', log: '/tmp/dsh-e2e-runbook.log' },
+  steps: [
+    {
+      kind: 'exec',
+      description: '写入标记 ${tag}',
+      script: "printf 'rb-line-%s\\n' '${tag}' > ${log}\necho wrote-${tag}",
+    },
+    { kind: 'assert', command: 'cat ${log}', expect: { exit_code: 0, stdout_contains: ['rb-line-'], stdout_not_contains: ['CORRUPT'] } },
+    { kind: 'tail', path: '${log}', description: '读回日志' },
+  ],
+}, null, 2))
+const runbookCtx = makeCtx({ fs: nodeFsAdapter(e2eRbRoot), workspaceRoot: e2eRbRoot })
+
+await run('ecs_deploy runbook: 工作区文件 + 参数替换 + 展开执行(S4b)', async () => {
+  const def = ecsDeployDefinition(runbookCtx)
+  const value = await def.execute(
+    {
+      instance_id: INSTANCE_ID,
+      runbook: 'e2e-smoke',
+      runbook_params: { tag: 'e2e' },
+    },
+    makeExec('ecs_deploy'),
+  )
+  assert.equal(value.mode, 'steps')
+  assert.equal(value.total_stage, 3)
+  assert.equal(value.ok, true, 'runbook 应执行成功: ' + JSON.stringify(value.stages.map((s) => [s.name, s.ok, s.error])))
+  assert.equal(value.runbook.name, 'e2e-smoke')
+  assert.equal(value.runbook.source, 'workspace')
+  assert.ok(String(value.runbook.path).endsWith('e2e-smoke.json'), '应回报 runbook 文件路径: ' + value.runbook.path)
+  assert.deepEqual(value.runbook.param_keys, ['tag'])
+  assert.equal(value.runbook.unused_params, undefined, '只用了一个参数, 不应报未使用')
+  // 参数替换: 步骤描述与命令里都应已替换
+  assert.equal(value.stages[0].name, '写入标记 e2e')
+  assert.ok(value.stages[0].output.includes('wrote-e2e'), '默认值应被调用方参数覆盖: ' + value.stages[0].output)
+  assert.ok(!value.stages[0].output.includes('${'), '不得把未替换的占位符下发到远端')
+  // 断言 + tail 步骤
+  assert.ok(value.stages[1].assertions.every((a) => a.ok === true), JSON.stringify(value.stages[1].assertions))
+  assert.ok(value.stages[2].output.includes('rb-line-e2e'), 'tail 应读到替换后参数写入的内容: ' + JSON.stringify(value.stages[2].output))
+  assertLossless('ecs_deploy runbook value', value)
+  assertLossless('ecs_deploy runbook presentationMeta', def.output.presentationMeta({}, value))
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('runbook: e2e-smoke'), '渲染应标注 runbook: ' + text.slice(0, 200))
+})
+
+await run('ecs_deploy runbook: 默认参数生效 + dry_run 预演不执行', async () => {
+  const def = ecsDeployDefinition(runbookCtx)
+  // 不传 runbook_params: 应使用 runbook 里的默认值 tag=default-tag
+  const preview = await def.execute(
+    { instance_id: INSTANCE_ID, runbook: 'e2e-smoke', dry_run: true },
+    makeExec('ecs_deploy'),
+  )
+  assert.equal(preview.dry_run, true)
+  assert.equal(preview.plan.length, 3)
+  assert.equal(preview.runbook.source, 'workspace')
+  assert.equal(preview.runbook.param_keys, undefined, '未传参数时不应有 param_keys')
+  const execDef = ecsExecDefinition(ctx)
+  const check = await execDef.execute(
+    { instance_id: INSTANCE_ID, command: 'cat /tmp/dsh-e2e-runbook.log 2>/dev/null || echo ABSENT' },
+    makeExec('ecs_exec'),
+  )
+  assert.ok(check.output.includes('rb-line-e2e'), 'dry_run 不应改动远端日志内容(应仍是上一条用例写入的): ' + check.output)
+  assertLossless('ecs_deploy runbook dry_run value', preview)
+})
+
+await run('ecs_deploy runbook: 名字不存在时报错并列出可用 runbook', async () => {
+  const def = ecsDeployDefinition(runbookCtx)
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID, runbook: 'no-such-runbook' }, makeExec('ecs_deploy')),
+    /可用的 runbook: e2e-smoke/,
+    '应把可用名字回给模型便于自我纠正',
+  )
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID, runbook: '../etc/passwd' }, makeExec('ecs_deploy')),
+    /名字非法/,
+    '路径穿越必须被拒绝',
+  )
 })
 
 console.log('')

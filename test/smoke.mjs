@@ -8,7 +8,7 @@
 // 运行: npm test  (需先 npm install)
 // ============================================================================
 import assert from 'node:assert'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { name, inject, apply } from '../lib/index.js'
 
 // 全部工具的必填参数契约
@@ -120,10 +120,36 @@ assert.deepEqual(
   'body 应注册相同的全部工具',
 )
 
+// ---- 动态 body 完整性守卫:D10 回归 ----
+// v0.6.1 曾出现: 新增 lib/runbooks.js 但 to-body.mjs 的模块清单是硬编码的,
+// body 里引用到未拼入的符号(ReferenceError: RUNBOOK_DIR is not defined)。
+// 这里按"谁 import 了谁"反查: 每个被 import 的本地模块都必须真的出现在 body 里。
+const libConsumers = [readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')]
+for (const f of readdirSync(new URL('../lib/tools/', import.meta.url))) {
+  if (f.endsWith('.js')) libConsumers.push(readFileSync(new URL('../lib/tools/' + f, import.meta.url), 'utf8'))
+}
+const localModules = new Set()
+for (const text of libConsumers) {
+  const re = /from\s+['"]\.\.?\/([A-Za-z0-9._-]+)\.js['"]/g
+  let match = re.exec(text)
+  while (match !== null) {
+    localModules.add(match[1] + '.js')
+    match = re.exec(text)
+  }
+}
+assert.ok(localModules.size >= 2, '应至少发现 common.js 与其余共享模块, 实际: ' + [...localModules].join(','))
+for (const file of localModules) {
+  const src = readFileSync(new URL('../lib/' + file, import.meta.url), 'utf8')
+  const marker = /export (?:async )?(?:function|const) ([A-Za-z0-9_$]+)/.exec(src)
+  assert.ok(marker !== null, 'lib/' + file + ' 应有可识别的导出符号')
+  assert.ok(bodyText.includes(marker[1]), 'lib/' + file + ' 未拼进动态 body(缺符号 ' + marker[1] + ')')
+}
+
 console.log('smoke OK: name =', name, '| tools =', Object.keys(EXPECTED).sort().join(', '))
 console.log('rpc OK: 设置页路由 /dsh-workbench-ecs 已注册 (' + routes[0].kind + ')')
 console.log('client OK: lib/client.js 工厂结构与 package.json dsh.client/bundle 声明一致')
 console.log('body OK: 动态挂载 body 语法合法且与 lib 注册一致 (' + bodyText.split('\n').length + ' 行)')
+console.log('body 完整性 OK: 本地共享模块均已拼入 (' + [...localModules].sort().join(', ') + ')')
 
 // ---- lib/client.js 工厂在模拟浏览器环境可运行 (load -> factory -> apply) ----
 {

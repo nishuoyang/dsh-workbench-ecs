@@ -303,17 +303,25 @@ ecs_deploy {
 - **踩坑记录**:DSH 参数 DSL 要求数组项显式声明 `additionalProperties`(true/false),写成 `{ type: 'object' }`
   会在 `defineTool` 阶段直接报 `UNSUPPORTED_SCHEMA`;已改为完整的步骤字段声明(对模型也更自解释)。
 
-**S4b [v0.6.0+ / 待排期] 命名 Runbook 模板(大工作量)**
+**S4b [v0.6.1 / ✅ 机制已交付] 命名 Runbook 模板**
 
-- 模板**内联定义**(不引入 YAML 依赖 —— 动态 body 无法 import,加依赖会破坏双通道一致性),
-  或从工作区读取 `.dsh/workbench-ecs/runbooks/*.json`(需要可选 `ctx.get('fs')`,不硬依赖);
-- 奶龙发布闭环可作为**首个内置模板 `release`**:参数 `sha`;阶段 =
+- ✅ **机制侧(插件)**: `ecs_deploy` 新增 `runbook` + `runbook_params`
+  —— `runbook: "名字"` 读工作区 `.dsh/workbench-ecs/runbooks/<name>.json`(经**可选** `ctx.get('fs')`,
+  未挂载时明确报错并指向内联写法), 或直接给内联对象; `runbook_params` 覆盖 `params` 默认值并替换 `${占位符}`
+  (整串恰好是占位符时保留原始类型; `${instance_id}`/`${region}` 隐式可用)。
+  校验/替换/展开集中在 `lib/runbooks.js`, 展开结果走 S4a 的同一套编排引擎(断言/中止/跳过语义完全一致);
+  名字白名单挡住路径穿越; 缺参数报错时列出该 runbook 声明的全部占位符, 读不到文件时列出可用 runbook 名字。
+- ✅ **内容侧(项目仓库)**: 由项目自己维护 —— 插件不含任何项目逻辑;
+  `deploy/release.sh` 之类的脚本经 `upload` 步骤上传后执行, runbook 只是"步骤 + 断言 + 参数"的数据。
+- 奶龙发布闭环可作为**首个内容示例**:参数 `sha`;步骤 =
   guard(package.json/lock 变化 FATAL、schema 变化 WARN)→ `pre-<sha>` 镜像快照 → overlay 构建 →
-  `compose up -d --force-recreate` → smoke(健康 + 边界 400 + 静态 404 + minio 200);
-- 断言语义直接平移 `deploy/release.sh`,使 15 次调用收敛为 1 次。
-- **决策点(按推荐口径确定)**:模板只声明**步骤与断言**,脚本本体留在项目仓库 ——
-  S4a 的 `steps` 已把"上传仓库里的脚本 → 执行 → 断言 → 读日志"打通,因此 Runbook 可以是一份**纯数据**
-  (步骤 + 断言 + 参数占位),不需要在插件里硬编码任何项目逻辑。
+  `compose up -d --force-recreate` → smoke(健康 + 边界 400 + 静态 404 + minio 200)。
+  **本仓库不写入该内容**(按用户 2026-09-12 口径: 只做插件侧机制)。
+
+**顺带修掉 D10**:`scripts/to-body.mjs` 的共享模块清单是**硬编码**的,新增 `lib/runbooks.js` 后
+动态挂载 body 里 `RUNBOOK_DIR is not defined`(npm 包通道却正常 —— 正是"双通道必须同时回归"的教训)。
+现改为**从 index.js 与 tools/*.js 的 import 自动发现**共享模块,并在 `test/smoke.mjs` 加守卫:
+凡被本地 import 的模块,其导出符号必须真的出现在 body 里。
 
 **工作量**:S4a 2 天;S4b 3~5 天 + 每项目适配。
 
@@ -337,7 +345,8 @@ ecs_deploy {
 | **v0.4.0** ✅ **已完成** | 投递与护栏(快赢) | S1 script 直送 / S6 read_only / S8' 小改进(含 **D1** timeout 修复)/ S5a sha256 / 补 0912+0909 回归断言;顺带修掉 **D5、D6、D7** | 已达成:e2e 20/20 通过,F1 的容器内 `node -e` 零转义直通 |
 | **v0.5.0** ✅ **已完成** | 长任务与会话 | S2 detach + `ecs_log` 游标 / S3 伪会话 / 解 **D2、D3** | 已达成:e2e 25/25(含 10s 长任务期间前台调用 < 6s 返回) |
 | **v0.5.1** ✅ **已完成** | 批量与会话补完 | S7 并行批量 + 后台批量 + JSON 模式 / S5b 目录递归上传 / `ecs_list` 补 5 个过滤器 + 分页提示;顺带修掉 **D8** | 已达成:unit 30/30、e2e 33/33(含目录上传远端 `find` 核对、坏包中止解包、批量并发与 `job_ids`) |
-| **v0.6.0** ✅ **S4a 已完成** | 编排 | S4a `ecs_deploy { steps }` 编排(upload/exec/assert/tail + dry_run + continue_on_error)/ 老三阶段保持兼容 | 已达成:unit 38/38、e2e 38/38(含 dry_run 不落地、断言失败中止且远端验证后续步骤未执行、`continue_on_error`、tail `wait_seconds` 等到退出码文件)。S4b 命名 Runbook 待排期 |
+| **v0.6.0** ✅ **S4a 已完成** | 编排 | S4a `ecs_deploy { steps }` 编排(upload/exec/assert/tail + dry_run + continue_on_error)/ 老三阶段保持兼容 | 已达成:unit 38/38、e2e 38/38(含 dry_run 不落地、断言失败中止且远端验证后续步骤未执行、`continue_on_error`、tail `wait_seconds` 等到退出码文件) |
+| **v0.6.1** ✅ **S4b 机制已交付** | 跑书机制 | Runbook: `runbook` + `runbook_params`(工作区 `.dsh/workbench-ecs/runbooks/*.json` 或内联)、`${参数}` 替换(整串保留类型)、隐式 `instance_id`/`region`、名字白名单、缺参数/缺文件的可操作报错;顺带修掉 **D10**(to-body 模块清单硬编码) | 已达成:unit 45/45、e2e 41/41;内容侧按约定留在项目仓库 |
 | **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,
@@ -373,10 +382,19 @@ ecs_deploy {
     - 回归:两条老三阶段 `ecs_deploy` 用例(重启+健康检查、上传+默认校验)仍全绿,证明向后兼容;
 17. **D9**(v0.6.0 开发中暴露)✅ *已覆盖*:steps 编排里 sha256 中止时,剩余步骤**没有**被标记 `skipped`,
     会被继续执行(原判定写成"aborted 时不算失败停止")。已把"aborted 一律停"并入中止判定,
-    并加断言 `stages[1].skipped === true` + 远端核对重启命令确实未下发。
+    并加断言 `stages[1].skipped === true` + 远端核对重启命令确实未下发;
+18. **S4b** ✅ *已覆盖(v0.6.1)*:
+    - unit 6 项:名字白名单(含 `../secret`、`a/b`、超长、空串)、占位符替换(嵌套/数组/整串保留类型/未知占位符收集/非法写法不误伤)、
+      runbook 形状校验、参数优先级(隐式 < 默认值 < 调用方)与缺参/多余参数报告、`loadRunbook` 三种失败路径(缺文件列可用名/无 fs/名字非法)、
+      runbook 展开执行(步骤描述也替换、不得把 `${sha}` 下发到远端、结果带回 runbook 元信息)、缺参数/与 steps 同用/内联形式;
+    - e2e 3 项(真实实例 + 真实文件系统):工作区 runbook 三步骤(upload 无、exec 写文件、assert、tail 读回)全绿且参数替换生效、
+      默认参数生效 + dry_run 预演不改动远端、名字不存在时报错并列出可用 runbook、路径穿越被拒;
+19. **D10**(v0.6.1 新增缺陷)✅ *已覆盖*:`scripts/to-body.mjs` 的共享模块清单硬编码,新增 `lib/runbooks.js` 后
+    动态挂载 body 报 `RUNBOOK_DIR is not defined`(npm 包通道却正常)。已改为从 import 自动发现,
+    并在 smoke 中加"被本地 import 的模块必须出现在 body 里"的守卫(防同类回归)。
 
-> 当前实际测试资产:`test/unit.mjs` **38 项**(不触达实例:护栏 47 条样例、base64/字节校验、sha256 链路、并发闸门、归档/解包、output_json 渲染、分页提示、坏包中止、steps 编排);
-> `test/e2e-local.mjs` **38 项**(真实实例,只读命令 + `/tmp` 临时文件)。`npm test` = unit + 冒烟 + 动态 body 一致性。
+> 当前实际测试资产:`test/unit.mjs` **45 项**(不触达实例)、`test/e2e-local.mjs` **41 项**(真实实例);
+> `npm test` = unit + 冒烟(含动态 body 一致性与完整性守卫)。
 
 ---
 

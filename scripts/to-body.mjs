@@ -2,21 +2,44 @@
 // scripts/to-body.mjs —— 把发布版 lib/ 多模块转换为动态挂载可用的 host body
 // ----------------------------------------------------------------------------
 // 用途: 动态挂载环境(cordis_define 的 code.host)没有 import/export,
-//       本脚本把 lib/common.js + lib/tools/*.js + lib/index.js 按依赖顺序拼接,
-//       去除 import/export 外壳, 生成与发布源码同源的单一 body。
-// 用法: node scripts/to-body.mjs [输出路径]
+//       本脚本把 lib/ 下的共享模块(自动发现) + lib/tools/*.js + lib/index.js
+//       按依赖顺序拼接, 去除 import/export 外壳, 生成与发布源码同源的单一 body。
+// 用法: node scripts/to-body.mjs [输出路径] [--tools=a,b] [--pretty]
+// 注意: 共享模块**从 index.js 与 tools/*.js 的 import 自动发现** —— 新增一个
+//       lib/xxx.js 无需改本脚本(此前是硬编码清单, 漏加会让动态挂载 body 里
+//       引用到未拼入的符号, 表现为 ReferenceError)。
 // ============================================================================
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs'
 
 const rootUrl = new URL('../', import.meta.url)
 const libUrl = new URL('lib/', rootUrl)
 
-// 模块顺序: common 先(被引用), settings-api 次(依赖 common), tools 次, index 最后
-const commonSrc = readFileSync(new URL('common.js', libUrl), 'utf8')
-const settingsApiSrc = readFileSync(new URL('settings-api.js', libUrl), 'utf8')
 const toolsDir = readdirSync(new URL('tools/', libUrl)).filter((f) => f.endsWith('.js')).sort()
-const toolsSrc = toolsDir.map((f) => readFileSync(new URL('tools/' + f, libUrl), 'utf8'))
+const toolSrcTexts = toolsDir.map((f) => readFileSync(new URL('tools/' + f, libUrl), 'utf8'))
 const indexSrc = readFileSync(new URL('index.js', libUrl), 'utf8')
+
+// 从消费者(index.js 与 tools/*.js)的本地 import 里发现共享模块
+function discoverSharedModules(consumers) {
+  const found = new Set()
+  const re = /from\s+['"]\.\.?\/([A-Za-z0-9._-]+)\.js['"]/g
+  for (const text of consumers) {
+    re.lastIndex = 0
+    let match = re.exec(text)
+    while (match !== null) {
+      found.add(match[1] + '.js')
+      match = re.exec(text)
+    }
+  }
+  // 依赖顺序: common.js 必须最先(其余共享模块都依赖它), 之后按字母序稳定排列
+  return Array.from(found).sort((a, b) => {
+    if (a === 'common.js') return -1
+    if (b === 'common.js') return 1
+    return a.localeCompare(b)
+  })
+}
+
+const sharedFiles = discoverSharedModules([indexSrc, ...toolSrcTexts])
+const sharedSrc = sharedFiles.map((f) => readFileSync(new URL(f, libUrl), 'utf8'))
 
 // 模块 -> 无 import/export 外壳的源码
 function stripModule(src) {
@@ -74,18 +97,15 @@ function processIndex(src, selected) {
 }
 
 // 紧凑化仅在非 --pretty 模式生效: pretty 用于生成可读 body 调试
+const render = (src) => (pretty ? strip(src) : compact(strip(src)))
 const body = [
   '// 由 scripts/to-body.mjs 从 lib/ 各模块自动生成 — 动态挂载用 host body',
   'const defineTool = harness.defineTool',
   '',
-  ...(pretty ? [strip(commonSrc)] : [compact(strip(commonSrc))]),
-  '',
-  ...(pretty ? [strip(settingsApiSrc)] : [compact(strip(settingsApiSrc))]),
-  '',
+  ...sharedSrc.flatMap((src) => [render(src), '']),
   // 注意: selectedTools 是文件名数组, 这里按文件名读取内容后再转换
-  ...selectedTools.map((f) => (pretty ? strip(readFileSync(new URL('tools/' + f, libUrl), 'utf8')) : compact(strip(readFileSync(new URL('tools/' + f, libUrl), 'utf8'))))),
-  '',
-  ...(pretty ? [strip(processIndex(strip(indexSrc), selectedTools))] : [compact(processIndex(strip(indexSrc), selectedTools))]),
+  ...selectedTools.flatMap((f) => [render(readFileSync(new URL('tools/' + f, libUrl), 'utf8')), '']),
+  render(processIndex(strip(indexSrc), selectedTools)),
   '',
   'return { name, inject, apply }',
   '',
@@ -94,4 +114,5 @@ const body = [
 const outPath = process.argv[2] ?? 'test/body.generated.js'
 writeFileSync(new URL(outPath, rootUrl), body)
 console.log('已生成: ' + outPath + ' (' + body.length + ' 字符, ' + body.split('\n').length + ' 行, pretty=' + pretty + ')')
-console.log('模块: lib/common.js + lib/settings-api.js + lib/tools/' + selectedTools.join(', ') + ' + lib/index.js')
+console.log('共享模块(自动发现): lib/' + sharedFiles.join(', lib/'))
+console.log('工具: lib/tools/' + selectedTools.join(', ') + ' + lib/index.js')
