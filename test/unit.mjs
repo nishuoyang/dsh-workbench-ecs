@@ -24,6 +24,7 @@ import { buildDiagnoseScript } from '../lib/tools/ecs-diagnose.js'
 import { buildSessionScript, extractSessionCwd, ecsExecDefinition } from '../lib/tools/ecs-exec.js'
 import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
+import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
 
 let passed = 0
 let failed = 0
@@ -615,6 +616,218 @@ await runAsync('ecs_list: 顶到 limit 且 CLI 未给 token 时显式提示分�
   const v2 = await def2.execute({ region: 'cn-shanghai', limit: 10 }, { signal: { aborted: false } })
   assert.equal(v2.next_token, 'tok-2', 'CLI 给出 token 时应透出')
   assert.equal(v2.pagination_note, undefined, '有 token 时不应提示')
+})
+
+// ---- S4a: ecs_deploy steps 编排(v0.6.0) ----
+function cannedHandle(body) {
+  return {
+    pid: 1,
+    collected: {
+      stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+      stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+    },
+    done: Promise.resolve({ exitCode: 0, signal: null }),
+    terminate() {},
+    async waitForExit() { return true },
+  }
+}
+
+// workbench 调用走可编排应答; tar/mkdir/rm/cmd/sha256sum 等本机程序走真实进程
+function deployStub(overrides = {}) {
+  const calls = []
+  const subprocess = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) {
+      const exe = String(spec.argv[0])
+      if (exe !== 'workbench') return localSubprocess.spawn(spec)
+      const argv = spec.argv.slice(1)
+      calls.push(argv)
+      const ci = argv.indexOf('--command')
+      const command = ci >= 0 ? String(argv[ci + 1]) : ''
+      if (typeof overrides.body === 'function') {
+        const custom = overrides.body({ argv, command })
+        if (custom !== undefined) return cannedHandle(custom)
+      }
+      const reply = (output, exitCode = 0, stderr = '') =>
+        JSON.stringify({ instance_id: 'i-x', exit_code: exitCode, output, stderr, request_id: 'r-1', session_id: 's-1' })
+      if (argv[0] === 'upload') return cannedHandle('Upload complete: x -> y')
+      if (command.includes('__DSH_ECS_META__')) {
+        return cannedHandle(reply('__DSH_ECS_META__ 24\nrelease log line\n__DSH_ECS_EXIT__ 0\n'))
+      }
+      if (command.includes('health')) return cannedHandle(reply('ready zz\n'))
+      if (command.includes('boom')) return cannedHandle(reply('', 3, 'boom\n'))
+      return cannedHandle(reply('ok\n'))
+    },
+  }
+  return { calls, subprocess }
+}
+
+function deployDefWith(stub) {
+  return ecsDeployDefinition({ get: (n) => (n === 'subprocess' ? stub.subprocess : undefined) })
+}
+const stubExec = () => ({ signal: { aborted: false } })
+
+await runAsync('ecs_deploy steps: dry_run 只回显计划, 不下发任何命令', async () => {
+  const stub = deployStub()
+  const def = deployDefWith(stub)
+  const value = await def.execute({
+    instance_id: 'i-x',
+    dry_run: true,
+    steps: [
+      { kind: 'upload', local_file: 'dist.tgz', remote_path: '/opt/app/' },
+      { kind: 'exec', command: 'docker compose up -d' },
+      { kind: 'assert', script: 'curl -fsS http://127.0.0.1/health', expect: { exit_code: 0, stdout_contains: ['ok'] } },
+      { kind: 'tail', path: '/tmp/release.log' },
+    ],
+  }, stubExec())
+  assert.equal(value.mode, 'steps')
+  assert.equal(value.dry_run, true)
+  assert.equal(value.plan.length, 4)
+  assert.deepEqual(value.plan.map((p) => p.kind), ['upload', 'exec', 'assert', 'tail'])
+  assert.equal(value.plan[0].verify_sha256, true, '上传步骤应默认校验 sha256')
+  assert.ok(value.plan[2].command_line.includes('<script'), '计划里不应内联脚本正文: ' + value.plan[2].command_line)
+  assert.ok(value.plan[1].command_line.includes('docker compose up -d'), '普通命令的计划应含命令正文')
+  assert.equal(stub.calls.length, 0, 'dry_run 不得下发任何命令')
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('未执行任何命令'))
+  assert.ok(text.includes('去掉 dry_run'))
+})
+
+await runAsync('ecs_deploy steps: 结构校验(非法 kind / 缺字段 / 上限 / 缺 command)', async () => {
+  const def = ecsDeployDefinition({ get: () => undefined })
+  const exec = stubExec()
+  await assert.rejects(() => def.execute({ instance_id: 'i-x', steps: [{ kind: 'rm', command: 'x' }] }, exec), /kind 非法/)
+  await assert.rejects(() => def.execute({ instance_id: 'i-x', steps: [{ kind: 'upload', remote_path: '/a' }] }, exec), /缺少 local_file/)
+  await assert.rejects(() => def.execute({ instance_id: 'i-x', steps: [{ kind: 'upload', local_file: 'a' }] }, exec), /缺少 remote_path/)
+  await assert.rejects(() => def.execute({ instance_id: 'i-x', steps: [{ command: 'a', script: 'b' }] }, exec), /二选一/)
+  await assert.rejects(() => def.execute({ instance_id: 'i-x', steps: [{ kind: 'exec' }] }, exec), /command 或 script/)
+  await assert.rejects(() => def.execute({ instance_id: 'i-x', steps: [{ kind: 'tail' }] }, exec), /缺少 path/)
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', steps: Array.from({ length: 21 }, () => ({ command: 'echo x' })) }, exec),
+    /上限为 20 步/,
+  )
+  await assert.rejects(() => def.execute({ instance_id: 'i-x' }, exec), /必须提供 command/, '无 steps 且无 command 应报错')
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', read_only: true, steps: [{ kind: 'exec', command: 'touch /tmp/x' }] }, exec),
+    /写操作模式/,
+    'read_only 应在预检阶段就拒绝写步骤',
+  )
+})
+
+await runAsync('ecs_deploy steps: assert 通过时逐条给出断言结果', async () => {
+  const stub = deployStub()
+  const def = deployDefWith(stub)
+  const value = await def.execute({
+    instance_id: 'i-x',
+    steps: [{
+      kind: 'assert', command: 'curl -fsS http://127.0.0.1/health',
+      expect: { exit_code: 0, stdout_contains: ['ready'], stdout_not_contains: ['ERROR'] },
+    }],
+  }, stubExec())
+  assert.equal(value.ok, true)
+  assert.equal(value.stopped_at, undefined)
+  const assertions = value.stages[0].assertions
+  assert.deepEqual(assertions.map((a) => a.check), ['exit_code', 'stdout_contains', 'stdout_not_contains'])
+  assert.ok(assertions.every((a) => a.ok === true), JSON.stringify(assertions))
+  assert.ok(def.output.render({}, value)[0].text.includes('✔ stdout_contains'), '渲染应展示每条断言')
+})
+
+await runAsync('ecs_deploy steps: 断言失败即中止, 后续步骤标记为跳过', async () => {
+  const stub = deployStub()
+  const def = deployDefWith(stub)
+  const value = await def.execute({
+    instance_id: 'i-x',
+    steps: [
+      { kind: 'exec', command: 'echo first' },
+      { kind: 'assert', command: 'curl -fsS http://127.0.0.1/health', expect: { stdout_contains: ['healthy'] } },
+      { kind: 'exec', command: 'echo never-runs' },
+    ],
+  }, stubExec())
+  assert.equal(value.ok, false)
+  assert.equal(value.done_stage, 2, '只执行到断言那一步')
+  assert.equal(value.stopped_at, 1)
+  assert.deepEqual(value.failed_steps, [1])
+  assert.match(String(value.stopped_reason), /stdout_contains\(healthy\)/)
+  assert.equal(value.stages[1].ok, false)
+  assert.equal(value.stages[2].skipped, true, '未执行的步骤应显式标记 skipped')
+  assert.ok(!stub.calls.some((argv) => argv.join(' ').includes('never-runs')), '中止后不得下发后续命令')
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('中断于步骤 [1]'), text.slice(0, 400))
+  assert.ok(text.includes('已跳过'), '渲染应标出被跳过的步骤')
+})
+
+await runAsync('ecs_deploy steps: continue_on_error 时失败不中断', async () => {
+  const stub = deployStub()
+  const def = deployDefWith(stub)
+  const value = await def.execute({
+    instance_id: 'i-x',
+    continue_on_error: true,
+    steps: [
+      { kind: 'exec', command: 'echo boom', description: '会失败的一步' },
+      { kind: 'exec', command: 'echo after-failure' },
+    ],
+  }, stubExec())
+  assert.equal(value.ok, false, '有失败步骤整体结果应为失败')
+  assert.equal(value.done_stage, 2, '两步都应执行')
+  assert.equal(value.stopped_at, undefined)
+  assert.deepEqual(value.failed_steps, [0])
+  assert.equal(value.stages[1].skipped, undefined)
+  assert.ok(stub.calls.some((argv) => argv.join(' ').includes('after-failure')), '开启后应继续执行后续步骤')
+  assert.equal(value.stages[0].exit_code, 3, '远端退出码应透传')
+  assert.ok(value.stages[0].stderr.includes('boom'), 'stderr 应带回')
+})
+
+await runAsync('ecs_deploy steps: tail 按字节游标读远端日志', async () => {
+  const stub = deployStub()
+  const def = deployDefWith(stub)
+  const value = await def.execute({
+    instance_id: 'i-x',
+    steps: [{ kind: 'tail', path: '/tmp/release.log', exit_file: '/tmp/exit' }],
+  }, stubExec())
+  const stage = value.stages[0]
+  assert.equal(stage.ok, true)
+  assert.equal(stage.output, 'release log line')
+  assert.equal(stage.total_bytes, 24)
+  assert.equal(stage.next_offset, 24)
+  assert.equal(stage.eof, true)
+  assert.equal(stage.exit_code, 0)
+  const readArgv = stub.calls[0].join(' ')
+  assert.ok(readArgv.includes('wc -c <'), 'tail 步骤应报告总字节数')
+  assert.ok(readArgv.includes('tail -c +1'), 'tail 步骤应按游标读取')
+})
+
+await runAsync('ecs_deploy steps: script 步骤零转义(正文不进 argv)', async () => {
+  const stub = deployStub()
+  const def = deployDefWith(stub)
+  const payload = 'docker exec app node -e "console.log(\'hi\', $HOME)"'
+  const value = await def.execute({
+    instance_id: 'i-x',
+    steps: [{ kind: 'exec', script: payload }],
+  }, stubExec())
+  assert.equal(value.stages[0].ok, true)
+  assert.ok(!stub.calls.some((argv) => argv.join(' ').includes('console.log')), '脚本正文不得以明文出现在 argv 中')
+  assert.ok(stub.calls.some((argv) => argv.join(' ').includes('base64 -d')), '脚本应经 base64 投递落盘')
+})
+
+await runAsync('ecs_deploy steps: 上传步骤 sha256 不一致时中止编排', async () => {
+  const stub = deployStub({
+    body: ({ command }) => (command.includes('sha256sum')
+      ? JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: 'f'.repeat(64) + '  /opt/dist.tgz\n', stderr: '' })
+      : undefined),
+  })
+  const def = deployDefWith(stub)
+  const value = await def.execute({
+    instance_id: 'i-x',
+    steps: [
+      { kind: 'upload', local_file: hashFile, remote_path: '/opt/dist.bin', force: true },
+      { kind: 'exec', command: 'docker compose restart nailong-server' },
+    ],
+  }, stubExec())
+  assert.equal(value.aborted, true, 'sha256 不一致必须中止编排')
+  assert.match(String(value.abort_reason), /sha256 不一致/)
+  assert.equal(value.stages[0].ok, false)
+  assert.equal(value.stages[1].skipped, true)
+  assert.ok(!stub.calls.some((argv) => argv.join(' ').includes('docker compose restart')), '校验失败后不得下发重启命令')
 })
 
 console.log('')

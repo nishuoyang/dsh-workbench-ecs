@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.5.1 · MIT License
+> v0.6.0 · MIT License
 
 [English](./README.md) | 中文
 
@@ -21,6 +21,7 @@
 - **只读护栏**(v0.4.0+): `ecs_exec` / `ecs_diagnose` 的 `read_only` 在命令进入 shell 之前拒绝写操作(重定向、`rm`/`mv`/`cp`/`chmod`、`docker` 变更、`systemctl` 变更、`nohup` 等); `ecs_diagnose` **默认开启**, 且预置诊断脚本零误杀
 - **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止; 批量时每台实例各起一个 job 并返回 `job_ids`(v0.5.1+)
+- **多步编排**(v0.6.0+): `ecs_deploy { steps: [...] }` 把「上传 → 执行 → 断言 → 读日志」写成一次调用, `assert` 用 `expect` 逐条判定并在失败时**精确标出是哪一条断言、期望什么、实际什么**; `dry_run` 可先预演命令而不执行。一次发布从十余次调用收敛为一次
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(单台失败不中断), 适合集群排查; `concurrency` 控制并发(默认只读 4 / 写 1 串行), 同实例仍由实例锁串行 —— 集群排查不再逐台排队(v0.5.1+)
 - **目录递归上传**(v0.5.1+): `ecs_upload { local_dir: "dist" }` 一次调用完成「本机 `tar` 归档 → 上传 → sha256 校验 → 远端解包」, 省掉手工打包; 校验失败**中止解包**, 坏包不会改写远端目录
 - **结构化输出**(v0.5.1+): `output_json: true` 直接返回稳定 JSON 文本, 便于下游自动化接线(`ecs_exec` / `ecs_list`)
@@ -53,7 +54,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.1"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.0"}
 ```
 
 然后让 Agent 调用:
@@ -393,19 +394,51 @@ CLI 对应: 一次远程 `exec`(分号串联的只读命令集)
 
 内置 7 段: 主机信息 / 负载与运行时长 / 内存 / 磁盘 / 运行服务与容器(docker ps)/ 内存 TOP 进程 / 监听端口。**生产排障的起始动作** —— 一个工具代替一串命令。
 
-### `ecs_deploy` —— 受控发布(上传 + 校验 + 重启 + 健康检查)
+### `ecs_deploy` —— 受控发布 / 多步编排
+
+两种用法:**(A) 老三阶段**(上传 → 校验 → 重启 → 健康检查)与 **(B) `steps` 编排**(v0.6.0+)。
+
+**(A) 老三阶段**
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `instance_id` | string | ✅ | 目标实例 ID |
-| `command` | string | ✅ | 重启/生效命令, 如 `docker compose restart` |
+| `command` | string | | 重启/生效命令, 如 `docker compose restart`(用 `steps` 时不需要) |
 | `local_file` | string | | 可选: 要上传的本地文件 |
 | `remote_path` | string | | 可选: 上传目标远端路径(local_file 提供时必填) |
 | `health_check` | string | | 可选: 健康检查命令, 如 `curl -fsS http://127.0.0.1/health \|\| true` |
 | `verify_sha256` | boolean | | 上传后校验 sha256, **默认 true**; 不一致即中止发布(不执行重启) |
 | `region` / `force` / `timeout` | | | 地域 / 覆盖确认 / 每阶段超时(秒, 默认 180) |
 
-四段流程结果全部返回(阶段内失败不中断后续阶段): 上传 → sha256 校验 → 重启 → 健康检查; 唯一例外是**校验失败会中止**(见 `aborted` / `abort_reason`), 避免用损坏的发布物重启服务。**"改代码 → 上传 → 校验 → 重启 → 验证"的完整修复闭环**。
+四段流程结果全部返回(阶段内失败不中断后续阶段): 上传 → sha256 校验 → 重启 → 健康检查; 唯一例外是**校验失败会中止**(见 `aborted` / `abort_reason`), 避免用损坏的发布物重启服务。
+
+**(B) `steps` 编排(v0.6.0+)** —— 把同一实例上的一串动作写成**一次调用**:
+
+| 步骤 | 字段 | 说明 |
+|---|---|---|
+| `upload` | `local_file`, `remote_path`, `force?`, `verify_sha256?` | 上传; 默认 `verify_sha256: true`, 校验失败**中止整个编排** |
+| `exec` | `command` \| `script`, `timeout?`, `read_only?`, `description?` | 执行命令或脚本(`script` 走 base64 零转义投递) |
+| `assert` | `command` \| `script`, `expect` | 断言: `expect: { exit_code?, stdout_contains?, stdout_not_contains?, stderr_contains? }` |
+| `tail` | `path`, `after?`, `max_bytes?`, `exit_file?`, `wait_seconds?` | 按**字节游标**读远端日志; `wait_seconds` 可等待 `exit_file` 出现 |
+
+编排级参数:`dry_run`(只回显计划不执行, **不请求审批**)、`continue_on_error`(默认 false:任一步失败即中止并把余下步骤标记为 `skipped`)、`read_only`(对所有 exec/assert 步骤开只读护栏)、`timeout`(每步默认 180s)。上限 20 步。
+
+```jsonc
+// 一次调用完成"上传 → 断言 → 重启 → 断言 → 读日志"
+{
+  "instance_id": "i-xxx",
+  "steps": [
+    { "kind": "upload", "local_file": "dist/app.jar", "remote_path": "/opt/app/app.jar", "force": true },
+    { "kind": "assert", "command": "test -s /opt/app/app.jar && echo size-ok",
+      "expect": { "exit_code": 0, "stdout_contains": ["size-ok"] } },
+    { "kind": "exec", "command": "docker compose up -d --force-recreate", "timeout": 300 },
+    { "kind": "assert", "script": "curl -fsS http://127.0.0.1/health", "expect": { "stdout_contains": ["\"ok\":true"] } },
+    { "kind": "tail", "path": "/tmp/release.log", "exit_file": "/tmp/release.exit", "wait_seconds": 60 }
+  ]
+}
+```
+
+返回 `mode`(`legacy` / `steps`)、`ok`、`done_stage`/`total_stage`、`stopped_at`/`stopped_reason`/`failed_steps`,以及逐步的 `stages`(断言步骤带 `assertions` 逐条结果,tail 步骤带 `next_offset`/`total_bytes`/`eof`)。**失败定位到具体步骤与具体断言**,不再靠人肉翻日志。
 
 ### `ecs_session` —— 会话管理
 

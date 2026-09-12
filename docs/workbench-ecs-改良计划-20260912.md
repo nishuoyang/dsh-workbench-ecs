@@ -275,17 +275,35 @@ nohup bash -c 'bash /tmp/.dsh-ecs/<id>/run.sh; echo $? > /tmp/.dsh-ecs/<id>/exit
 ecs_deploy {
   instance_id, dry_run?,
   steps: [
-    { kind: 'upload',   local_file, remote_path, force?, sha256? },
-    { kind: 'exec',     script|command, timeout?, read_only? },
-    { kind: 'assert',   script|command, expect: { exit_code: 0, stdout_contains: [...] } },
-    { kind: 'tail',     path, after?, until: { exit_code_file: '/tmp/x/exit' } },
+**S4a [v0.6.0 / ✅ 已交付] `ecs_deploy` 泛化为 `steps` 编排**
+
+```
+ecs_deploy {
+  instance_id, dry_run?, continue_on_error?, read_only?, timeout?,
+  steps: [
+    { kind: 'upload', local_file, remote_path, force?, verify_sha256? },
+    { kind: 'exec',   command | script, timeout?, read_only?, description? },
+    { kind: 'assert', command | script, expect: { exit_code?, stdout_contains?, stdout_not_contains?, stderr_contains? } },
+    { kind: 'tail',   path, after?, max_bytes?, exit_file?, wait_seconds? },
   ]
 }
 ```
-- 每步结果全量返回、`continue_on_error` 可选;断言失败即中止并标出失败步骤;
-- 与现有三个阶段式 `ecs_deploy` **向后兼容**(无 `steps` 时走老路径)。
 
-**S4b [v0.6.0+] 命名 Runbook 模板(大工作量)**
+已落地:
+- **计划与执行同源**:`planSteps()` 同时供 `dry_run` 预演与实际执行使用,预演的命令行与真正下发的一致;
+  `dry_run` 不执行任何命令, 也**不请求审批**(无副作用);
+- **断言逐条定位**:`assertions: [{check, expected, actual, ok}]`,失败时 `stopped_reason` 直接给出
+  `stdout_contains(healthy) 实际 missing` 这样的判据,不再需要人翻日志找原因;
+- **失败语义**:默认失败即中止,余下步骤标记 `skipped`(显式可见,而不是静默消失);
+  `continue_on_error: true` 则继续,并用 `failed_steps` 汇总;
+  **中止(aborted, 如 sha256 不一致)在任何情况下都停** —— 即使开了 continue_on_error 也不拿坏包继续;
+- **tail 步骤**复用 S2 的字节游标读(`__DSH_ECS_META__` + `tail -c +N`),`wait_seconds` 可等待退出码文件出现,
+  因此"脚本 detach + 轮询日志直到结束"也能收进同一次调用;
+- **向后兼容**:无 `steps` 时走老三阶段(上传 → 校验 → 重启 → 健康检查),两条老 e2e 用例仍全绿;
+- **踩坑记录**:DSH 参数 DSL 要求数组项显式声明 `additionalProperties`(true/false),写成 `{ type: 'object' }`
+  会在 `defineTool` 阶段直接报 `UNSUPPORTED_SCHEMA`;已改为完整的步骤字段声明(对模型也更自解释)。
+
+**S4b [v0.6.0+ / 待排期] 命名 Runbook 模板(大工作量)**
 
 - 模板**内联定义**(不引入 YAML 依赖 —— 动态 body 无法 import,加依赖会破坏双通道一致性),
   或从工作区读取 `.dsh/workbench-ecs/runbooks/*.json`(需要可选 `ctx.get('fs')`,不硬依赖);
@@ -293,7 +311,9 @@ ecs_deploy {
   guard(package.json/lock 变化 FATAL、schema 变化 WARN)→ `pre-<sha>` 镜像快照 → overlay 构建 →
   `compose up -d --force-recreate` → smoke(健康 + 边界 400 + 静态 404 + minio 200);
 - 断言语义直接平移 `deploy/release.sh`,使 15 次调用收敛为 1 次。
-- **决策点**:S4b 的"契约来源"应是仓库里的 `deploy/release.sh`(单一事实源),而不是插件内硬编码 —— 建议模板只声明**步骤与断言**,把脚本本体留在项目仓库,由 `steps` 上传执行。
+- **决策点(按推荐口径确定)**:模板只声明**步骤与断言**,脚本本体留在项目仓库 ——
+  S4a 的 `steps` 已把"上传仓库里的脚本 → 执行 → 断言 → 读日志"打通,因此 Runbook 可以是一份**纯数据**
+  (步骤 + 断言 + 参数占位),不需要在插件里硬编码任何项目逻辑。
 
 **工作量**:S4a 2 天;S4b 3~5 天 + 每项目适配。
 
@@ -317,7 +337,7 @@ ecs_deploy {
 | **v0.4.0** ✅ **已完成** | 投递与护栏(快赢) | S1 script 直送 / S6 read_only / S8' 小改进(含 **D1** timeout 修复)/ S5a sha256 / 补 0912+0909 回归断言;顺带修掉 **D5、D6、D7** | 已达成:e2e 20/20 通过,F1 的容器内 `node -e` 零转义直通 |
 | **v0.5.0** ✅ **已完成** | 长任务与会话 | S2 detach + `ecs_log` 游标 / S3 伪会话 / 解 **D2、D3** | 已达成:e2e 25/25(含 10s 长任务期间前台调用 < 6s 返回) |
 | **v0.5.1** ✅ **已完成** | 批量与会话补完 | S7 并行批量 + 后台批量 + JSON 模式 / S5b 目录递归上传 / `ecs_list` 补 5 个过滤器 + 分页提示;顺带修掉 **D8** | 已达成:unit 30/30、e2e 33/33(含目录上传远端 `find` 核对、坏包中止解包、批量并发与 `job_ids`) |
-| **v0.6.0** | 编排 | S4a `steps` 编排 → S4b 命名 Runbook(`release` 模板) | 15 次调用 → 1 次;发布契约离开人的记忆 |
+| **v0.6.0** ✅ **S4a 已完成** | 编排 | S4a `ecs_deploy { steps }` 编排(upload/exec/assert/tail + dry_run + continue_on_error)/ 老三阶段保持兼容 | 已达成:unit 38/38、e2e 38/38(含 dry_run 不落地、断言失败中止且远端验证后续步骤未执行、`continue_on_error`、tail `wait_seconds` 等到退出码文件)。S4b 命名 Runbook 待排期 |
 | **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,
@@ -346,10 +366,17 @@ ecs_deploy {
 12. **S5b** ✅ *已覆盖(v0.5.1)*:目录上传 e2e 走通"归档→上传→校验→解包"(远端 `find` 核对顶层剥离与子目录保留)、`keep_root_dir` 保留顶层、目录不存在时报错;**损坏注入用例**在 unit 中以可编排 subprocess 构造"远端摘要不一致",断言 `aborted`/`extracted:false` 且**不再下发解包命令**(坏包不落地);
 13. **lossless** ✅ *已覆盖*:新增分支的 value / presentationMeta / presentCall 均过 `isJsonValue`;
 14. **D5/D6/D7**(v0.4.0 新增缺陷)✅ *已覆盖*:`request_id` 带回;`ecs_deploy` 带 `local_file` 的三阶段全绿(此前恒失败);`ecs_deploy` 上传+校验+重启不再死锁;
-15. **D8**(v0.5.1 新增缺陷)✅ *已覆盖*:`ecs_upload` 目录模式的解包结果曾取自 `decodeLoose().text` —— 而该字段在 stdout 是合法 JSON 时为**空串**(内容在 `.json.output`),导致 `entries` 恒为 undefined;已改为优先读 JSON 的 `output`/`exit_code`(与 D5 同类)。
+15. **D8**(v0.5.1 新增缺陷)✅ *已覆盖*:`ecs_upload` 目录模式的解包结果曾取自 `decodeLoose().text` —— 而该字段在 stdout 是合法 JSON 时为**空串**(内容在 `.json.output`),导致 `entries` 恒为 undefined;已改为优先读 JSON 的 `output`/`exit_code`(与 D5 同类);
+16. **S4a** ✅ *已覆盖(v0.6.0)*:
+    - unit 8 项:dry_run 只回显计划且零命令下发、结构校验(非法 kind/缺字段/上限 20/无 command)、断言逐条结果、断言失败即中止+后续 `skipped`、`continue_on_error`、tail 游标、script 步骤零转义、上传 sha256 不一致中止编排、`read_only` 预检拒绝写步骤;
+    - e2e 6 项(真实实例):dry_run 后**远端核对文件确实不存在**、四步真实编排(上传+默认校验 → 断言 3 条 → 脚本步骤含中文 → tail 读到日志)、断言失败后**远端核对第三步未执行**、`continue_on_error` 保留退出码 3 与 stderr、tail `wait_seconds` 等到退出码文件后读到 `late-line` 且 `eof: true`;
+    - 回归:两条老三阶段 `ecs_deploy` 用例(重启+健康检查、上传+默认校验)仍全绿,证明向后兼容;
+17. **D9**(v0.6.0 开发中暴露)✅ *已覆盖*:steps 编排里 sha256 中止时,剩余步骤**没有**被标记 `skipped`,
+    会被继续执行(原判定写成"aborted 时不算失败停止")。已把"aborted 一律停"并入中止判定,
+    并加断言 `stages[1].skipped === true` + 远端核对重启命令确实未下发。
 
-> 当前实际测试资产:`test/unit.mjs` **30 项**(不触达实例:护栏 47 条样例、base64/字节校验、sha256 链路、并发闸门、归档/解包、output_json 渲染、分页提示、坏包中止);
-> `test/e2e-local.mjs` **33 项**(真实实例,只读命令 + `/tmp` 临时文件)。`npm test` = unit + 冒烟 + 动态 body 一致性。
+> 当前实际测试资产:`test/unit.mjs` **38 项**(不触达实例:护栏 47 条样例、base64/字节校验、sha256 链路、并发闸门、归档/解包、output_json 渲染、分页提示、坏包中止、steps 编排);
+> `test/e2e-local.mjs` **38 项**(真实实例,只读命令 + `/tmp` 临时文件)。`npm test` = unit + 冒烟 + 动态 body 一致性。
 
 ---
 
@@ -360,7 +387,7 @@ ecs_deploy {
 3. **直连传输**:建议作为 CLI 上游需求(插件侧无凭据来源,不应承诺)。
 4. **动态挂载 body 的哈希能力**:**已绕过** —— sha256 改为经 subprocess 调平台工具,不再依赖 `node:crypto`;
    但 `to-body.mjs` "同作用域 + 剥 import" 的约束仍在,新增模块级常量必须带模块前缀(见 D7 提示)。
-5. **奶龙 `deploy/release.sh` 作为模板契约来源**:是否同意"模板声明步骤与断言、脚本留在项目仓库"的分工(S4b 前提)。
+5. **奶龙 `deploy/release.sh` 作为模板契约来源**:✅ **已确认按推荐口径执行**(用户 2026-09-12 决策)—— 模板只声明**步骤与断言**,脚本本体留在项目仓库。S4a 的 `steps` 已经支持"上传仓库脚本 → 执行 → 断言 → 读日志",因此 Runbook 只需是纯数据,无需在插件里硬编码项目逻辑。
 6. **是否保留 `run_in_background`**:S2 落地后建议保留为"本地 CLI 进程级后台",把远端长任务一律导向 `detach`;文档需明确二选一的使用判据。
 7. **CLI 应透出分页 token**(v0.5.1 实测新增):`workbench list ecs --output json` 只返回 `instances`,
    不返回 `NextToken`/`TotalCount`,插件因此无法自动翻页(只能用 `pagination_note` 提示用户收紧过滤条件)。
@@ -375,17 +402,18 @@ ecs_deploy {
 | F1 嵌套引号必炸 | 真缺口,根因修正为"远端两层"(D4) | S1 | ✅ **v0.4.0 已交付** |
 | F2 长命令软上限 + 日志不可续读 | 真缺口;机制解释见 D3,另发现 D1 | S2 + D1 | D1 ✅ v0.4.0 / S2 ✅ v0.5.0 |
 | F3 每次独立 shell | 真缺口,但 CLI 无可靠会话创建 | S3(伪会话) | ✅ v0.5.0 |
-| F4 多步流水线零编排 | 真缺口,建议拆 S4a/S4b | S4 | v0.6.0 |
+| F4 多步流水线零编排 | 真缺口,建议拆 S4a/S4b | S4 | S4a ✅ **v0.6.0 已交付** / S4b 待排期 |
 | F5 传输无校验/无目录语义 | 部分真缺口;直连不可做 | S5a / S5b / S5c | S5a ✅ v0.4.0 / S5b ✅ v0.5.1 / S5c 上游 |
 | F6 无只读护栏 | 真缺口 | S6 | ✅ **v0.4.0 已交付** |
 | F7 小项(批量串行/无 description/timeout 偏短) | 真缺口 + D1 | S7 + S8' | S8' ✅ v0.4.0 / S7 ✅ v0.5.1(分页受 CLI 限制) |
 | 0909-1 undefined / 通知 | **已修**(v0.3.6+0.3.7) | 仅补断言 | ✅ v0.4.0(断言已加) |
-| 0909-2 并发串流 | **已修**(实例锁),但引入 D2 | S2 重构为短锁 | v0.5.0 |
+| 0909-2 并发串流 | **已修**(实例锁),但引入 D2 | S2 重构为短锁 | ✅ v0.5.0 |
 | §七-6 中文/ANSI/空输出健壮性 | 基本满足,发现进度帧污染(D6 关联) | strip_ansi + 用例 | ✅ **v0.4.0 已交付** |
 | (新)D5 远端退出码被覆盖 | 真缺陷 | 以 JSON `exit_code` 为准 | ✅ v0.4.0 |
 | (新)D6 `ecs_deploy` 上传阶段恒失败 | 真缺陷(自 v0.2.0) | 上传阶段改宽容解码 | ✅ v0.4.0 |
 | (新)D7 实例锁不可重入 → 死锁 | 真缺陷(v0.4.0 开发中暴露) | `locked: true` 复用锁 | ✅ v0.4.0 |
 | (新)D8 目录上传 `entries` 恒为 undefined | 真缺陷(`decodeLoose().text` 在 JSON 成功时为空串) | 改读 JSON 的 `output`/`exit_code` | ✅ v0.5.1 |
+| (新)D9 steps 里 sha256 中止后仍继续执行后续步骤 | 真缺陷(v0.6.0 开发中暴露,unit 断言抓到) | aborted 一律停 + `skipped` 标记 | ✅ v0.6.0 |
 
 ---
 

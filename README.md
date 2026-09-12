@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.5.1 · MIT License
+> v0.6.0 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -21,6 +21,7 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Read-only guard** (v0.4.0+): `read_only` on `ecs_exec` / `ecs_diagnose` rejects write operations before they reach a shell (redirects, `rm`/`mv`/`cp`/`chmod`, `docker`/`systemctl` mutations, `nohup`, …); on by default for `ecs_diagnose`, with zero false positives on the built-in diagnostic script
 - **Transfer integrity** (v0.4.0+): `ecs_upload.verify_sha256` compares local/remote digests after upload; `ecs_deploy` enables it by default and **aborts before restart** on a mismatch. Local hashing uses `sha256sum`/`shasum`/`certutil`, so no extra runtime is required
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
+- **Multi-step orchestration** (v0.6.0+): `ecs_deploy { steps: [...] }` expresses "upload → run → assert → read log" as one call; `assert` evaluates `expect` checks and reports **exactly which assertion failed, what was expected, and what actually happened**; `dry_run` previews the commands without executing. A release drops from a dozen calls to one
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (per-instance failures do not stop others); `concurrency` controls parallelism (default 4 when `read_only`, otherwise serial) while the same instance still serializes behind its lock — cluster triage no longer queues one host at a time (v0.5.1+)
 - **Recursive directory upload** (v0.5.1+): `ecs_upload { local_dir: "dist" }` does "local `tar` → upload → sha256 verify → remote extract" in one call; a checksum mismatch **aborts the extract**, so a corrupt archive never rewrites the remote directory
 - **Structured output** (v0.5.1+): `output_json: true` returns stable JSON text for downstream automation (`ecs_exec` / `ecs_list`)
@@ -54,7 +55,7 @@ That's it — the bundle layer inserts the plugin row into the web profile: the 
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.5.1"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.6.0"}
 ```
 
 Then ask the Agent:
@@ -393,19 +394,51 @@ CLI equivalent: one remote `exec` (semicolon-joined read-only command set)
 
 Built-in 7 sections: host info / uptime & load / memory / disk / running services & containers (`docker ps`) / top memory processes / listening ports. **The starting point of production debugging** — one tool instead of a command string.
 
-### `ecs_deploy` — guarded deployment (upload + verify + restart + health check)
+### `ecs_deploy` — guarded deployment / multi-step orchestration
+
+Two usages: **(A) the classic three phases** (upload → verify → restart → health check) and **(B) `steps` orchestration** (v0.6.0+).
+
+**(A) Classic phases**
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `instance_id` | string | ✅ | Target instance ID |
-| `command` | string | ✅ | Restart/apply command, e.g. `docker compose restart` |
+| `command` | string | | Restart/apply command, e.g. `docker compose restart` (not needed with `steps`) |
 | `local_file` | string | | Optional local file to upload |
 | `remote_path` | string | | Upload target path (required when `local_file` is set) |
 | `health_check` | string | | Optional health-check command, e.g. `curl -fsS http://127.0.0.1/health \|\| true` |
 | `verify_sha256` | boolean | | Verify sha256 after upload, **default true**; a mismatch aborts the deployment before restart |
 | `region` / `force` / `timeout` | | | Region / overwrite confirmation / per-phase timeout in seconds (default 180) |
 
-All phases return their results (a failing phase does not stop later ones): upload → sha256 verify → restart → health check — with the one exception that a verification failure aborts (`aborted` / `abort_reason`), so a corrupt artifact never gets deployed. **The complete *edit → upload → verify → restart → verify* fix loop.**
+All phases return their results (a failing phase does not stop later ones): upload → sha256 verify → restart → health check — with the one exception that a verification failure aborts (`aborted` / `abort_reason`), so a corrupt artifact never gets deployed.
+
+**(B) `steps` orchestration (v0.6.0+)** — model a whole sequence on one instance as a **single call**:
+
+| Step | Fields | Description |
+|---|---|---|
+| `upload` | `local_file`, `remote_path`, `force?`, `verify_sha256?` | Upload; `verify_sha256` defaults to true and a mismatch **aborts the whole run** |
+| `exec` | `command` \| `script`, `timeout?`, `read_only?`, `description?` | Run a command or a script (`script` uses zero-escape base64 delivery) |
+| `assert` | `command` \| `script`, `expect` | Assertions: `expect: { exit_code?, stdout_contains?, stdout_not_contains?, stderr_contains? }` |
+| `tail` | `path`, `after?`, `max_bytes?`, `exit_file?`, `wait_seconds?` | Read a remote log by **byte cursor**; `wait_seconds` waits for `exit_file` to appear |
+
+Run-level parameters: `dry_run` (print the plan without executing — and **without requesting approval**), `continue_on_error` (default false: the first failure stops the run and remaining steps are marked `skipped`), `read_only` (guard every exec/assert step), `timeout` (per step, default 180s). Maximum 20 steps.
+
+```jsonc
+// One call: upload → assert → restart → assert → read log
+{
+  "instance_id": "i-xxx",
+  "steps": [
+    { "kind": "upload", "local_file": "dist/app.jar", "remote_path": "/opt/app/app.jar", "force": true },
+    { "kind": "assert", "command": "test -s /opt/app/app.jar && echo size-ok",
+      "expect": { "exit_code": 0, "stdout_contains": ["size-ok"] } },
+    { "kind": "exec", "command": "docker compose up -d --force-recreate", "timeout": 300 },
+    { "kind": "assert", "script": "curl -fsS http://127.0.0.1/health", "expect": { "stdout_contains": ["\"ok\":true"] } },
+    { "kind": "tail", "path": "/tmp/release.log", "exit_file": "/tmp/release.exit", "wait_seconds": 60 }
+  ]
+}
+```
+
+Returns `mode` (`legacy` / `steps`), `ok`, `done_stage`/`total_stage`, `stopped_at`/`stopped_reason`/`failed_steps`, and per-step `stages` (assert steps carry per-check `assertions`; tail steps carry `next_offset`/`total_bytes`/`eof`). **Failures point at the exact step and the exact assertion** instead of requiring someone to read the log.
 
 ### `ecs_session` — session management
 

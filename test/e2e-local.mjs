@@ -745,6 +745,150 @@ await run('ecs_deploy(上传 + 默认开启 sha256 校验)', async () => {
   assertLossless('ecs_deploy upload value', value)
 })
 
+// ---- S4a: steps 编排(v0.6.0) ----
+await run('ecs_deploy steps: dry_run 预演(不执行, 计划可读)', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const args = {
+    instance_id: INSTANCE_ID,
+    dry_run: true,
+    steps: [
+      { kind: 'upload', local_file: localFile, remote_path: '/tmp/dsh-e2e-steps.txt', force: true },
+      { kind: 'exec', command: 'echo steps-dry' },
+      { kind: 'assert', command: 'cat /tmp/dsh-e2e-steps.txt', expect: { exit_code: 0, stdout_contains: ['hello-from-dsh-e2e'] } },
+      { kind: 'tail', path: '/tmp/dsh-e2e-steps.log' },
+    ],
+  }
+  const value = await def.execute(args, makeExec('ecs_deploy'))
+  assert.equal(value.dry_run, true)
+  assert.equal(value.mode, 'steps')
+  assert.equal(value.plan.length, 4)
+  assert.deepEqual(value.plan.map((p) => p.kind), ['upload', 'exec', 'assert', 'tail'])
+  assert.equal(value.plan[0].verify_sha256, true)
+  assert.equal(value.stages, undefined, 'dry_run 不得产生阶段结果')
+  const text = def.output.render(args, value)[0].text
+  assert.ok(text.includes('未执行任何命令'))
+  assertLossless('ecs_deploy dry_run value', value)
+  assertLossless('ecs_deploy dry_run presentationMeta', def.output.presentationMeta({}, value))
+  assertLossless('ecs_deploy steps presentCall', def.presentCall(args))
+  // 预演没有执行任何东西: 远端文件不应存在
+  const execDef = ecsExecDefinition(ctx)
+  const check = await execDef.execute(
+    { instance_id: INSTANCE_ID, command: 'ls /tmp/dsh-e2e-steps.txt 2>/dev/null || echo ABSENT' },
+    makeExec('ecs_exec'),
+  )
+  assert.ok(check.output.includes('ABSENT'), 'dry_run 后远端不应出现上传文件: ' + check.output)
+})
+
+await run('ecs_deploy steps: 真实编排(上传→校验→断言→日志游标)', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const value = await def.execute(
+    {
+      instance_id: INSTANCE_ID,
+      steps: [
+        { kind: 'upload', local_file: localFile, remote_path: '/tmp/dsh-e2e-steps.txt', force: true, description: '上传发布物' },
+        { kind: 'assert', command: 'cat /tmp/dsh-e2e-steps.txt', expect: { exit_code: 0, stdout_contains: ['hello-from-dsh-e2e'], stdout_not_contains: ['CORRUPT'] } },
+        { kind: 'exec', script: 'echo "编排脚本 零转义: $HOME"; echo done > /tmp/dsh-e2e-steps.log', description: '脚本步骤' },
+        { kind: 'tail', path: '/tmp/dsh-e2e-steps.log', description: '读日志' },
+      ],
+    },
+    makeExec('ecs_deploy'),
+  )
+  assert.equal(value.mode, 'steps')
+  assert.equal(value.total_stage, 4)
+  assert.equal(value.done_stage, 4, '四步都应执行: ' + JSON.stringify(value.stages.map((s) => [s.name, s.ok, s.error])))
+  assert.equal(value.ok, true, '编排应全部成功: ' + JSON.stringify(value.stages.map((s) => [s.name, s.ok, s.error])))
+  assert.equal(value.stopped_at, undefined)
+  assert.equal(value.aborted, undefined)
+  // 上传步骤默认做了 sha256 校验
+  assert.equal(value.stages[0].sha256_local, value.stages[0].sha256_remote, '上传步骤应默认校验 sha256')
+  // 断言步骤逐条给出结果
+  const asserts = value.stages[1].assertions
+  assert.ok(Array.isArray(asserts) && asserts.length === 3, '断言应逐条回报, 实际: ' + JSON.stringify(asserts))
+  assert.ok(asserts.every((a) => a.ok === true))
+  // 脚本步骤零转义 + 中文
+  assert.ok(value.stages[2].output.includes('编排脚本 零转义: /root'), '脚本步骤应原样执行: ' + value.stages[2].output)
+  // tail 步骤读到日志并可续读
+  assert.equal(value.stages[3].output, 'done')
+  assert.ok(value.stages[3].next_offset >= 5, 'tail 应回报字节游标')
+  assertLossless('ecs_deploy steps value', value)
+  assertLossless('ecs_deploy steps presentationMeta', def.output.presentationMeta({}, value))
+})
+
+await run('ecs_deploy steps: 断言失败即中止且不执行后续步骤', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const value = await def.execute(
+    {
+      instance_id: INSTANCE_ID,
+      steps: [
+        { kind: 'exec', command: 'echo step-zero' },
+        { kind: 'assert', command: 'echo actual-output', expect: { exit_code: 0, stdout_contains: ['definitely-not-present'] } },
+        { kind: 'exec', command: 'touch /tmp/dsh-e2e-should-not-exist', description: '不应被执行' },
+      ],
+    },
+    makeExec('ecs_deploy'),
+  )
+  assert.equal(value.ok, false)
+  assert.equal(value.done_stage, 2, '只应执行到断言那一步')
+  assert.equal(value.stopped_at, 1)
+  assert.deepEqual(value.failed_steps, [1])
+  assert.match(String(value.stopped_reason), /stdout_contains/)
+  assert.equal(value.stages[2].skipped, true)
+  // 远端验证: 第三步确实没有执行
+  const execDef = ecsExecDefinition(ctx)
+  const check = await execDef.execute(
+    { instance_id: INSTANCE_ID, command: 'ls /tmp/dsh-e2e-should-not-exist 2>/dev/null || echo ABSENT' },
+    makeExec('ecs_exec'),
+  )
+  assert.ok(check.output.includes('ABSENT'), '中止后不得执行后续步骤: ' + check.output)
+  assertLossless('ecs_deploy steps aborted value', value)
+})
+
+await run('ecs_deploy steps: continue_on_error 时失败不中断', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const value = await def.execute(
+    {
+      instance_id: INSTANCE_ID,
+      continue_on_error: true,
+      steps: [
+        { kind: 'exec', command: 'echo will-fail; exit 3', description: '预期失败' },
+        { kind: 'exec', command: 'echo ran-after-failure' },
+      ],
+    },
+    makeExec('ecs_deploy'),
+  )
+  assert.equal(value.done_stage, 2, '两步都应执行')
+  assert.equal(value.stopped_at, undefined)
+  assert.deepEqual(value.failed_steps, [0])
+  assert.equal(value.stages[0].exit_code, 3, '远端退出码应透传')
+  assert.ok(value.stages[1].output.includes('ran-after-failure'), '失败后仍应继续执行')
+  assertLossless('ecs_deploy continue_on_error value', value)
+})
+
+await run('ecs_deploy steps: tail 等待退出码文件(wait_seconds)', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const value = await def.execute(
+    {
+      instance_id: INSTANCE_ID,
+      steps: [
+        {
+          kind: 'exec',
+          description: '后台写日志',
+          script: 'rm -f /tmp/dsh-e2e-wait.log /tmp/dsh-e2e-wait.exit\n' +
+            "nohup sh -c 'sleep 4; echo late-line; echo 0 > /tmp/dsh-e2e-wait.exit' > /tmp/dsh-e2e-wait.log 2>&1 &\necho launched",
+        },
+        { kind: 'tail', path: '/tmp/dsh-e2e-wait.log', exit_file: '/tmp/dsh-e2e-wait.exit', wait_seconds: 30, description: '等待并读日志' },
+      ],
+    },
+    makeExec('ecs_deploy'),
+  )
+  assert.equal(value.ok, true, '两步都应成功: ' + JSON.stringify(value.stages.map((s) => [s.name, s.ok, s.error])))
+  const tail = value.stages[1]
+  assert.ok(tail.output.includes('late-line'), '等待后应读到日志内容: ' + JSON.stringify(tail.output))
+  assert.equal(tail.eof, true, '退出码文件出现后应标记 eof')
+  assert.equal(tail.exit_code, 0)
+  assertLossless('ecs_deploy tail wait value', value)
+})
+
 console.log('')
 console.log('== 结果: ' + passed + ' 通过, ' + failed + ' 失败 ==')
 process.exit(failed > 0 ? 1 : 0)
