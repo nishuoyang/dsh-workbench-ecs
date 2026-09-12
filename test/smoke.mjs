@@ -10,6 +10,8 @@
 import assert from 'node:assert'
 import { readFileSync, readdirSync } from 'node:fs'
 import { name, inject, apply } from '../lib/index.js'
+import { lintRunbook, parseRunbook, buildRunbookRun, collectParamNames } from '../lib/runbooks.js'
+import { planSteps } from '../lib/steps-engine.js'
 
 // 全部工具的必填参数契约
 // 注意: ecs_exec 的 command 自 v0.4.0 起与 script 二选一, 两者都可缺省;
@@ -154,6 +156,32 @@ for (const file of localModules) {
   assert.ok(marker !== null, 'lib/' + file + ' 应有可识别的导出符号')
   assert.ok(bodyText.includes(marker[1]), 'lib/' + file + ' 未拼进动态 body(缺符号 ' + marker[1] + ')')
 }
+
+// ---- 通用跑书模板守卫(v0.6.7) ----
+// templates/runbooks/*.json 是随包分发的**通用跑书**: 用户直接拷进项目工作区就用。
+// 模板最容易烂在没人跑: 少个默认值、字段写错、改成非法 timeout —— 静态校验全都能提前
+// 看见, 所以这里把"每份模板必须 lint 全绿(0 错误 0 提醒) + 参数齐备 + 无残留占位符"
+// 变成回归项, 模板坏了 CI 就红。
+const templateDirUrl = new URL('../templates/runbooks/', import.meta.url)
+const templateFiles = readdirSync(templateDirUrl).filter((f) => f.endsWith('.json')).sort()
+assert.ok(templateFiles.length >= 3, '应至少有 3 份通用跑书模板, 实际: ' + templateFiles.length)
+for (const file of templateFiles) {
+  const label = file.replace(/\.json$/, '')
+  const text = readFileSync(new URL(file, templateDirUrl), 'utf8')
+  const lint = lintRunbook(text, { name: label })
+  assert.ok(lint.ok, '模板 ' + label + ' 必须有 0 个错误: ' + JSON.stringify(lint.issues))
+  assert.equal(lint.warn_count, 0, '模板 ' + label + ' 不应有提醒: ' + JSON.stringify(lint.issues))
+  const runbook = parseRunbook(text, label)
+  const run = buildRunbookRun(runbook, {}, { instance_id: 'i-smoke', region: 'cn-shanghai' })
+  assert.deepEqual(run.missing, [], '模板 ' + label + ' 的占位符必须都有默认值, 缺: ' + run.missing.join(','))
+  assert.equal(collectParamNames(run.steps).size, 0, '模板 ' + label + ' 替换后不应残留占位符: ' + [...collectParamNames(run.steps)].join(','))
+  const plan = planSteps(run.steps, { instance_id: 'i-smoke', region: 'cn-shanghai' })
+  assert.equal(plan.length, runbook.steps.length, '模板 ' + label + ' 应能完整展开成计划')
+  for (const step of plan) {
+    assert.ok(Number(step.timeout) > 0, '模板 ' + label + ' 的 steps[' + step.index + '] 超时应为正数')
+  }
+}
+assert.ok(pkg.files.includes('templates/'), 'package.json 的 files 必须包含 templates/(否则模板不会随 npm 包分发)')
 
 console.log('smoke OK: name =', name, '| tools =', Object.keys(EXPECTED).sort().join(', '))
 console.log('rpc OK: 设置页路由 /dsh-workbench-ecs 已注册 (' + routes[0].kind + ')')

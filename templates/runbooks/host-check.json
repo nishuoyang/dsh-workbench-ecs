@@ -1,0 +1,54 @@
+{
+  "name": "host-check",
+  "description": "通用主机体检（只读）：磁盘/内存水位断言、关键进程与监听端口核对，并留档负载/内存/时间同步。不改动任何东西，可随时对任意实例跑。",
+  "params": {
+    "disk_max": 90,
+    "mem_max": 90,
+    "process_name": "",
+    "port": "",
+    "mount": "/"
+  },
+  "steps": [
+    {
+      "kind": "assert",
+      "description": "磁盘水位 ≤ ${disk_max}%（${mount}）",
+      "script": "set -euo pipefail\nUSE=$(df -P \"${mount}\" | awk 'NR==2{gsub(/%/,\"\",$5); print $5}')\necho \"disk-use=${mount}=$USE%\"\n[ \"$USE\" -le ${disk_max} ] || { echo \"disk-high ${mount}=$USE%（阈值 ${disk_max}%）\" >&2; exit 3; }\necho disk-ok",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["disk-ok"]
+      }
+    },
+    {
+      "kind": "assert",
+      "description": "内存水位 ≤ ${mem_max}%",
+      "script": "set -euo pipefail\nMEM=$(free -m | awk '/^Mem:/{printf \"%d\", $3*100/$2}')\necho \"mem-use=$MEM%\"\n[ \"$MEM\" -le ${mem_max} ] || { echo \"mem-high $MEM%（阈值 ${mem_max}%）\" >&2; exit 4; }\necho mem-ok",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["mem-ok"]
+      }
+    },
+    {
+      "kind": "assert",
+      "description": "关键进程存在（可选：process_name）",
+      "script": "set -euo pipefail\nif [ -z \"${process_name}\" ]; then\n  echo 'process-skip（未提供 process_name）'\nelse\n  pgrep -f \"${process_name}\" >/dev/null || { echo \"process-missing ${process_name}\" >&2; exit 5; }\n  echo \"process-ok ${process_name}\"\nfi\necho host-check-process-done",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["host-check-process-done"]
+      }
+    },
+    {
+      "kind": "assert",
+      "description": "端口在监听（可选：port）",
+      "script": "set -euo pipefail\nif [ -z \"${port}\" ]; then\n  echo 'port-skip（未提供 port）'\nelse\n  ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE \"[:.]${port}$\" || { echo \"port-not-listening ${port}\" >&2; exit 6; }\n  echo \"port-ok ${port}\"\nfi\necho host-check-port-done",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["host-check-port-done"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "留档：负载/内存/磁盘/时间同步/CPU",
+      "script": "set -u\necho '== uptime =='; uptime\necho '== memory =='; free -m | head -n 2\necho '== disk =='; df -h | head -n 6\necho '== cpu =='; nproc\necho '== time =='; date\ntimedatectl 2>/dev/null | head -n 4 || echo 'timedatectl 不可用'"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.6 · MIT License
+> v0.6.7 · MIT License
 
 [English](./README.md) | 中文
 
@@ -21,7 +21,7 @@
 - **只读护栏**(v0.4.0+): `ecs_exec` / `ecs_diagnose` 的 `read_only` 在命令进入 shell 之前拒绝写操作(重定向、`rm`/`mv`/`cp`/`chmod`、`docker` 变更、`systemctl` 变更、`nohup` 等); `ecs_diagnose` **默认开启**, 且预置诊断脚本零误杀
 - **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止; 批量时每台实例各起一个 job 并返回 `job_ids`(v0.5.1+)
-- **Runbook / 跑书**(v0.6.1+ 机制, v0.6.2+ 面板, v0.6.3+ 静态校验): 把编排存成**纯数据**放在工作区 `.dsh/workbench-ecs/runbooks/*.json`,`ecs_deploy { runbook: "release", runbook_params: { sha } }` 一次调用跑完;插件只做机制(读取/校验/`${参数}` 替换/展开),**内容与脚本本体留在项目仓库** —— 发布契约可评审、可版本化, 插件里没有项目逻辑。设置面板里也能**列出 / 校验 / 预演 / 执行**同一份跑书(与 Agent 共用同一引擎, 预演的命令行逐字一致);`ecs_runbook` 工具可只读地先查错(字段笔误、缺参数、断言无判据、护栏矛盾), shell 变量用 `$${NAME}` 转义
+- **Runbook / 跑书**(v0.6.1+ 机制, v0.6.2+ 面板, v0.6.3+ 静态校验): 把编排存成**纯数据**放在工作区 `.dsh/workbench-ecs/runbooks/*.json`,`ecs_deploy { runbook: "release", runbook_params: { sha } }` 一次调用跑完;插件只做机制(读取/校验/`${参数}` 替换/展开),**内容与脚本本体留在项目仓库** —— 发布契约可评审、可版本化, 插件里没有项目逻辑。设置面板里也能**列出 / 校验 / 预演 / 执行**同一份跑书(与 Agent 共用同一引擎, 预演的命令行逐字一致);`ecs_runbook` 工具可只读地先查错(字段笔误、缺参数、断言无判据、护栏矛盾), shell 变量用 `$${NAME}` 转义;随包另带 **5 份通用跑书模板**(v0.6.7+:`host-check` / `compose-redeploy` / `disk-cleanup` / `tls-cert-check` / `log-dig`),拷进任意项目即用
 - **多步编排**(v0.6.0+): `ecs_deploy { steps: [...] }` 把「上传 → 执行 → 断言 → 读日志」写成一次调用, `assert` 用 `expect` 逐条判定并在失败时**精确标出是哪一条断言、期望什么、实际什么**; `dry_run` 可先预演命令而不执行。一次发布从十余次调用收敛为一次
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(单台失败不中断), 适合集群排查; `concurrency` 控制并发(默认只读 4 / 写 1 串行), 同实例仍由实例锁串行 —— 集群排查不再逐台排队(v0.5.1+)
 - **目录递归上传**(v0.5.1+): `ecs_upload { local_dir: "dist" }` 一次调用完成「本机 `tar` 归档 → 上传 → sha256 校验 → 远端解包」, 省掉手工打包; 校验失败**中止解包**, 坏包不会改写远端目录
@@ -478,6 +478,35 @@ runbook 文件形状:
 - 面板与 Agent **共用同一个编排引擎**(`lib/steps-engine.js`),因此预演出来的命令行与 Agent 真正下发的逐字一致 —— 不会出现"面板能跑、工具跑不通"的漂移;
 - **守卫口径差异(有意)**:面板没有审批上下文,命中破坏性命令模式**直接拒绝**并把错误定位到具体步骤(要审批放行请走 Agent 的 `ecs_deploy`);`read_only` 步骤按只读护栏预检;
 - 面板侧 RPC 操作:`runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run`(同源路由 `/dsh-workbench-ecs/rpc`),均可传 `dir` 指定跑书目录;
+
+### 内置通用跑书模板(v0.6.7+)
+
+随包分发 **5 份不绑定具体项目的跑书**(`templates/runbooks/*.json`):拷进任意项目的 `<工作区>/.dsh/workbench-ecs/runbooks/` 即可用,也可以直接当内联 `runbook` 对象传给 `ecs_deploy`/`ecs_runbook`。它们和项目自己的跑书(如奶龙的 `release.json`)是同一套机制 —— 纯数据、可 lint、可预演。
+
+| 模板 | 用途 | 关键参数(都有默认值) | 备注 |
+|---|---|---|---|
+| `host-check` | 主机体检:**只读** | `disk_max=90` `mem_max=90` `mount=/` `port=""` `process_name=""` | 断言磁盘/内存水位、端口在听、进程在跑,并留档负载/时间同步;可随时对任意实例跑 |
+| `compose-redeploy` | 通用容器重部署 | `app_dir`(需显式传) `compose_file=docker-compose.yml` `service=""` `container_name=""` `health_url=""` `git_ref=""` `step_timeout=300` | 给了 `service` 才 `--force-recreate --no-deps`,否则只 `up -d`;`git_ref`/`health_url`/`container_name` 留空即跳过对应检查 |
+| `disk-cleanup` | 磁盘回收 | `confirm=no` `cache_keep=2GB` `disk_max=90` `container_name=""` | **默认只报告不删**(`confirm` 必须是 `yes`);清理已退出容器/悬空镜像/构建缓存,再断言水位与容器仍在 |
+| `tls-cert-check` | 域名与证书体检:**只读** | `host`(需显式传) `port=443` `path=/` `min_days=14` | HTTPS 可达 + 状态码 2xx、证书剩余天数 ≥ 阈值(需远端有 `openssl`) |
+| `log-dig` | 日志排查:**只读** | `log_path`(需显式传) `lines=500` `pattern=ERROR` `max_hits=0` | 统计最近 N 行命中数,超过阈值即失败;默认口径是"最近 500 行不出现 ERROR 才算过" |
+
+```bash
+# 拷进项目(拷贝后即可 ecs_runbook validate / ecs_deploy runbook 使用)
+cp -r node_modules/dsh-workbench-ecs/templates/runbooks/*.json  .dsh/workbench-ecs/runbooks/
+
+# 例:只读体检,先校验再预演,确认后执行
+#   ecs_runbook  { action: "validate", runbook: "host-check" }
+#   ecs_runbook  { action: "plan",     runbook: "host-check", instance_id: "i-xxx" }
+#   ecs_deploy   { instance_id: "i-xxx", runbook: "host-check", runbook_params: { disk_max: 85, port: "443" } }
+```
+
+约定(模板自己就是这么写的,照着改就行):
+
+- **必需参数用哨兵默认值**:`"app_dir": "<app_dir>"`,第 0 步断言会带中文提示拒绝哨兵值,避免"忘了传参数→在远端做了一半才失败";
+- **可选参数默认空串**:脚本里 `if [ -n "${param}" ]` 判断,留空即跳过该检查,而不是给个假默认值;
+- **危险动作加确认闸门**:`disk-cleanup` 的 `confirm=no` 默认只报告,`confirm=yes` 才动手;
+- 模板在 CI 里受**回归守卫**(`test/smoke.mjs`):每份模板必须 lint 0 错误 0 提醒、占位符都有默认值、替换后无残留、能完整展开成计划 —— 模板坏了 CI 直接红。
 
 ### `ecs_runbook` —— 工作区跑书的只读清点与静态校验(v0.6.3+)
 

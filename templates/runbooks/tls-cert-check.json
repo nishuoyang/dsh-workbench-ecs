@@ -1,0 +1,35 @@
+{
+  "name": "tls-cert-check",
+  "description": "通用域名/证书体检（只读）：HTTPS 可达与状态码、证书剩余天数 ≥ 阈值、证书主题与有效期留档。适合定时或发布后确认 Caddy/Nginx 的证书没掉。",
+  "params": {
+    "host": "<host>",
+    "port": 443,
+    "path": "/",
+    "min_days": 14
+  },
+  "steps": [
+    {
+      "kind": "assert",
+      "description": "HTTPS 可达且状态码 2xx（跟随跳转）",
+      "script": "set -euo pipefail\n[ \"${host}\" != '<host>' ] || { echo '缺少参数 host（例如 example.com，不带协议）' >&2; exit 2; }\ncurl -fsSL -m 20 -w '\\nhttp-code=%{http_code}\\n' \"https://${host}${path}\" | tail -n 1",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["http-code=2"]
+      }
+    },
+    {
+      "kind": "assert",
+      "description": "证书剩余天数 ≥ ${min_days}",
+      "script": "set -euo pipefail\nEND=$(echo | openssl s_client -connect \"${host}:${port}\" -servername \"${host}\" 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)\n[ -n \"$END\" ] || { echo \"cert-read-failed ${host}:${port}（openssl 不可用或握手失败）\" >&2; exit 3; }\nLEFT=$(( ( $(date -d \"$END\" +%s) - $(date +%s) ) / 86400 ))\necho \"cert-days-left=$LEFT\"\n[ \"$LEFT\" -ge ${min_days} ] || { echo \"cert-expiring ${host} 剩余 $LEFT 天（阈值 ${min_days}）\" >&2; exit 4; }\necho cert-ok",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["cert-ok"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "留档：证书主题/颁发者/有效期",
+      "script": "set -euo pipefail\necho | openssl s_client -connect \"${host}:${port}\" -servername \"${host}\" 2>/dev/null | openssl x509 -noout -subject -issuer -dates"
+    }
+  ]
+}

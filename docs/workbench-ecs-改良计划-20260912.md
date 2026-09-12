@@ -1,4 +1,4 @@
-# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.6)
+# dsh-workbench-ecs 反馈整理与改良计划(v0.4.0 → v0.6.7)
 
 > 输入: `E:\AiProject\nailong\docs\workbench-ecs-反馈与改进建议-20260912.md`(奶龙生产运维 ~30 次真实调用)
 > 核对基线: 插件源码 v0.3.7(commit `324d979`)+ 本机 Workbench CLI **v1.0.1**(commit `86c0aff`)
@@ -417,6 +417,7 @@ runbook 是**纯数据**, 因此"哪里写错了"完全可以在下发任何命�
 | **v0.6.4** ✅ **D11 已修复** | 会话工作区 | 新增 `common.resolveWorkspaceRoot(ctx, exec)`(与 DSH 内置工具同源: `sandboxPolicy.resolve({session})` → `session.header.cwd` → 部署兜底);各工具的 CLI/本机子进程透传 `exec`,工作目录与会话工作区一致;跑书目录取会话工作区;设置页默认跟随最近一次工具调用解析出的会话工作区,并支持 `dir` 显式覆盖(卡片带目录输入框 + [跟随会话]) | 已达成:unit 62/62、ui-rpc 25/25、e2e 47/47(含"会话 cwd 优先于部署兜底"的真机断言) |
 | **v0.6.5** ✅ **收尾打磨** | 显示噪声 | 真机核对 D11 时顺手修掉两处:① `ecs_upload` 的 message 未过 `cleanOutput`, 卡片被几百个 spinner/百分比帧淹没(与 `ecs_deploy` 上传阶段口径统一);② `ecs_runbook` 校验报告重复前缀(`steps[2] steps[2] …`) | 已达成:unit 62/62、ui-rpc 25/25、e2e 47/47 |
 | **v0.6.6** ✅ **真缺陷(D12)** | 单步超时 | 写奶龙发布跑书时发现:步骤里的 `timeout` **被静默忽略**(`planSteps` 只把全局值算一次发给每步),而工具 schema 明确承诺"本步骤命令超时(秒), 默认 180" —— 长步骤(发布脚本)仍会在全局 180s 处被 CLI 掐断, 预演显示的也不是调用方写的那个数。修复: `stepTimeoutOf(step, fallback)` 单步优先、上限 3600s 截断、非法值退回全局;`planPreview` 与 `ecs_deploy` dry_run 输出补 `timeout`(预演里能看见**实际生效**的值);lint 新增 `bad_timeout` / `timeout_clamped` 两条提醒(杜绝"写了却不按你写的执行"再次静默) | 已达成:unit 65/65、ui-rpc 25/25、e2e 47/47 |
+| **v0.6.7** ✅ **通用跑书模板** | 可复用内容 | 随包分发 5 份**不绑项目**的跑书模板(`templates/runbooks/`):`host-check`(只读体检)/ `compose-redeploy`(通用容器重部署)/ `disk-cleanup`(磁盘回收, 默认只报告)/ `tls-cert-check`(域名与证书剩余天数)/ `log-dig`(日志命中阈值);约定:必需参数用哨兵默认值 + 第 0 步闸门、可选参数默认空串即跳过、危险动作走 `confirm=yes` 闸门。顺带修掉 lint 一处误报(D13):`"timeout": "${t}"` 被当成非法值 —— 逐条检查改为看**替换后**的值 | 已达成:unit 66/66、smoke 新增"每份模板 lint 0/0 + 参数齐备 + 无残留占位符 + 可完整展开"回归守卫、ui-rpc 25/25、e2e 47/47 |
 | **backlog** | 上游依赖 | S5c 直连传输(需 CLI)、`list ecs` 的 `NextToken`/`TotalCount` 透出(需 CLI,见 §七-7)、`--session-id` 语义确认、CLI stdin 转发确认 | 需与 Workbench CLI 团队对齐 |
 
 **为什么把 S1 放在最前**:反馈 §五 的排序本身没错,但 S1 与 S6 是可以同期完成的 S 级改动,

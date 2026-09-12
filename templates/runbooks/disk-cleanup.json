@@ -1,0 +1,41 @@
+{
+  "name": "disk-cleanup",
+  "description": "通用磁盘回收：默认只报告不删（confirm 必须是 yes 才动手）。清理已退出容器、悬空镜像、构建缓存（保留 cache_keep），并断言关键容器仍在跑、磁盘水位达标。",
+  "params": {
+    "confirm": "no",
+    "cache_keep": "2GB",
+    "container_name": "",
+    "disk_max": 90
+  },
+  "steps": [
+    {
+      "kind": "assert",
+      "description": "闸门：报告当前占用；确认后才继续",
+      "script": "set -euo pipefail\necho '== 当前占用 =='\ndocker system df\nif [ \"${confirm}\" != 'yes' ]; then\n  echo '需要确认：传 confirm=yes 才会真正清理（本次只做了报告，未删除任何东西）' >&2\n  exit 2\nfi\necho cleanup-confirm-ok",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["cleanup-confirm-ok"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "清理：已退出容器 → 悬空镜像 → 构建缓存（保留 ${cache_keep}）",
+      "timeout": 600,
+      "script": "set -euo pipefail\necho '== 已退出容器 =='\ndocker container prune -f\necho '== 悬空镜像 =='\ndocker image prune -f\necho \"== 构建缓存（保留 ${cache_keep}）==\"\ndocker builder prune -f --keep-storage \"${cache_keep}\" || echo 'builder-prune-skip（此 docker 不支持 --keep-storage，已跳过而不是清空）'\necho cleanup-done"
+    },
+    {
+      "kind": "assert",
+      "description": "清理后：磁盘水位 ≤ ${disk_max}%；容器仍在跑（可选）",
+      "script": "set -euo pipefail\nUSE=$(df -P / | awk 'NR==2{gsub(/%/,\"\",$5); print $5}')\necho \"disk-use=/$USE%\"\n[ \"$USE\" -le ${disk_max} ] || { echo \"disk-still-high /=$USE%（阈值 ${disk_max}%）\" >&2; exit 3; }\nif [ -n \"${container_name}\" ]; then\n  docker inspect -f '{{.State.Status}}' \"${container_name}\" 2>/dev/null || { echo \"container-missing ${container_name}\" >&2; exit 4; }\n  echo \"container-still-ok ${container_name}\"\nfi\necho cleanup-verified",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["cleanup-verified"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "留档：清理后的占用明细",
+      "script": "set -u\ndocker system df\ndf -h / | tail -n 1"
+    }
+  ]
+}

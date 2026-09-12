@@ -1,0 +1,67 @@
+{
+  "name": "compose-redeploy",
+  "description": "通用容器重部署：目录/编排文件核对 → 可选 git 快进 → compose 配置与 service 校验 → 重建服务 → 容器与 HTTP 健康断言 → 日志留档。产物怎么上去由项目决定（本文件只管编排与断言，脚本本体留在项目仓库）。",
+  "params": {
+    "app_dir": "<app_dir>",
+    "compose_file": "docker-compose.yml",
+    "service": "",
+    "container_name": "",
+    "health_url": "",
+    "git_ref": "",
+    "step_timeout": 300
+  },
+  "steps": [
+    {
+      "kind": "assert",
+      "description": "闸门：目录与编排文件必须存在",
+      "script": "set -euo pipefail\n[ \"${app_dir}\" != '<app_dir>' ] || { echo '缺少参数 app_dir（例如 /root/myapp 或 /opt/app）' >&2; exit 2; }\n[ -d \"${app_dir}\" ] || { echo \"目录不存在 ${app_dir}\" >&2; exit 3; }\n[ -f \"${app_dir}/${compose_file}\" ] || { echo \"编排文件不存在 ${app_dir}/${compose_file}\" >&2; exit 4; }\necho \"compose-dir-ok ${app_dir}/${compose_file}\"",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["compose-dir-ok"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "可选：仓库快进到 ${git_ref}（未提供则跳过）",
+      "script": "set -euo pipefail\nif [ -z \"${git_ref}\" ]; then\n  echo 'git-skip（未提供 git_ref）'\nelse\n  git -C \"${app_dir}\" fetch --all --prune\n  git -C \"${app_dir}\" merge --ff-only \"${git_ref}\"\n  echo \"repo-head=$(git -C \"${app_dir}\" rev-parse --short HEAD)\"\nfi"
+    },
+    {
+      "kind": "assert",
+      "description": "compose 配置语法有效；提供了 service 时必须在编排里存在",
+      "script": "set -euo pipefail\ncd \"${app_dir}\"\ndocker compose -f \"${compose_file}\" config -q\necho compose-config-ok\nif [ -n \"${service}\" ]; then\n  docker compose -f \"${compose_file}\" config --services | grep -qx \"${service}\" || { echo \"service-not-found ${service}\" >&2; exit 5; }\n  echo \"compose-service-ok ${service}\"\nfi\necho compose-config-done",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["compose-config-done"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "重建服务：给了 service 就走 --force-recreate --no-deps，否则只做 up -d",
+      "timeout": "${step_timeout}",
+      "script": "set -euo pipefail\ncd \"${app_dir}\"\nif [ -n \"${service}\" ]; then\n  docker compose -f \"${compose_file}\" up -d --force-recreate --no-deps \"${service}\"\nelse\n  docker compose -f \"${compose_file}\" up -d\nfi\necho compose-up-done"
+    },
+    {
+      "kind": "assert",
+      "description": "容器在跑（可选：container_name）",
+      "script": "set -euo pipefail\nif [ -n \"${container_name}\" ]; then\n  docker inspect -f '{{.State.Status}}' \"${container_name}\" 2>/dev/null || { echo \"container-missing ${container_name}\" >&2; exit 6; }\n  echo \"container-ok ${container_name}\"\nelse\n  cd \"${app_dir}\"\n  docker compose -f \"${compose_file}\" ps\n  echo 'container-skip（未提供 container_name，已回显 compose ps）'\nfi\necho compose-container-done",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["compose-container-done"]
+      }
+    },
+    {
+      "kind": "assert",
+      "description": "HTTP 健康检查（可选：health_url）",
+      "script": "set -euo pipefail\nif [ -z \"${health_url}\" ]; then\n  echo 'http-skip（未提供 health_url）'\nelse\n  curl -fsSL -m 15 -w '\\nhttp-code=%{http_code}\\n' \"${health_url}\" | tail -n 1\nfi\necho compose-http-done",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["compose-http-done"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "日志尾部留档（可选：container_name，失败不影响结论）",
+      "script": "set -u\nif [ -z \"${container_name}\" ]; then\n  echo 'logs-skip（未提供 container_name）'\nelse\n  docker logs --tail 20 \"${container_name}\" 2>&1 | tail -n 20 || echo logs-unavailable\nfi"
+    }
+  ]
+}

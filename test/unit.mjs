@@ -1338,6 +1338,25 @@ run('lintRunbook: timeout 写了却不生效的两种情形都要报出来', () 
   assert.match(clamped.message, /3600/)
 })
 
+run('lintRunbook: timeout 写成占位符不算非法(v0.6.7 —— 只看替换后的值)', () => {
+  const text = JSON.stringify({
+    params: { t: 300, bad: 'soon' },
+    steps: [
+      { kind: 'exec', command: 'bash /opt/release.sh', timeout: '${t}' },
+      { kind: 'exec', command: 'echo b', timeout: '${bad}' },
+    ],
+  })
+  const report = lintRunbook(text, { name: 'tpl' })
+  assert.equal(report.error_count, 0, JSON.stringify(report.issues))
+  const warns = report.issues.filter((i) => i.code === 'bad_timeout')
+  assert.equal(warns.length, 1, '只有替换后真的非法的那个才该报: ' + JSON.stringify(report.issues))
+  assert.equal(warns[0].step, 1)
+  const run = buildRunbookRun(parseRunbook(text, 'tpl'), {}, { instance_id: 'i-x' })
+  const plan = planSteps(run.steps, { instance_id: 'i-x' })
+  assert.equal(plan[0].timeout, '300', '合法占位符应替换成单步超时')
+  assert.equal(plan[1].timeout, '180', '非法值退回全局默认')
+})
+
 await runAsync('ecs_runbook 工具: list / validate / plan(纯只读, 零远程调用)', async () => {
   const files = {
     ['/ws/' + RUNBOOK_DIR + '/demo.json']: JSON.stringify({

@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.6.6 · MIT License
+> v0.6.7 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -21,7 +21,7 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Read-only guard** (v0.4.0+): `read_only` on `ecs_exec` / `ecs_diagnose` rejects write operations before they reach a shell (redirects, `rm`/`mv`/`cp`/`chmod`, `docker`/`systemctl` mutations, `nohup`, …); on by default for `ecs_diagnose`, with zero false positives on the built-in diagnostic script
 - **Transfer integrity** (v0.4.0+): `ecs_upload.verify_sha256` compares local/remote digests after upload; `ecs_deploy` enables it by default and **aborts before restart** on a mismatch. Local hashing uses `sha256sum`/`shasum`/`certutil`, so no extra runtime is required
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
-- **Runbooks** (v0.6.2+): keep an orchestration as **pure data** in `<workspace>/.dsh/workbench-ecs/runbooks/*.json` and run it with `ecs_deploy { runbook: "release", runbook_params: { sha } }` in one call; the plugin only supplies the mechanism (load / validate / `${param}` substitution / expansion) while **the content and script bodies stay in the project repository** — reviewable, versioned, and free of plugin-side project logic. The settings panel can also **list / validate / preview / execute** the same runbook (shared engine, byte-identical preview); the `ecs_runbook` tool gives read-only static checks (typos, missing params, weak assertions, guard conflicts) and shell variables escape as `$${NAME}`
+- **Runbooks** (v0.6.2+): keep an orchestration as **pure data** in `<workspace>/.dsh/workbench-ecs/runbooks/*.json` and run it with `ecs_deploy { runbook: "release", runbook_params: { sha } }` in one call; the plugin only supplies the mechanism (load / validate / `${param}` substitution / expansion) while **the content and script bodies stay in the project repository** — reviewable, versioned, and free of plugin-side project logic. The settings panel can also **list / validate / preview / execute** the same runbook (shared engine, byte-identical preview); the `ecs_runbook` tool gives read-only static checks (typos, missing params, weak assertions, guard conflicts) and shell variables escape as `$${NAME}`; five **generic runbook templates** ship with the package (v0.6.7+: `host-check` / `compose-redeploy` / `disk-cleanup` / `tls-cert-check` / `log-dig`) — copy one into any project and it works
 - **Multi-step orchestration** (v0.6.0+): `ecs_deploy { steps: [...] }` expresses "upload → run → assert → read log" as one call; `assert` evaluates `expect` checks and reports **exactly which assertion failed, what was expected, and what actually happened**; `dry_run` previews the commands without executing. A release drops from a dozen calls to one
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (per-instance failures do not stop others); `concurrency` controls parallelism (default 4 when `read_only`, otherwise serial) while the same instance still serializes behind its lock — cluster triage no longer queues one host at a time (v0.5.1+)
 - **Recursive directory upload** (v0.5.1+): `ecs_upload { local_dir: "dist" }` does "local `tar` → upload → sha256 verify → remote extract" in one call; a checksum mismatch **aborts the extract**, so a corrupt archive never rewrites the remote directory
@@ -473,6 +473,35 @@ Returns `mode` (`legacy` / `steps`), `ok`, `done_stage`/`total_stage`, `stopped_
 - The panel and the Agent share **one orchestration engine** (`lib/steps-engine.js`), so a previewed command line is byte-for-byte what the Agent would send — no "works in the panel, fails through the tool" drift;
 - **Guard difference (intentional)**: the panel has no approval context, so a destructive command pattern is **rejected outright** with the offending step index (use the Agent's `ecs_deploy` for approval-gated execution); `read_only` steps are pre-checked by the read-only guard;
 - Panel-side RPC operations: `runbook-list` / `runbook-validate` / `runbook-plan` / `runbook-run` (same-origin route `/dsh-workbench-ecs/rpc`), each accepting `dir` to point at an explicit runbook directory;
+
+### Built-in generic runbook templates (v0.6.7+)
+
+Five runbooks that are **not tied to any project** ship with the package (`templates/runbooks/*.json`). Copy them into any project's `<workspace>/.dsh/workbench-ecs/runbooks/`, or pass one straight to `ecs_deploy` / `ecs_runbook` as an inline `runbook` object. They use the same mechanism as a project's own runbook (pure data, lintable, previewable).
+
+| Template | Purpose | Key parameters (all have defaults) | Notes |
+|---|---|---|---|
+| `host-check` | host health check: **read-only** | `disk_max=90` `mem_max=90` `mount=/` `port=""` `process_name=""` | asserts disk/memory watermark, listening port, process presence; archives load/time-sync; safe to run any time |
+| `compose-redeploy` | generic container redeploy | `app_dir` (must be passed) `compose_file=docker-compose.yml` `service=""` `container_name=""` `health_url=""` `git_ref=""` `step_timeout=300` | only uses `--force-recreate --no-deps` when `service` is given, otherwise plain `up -d`; empty `git_ref` / `health_url` / `container_name` skips that check |
+| `disk-cleanup` | reclaim disk | `confirm=no` `cache_keep=2GB` `disk_max=90` `container_name=""` | **reports only unless `confirm=yes`**; prunes stopped containers / dangling images / build cache, then asserts the watermark and that the container is still up |
+| `tls-cert-check` | domain & certificate check: **read-only** | `host` (must be passed) `port=443` `path=/` `min_days=14` | HTTPS reachable with a 2xx code, certificate days-left ≥ threshold (needs `openssl` on the box) |
+| `log-dig` | log triage: **read-only** | `log_path` (must be passed) `lines=500` `pattern=ERROR` `max_hits=0` | counts matches in the last N lines and fails above the threshold; the default verdict is "no ERROR in the last 500 lines" |
+
+```bash
+# copy into a project, then use ecs_runbook validate / ecs_deploy runbook
+cp -r node_modules/dsh-workbench-ecs/templates/runbooks/*.json  .dsh/workbench-ecs/runbooks/
+
+# example: read-only host check — validate, preview, then execute
+#   ecs_runbook  { action: "validate", runbook: "host-check" }
+#   ecs_runbook  { action: "plan",     runbook: "host-check", instance_id: "i-xxx" }
+#   ecs_deploy   { instance_id: "i-xxx", runbook: "host-check", runbook_params: { disk_max: 85, port: "443" } }
+```
+
+Conventions the templates themselves follow:
+
+- **required parameters use a sentinel default** — `"app_dir": "<app_dir>"`; step 0 asserts it away with an actionable message, so a forgotten parameter fails before anything happens on the box;
+- **optional parameters default to an empty string** — the script branches on `if [ -n "${param}" ]`, skipping that check instead of inventing a fake default;
+- **destructive work sits behind a confirmation gate** — `disk-cleanup` only reports unless `confirm=yes`;
+- every template is covered by a **regression guard** in `test/smoke.mjs`: each one must lint with 0 errors and 0 warnings, have defaults for every placeholder, leave no placeholder unsubstituted, and expand into a complete plan — a rotten template turns CI red.
 
 ### `ecs_runbook` — read-only inventory & static checks for workspace runbooks (v0.6.3+)
 

@@ -1,0 +1,35 @@
+{
+  "name": "log-dig",
+  "description": "通用日志排查（只读）：核对日志文件 → 统计最近 N 行里关键字命中数（超过阈值即失败）→ 回显最近命中行。默认阈值 0，即“最近 N 行不出现 ERROR 才算过”。",
+  "params": {
+    "log_path": "<log_path>",
+    "lines": 500,
+    "pattern": "ERROR",
+    "max_hits": 0
+  },
+  "steps": [
+    {
+      "kind": "assert",
+      "description": "日志文件存在且可读",
+      "script": "set -euo pipefail\n[ \"${log_path}\" != '<log_path>' ] || { echo '缺少参数 log_path（远端绝对路径）' >&2; exit 2; }\n[ -f \"${log_path}\" ] || { echo \"日志不存在 ${log_path}\" >&2; exit 3; }\n[ -r \"${log_path}\" ] || { echo \"日志不可读 ${log_path}\" >&2; exit 4; }\necho \"log-ready ${log_path} $(wc -c < \"${log_path}\") 字节\"",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["log-ready"]
+      }
+    },
+    {
+      "kind": "assert",
+      "description": "最近 ${lines} 行里 /${pattern}/ 命中数 ≤ ${max_hits}",
+      "script": "set -euo pipefail\nHITS=$(tail -n ${lines} \"${log_path}\" | grep -cE -- \"${pattern}\" || true)\necho \"log-hits=${pattern} -> $HITS（最近 ${lines} 行）\"\n[ \"$HITS\" -le ${max_hits} ] || { echo \"log-too-many-hits $HITS > ${max_hits}\" >&2; exit 5; }\necho log-threshold-ok",
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": ["log-threshold-ok"]
+      }
+    },
+    {
+      "kind": "exec",
+      "description": "回显最近 20 条命中行（便于定位）",
+      "script": "set -u\ntail -n ${lines} \"${log_path}\" | grep -E -- \"${pattern}\" | tail -n 20 || echo \"no-hits（最近 ${lines} 行没有匹配 ${pattern}）\""
+    }
+  ]
+}
