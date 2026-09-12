@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.3.7 · MIT License
+> v0.4.0 · MIT License
 
 [English](./README.md) | 中文
 
@@ -15,10 +15,15 @@
 - **真实 API 调用**: 工具执行本机 `workbench` 命令, 经阿里云 Workbench 后端连接实例(支持无公网 IP 的实例)
 - **JSON 解析 + 可读渲染**: 解析 CLI 的 JSON 输出, 渲染为表格/文本/终端卡片; CLI 层错误(`{code, message}`)转成可读报错
 - **安全守卫**: 破坏性命令(`rm -rf`、`shutdown`、`reboot`、`mkfs`、`dd`、`iptables -F/-X` 等)自动接入 Harness 审批服务, 未获批准一律拒绝(fail closed)
+- **脚本直送**(v0.4.0+): `ecs_exec` 的 `script` 参数把脚本正文 base64 投递远端落盘后执行, 内容不经过任何 shell 引用层 —— `docker exec ... node -e "..."` 这类多层引号组合、中文、`$`、反引号、heredoc、多行全部**零转义**; 超过 16KB 自动分片投递, 并按字节数校验落盘完整性
+- **只读护栏**(v0.4.0+): `ecs_exec` / `ecs_diagnose` 的 `read_only` 在命令进入 shell 之前拒绝写操作(重定向、`rm`/`mv`/`cp`/`chmod`、`docker` 变更、`systemctl` 变更、`nohup` 等); `ecs_diagnose` **默认开启**, 且预置诊断脚本零误杀
+- **传输完整性**(v0.4.0+): `ecs_upload.verify_sha256` 上传后比对本地/远端 sha256; `ecs_deploy` 默认开启, 校验不一致时**中止发布**(不会拿损坏的发布物去重启), 本地哈希经 `sha256sum`/`shasum`/`certutil` 计算, 不依赖额外运行时
 - **后台任务**: `ecs_exec` 支持 `run_in_background` — 长命令注册到 jobs, 可 `job_output` 增量读取、`job_kill` 终止
 - **批量执行**: `ecs_exec` 支持 `instance_ids` 数组(串行, 单台失败不中断), 适合集群排查
 - **同实例串行化**: 同一实例上的操作按 FIFO 逐个执行, 并发调用不会经由共享的 Workbench 会话互相串流; 不同实例仍可并行。长时间后台任务会一直占用该实例的名额直到结束
 - **大输出 spill**: stdout 超限自动落盘并返回完整输出路径, 日志排查不再截断丢头
+- **输出清洗**: 默认剔除 ANSI 转义、控制字符与 CLI 进度帧(spinner/百分比条), 日志与上传结果直接可读(`strip_ansi: false` 可关闭)
+- **可靠退出码**: 以 CLI JSON 中的远端 `exit_code` 为准(而非本地进程退出码), 并带回 `request_id`/`session_id` 便于事后核对隔离性
 - **健壮二进制解析**: 按 PATH 解析 `workbench`, 失败时回退常见安装位置(如 `C:\Program Files\workbench\workbench.exe`), 解决宿主进程 PATH 过期问题
 - **取消支持**: 工具调用被取消时自动终止进程树(SIGTERM → SIGKILL), 不留孤儿进程
 
@@ -44,7 +49,7 @@ dsh plugin --profile web add dsh-workbench-ecs
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.7"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.4.0"}
 ```
 
 然后让 Agent 调用:
@@ -277,12 +282,28 @@ CLI 对应: `workbench exec --instance-id <id> --command <cmd> [--timeout <s>] -
 |---|---|---|---|
 | `instance_id` | string | | 目标实例 ID(与 `instance_ids` 二选一) |
 | `instance_ids` | array\<string\> | | 批量目标(串行, 最多 20 台, 单台失败不中断) |
-| `command` | string | ✅ | 远程命令; 需要共享上下文时用 `&&` 或 `;` 串联 |
-| `timeout` | integer | | 命令超时(秒), 默认 30 |
+| `command` | string | | 远程命令(与 `script` 二选一); 需要共享上下文时用 `&&` 或 `;` 串联 |
+| `script` | string | | 脚本正文(与 `command` 二选一)。**零转义**: base64 投递远端落盘后执行, 引号/中文/`$`/反引号/多行/heredoc 都不需要处理 |
+| `shell` | `bash`\|`sh` | | `script` 模式的远端解释器, 默认 `bash` |
+| `keep_script` | boolean | | 保留远端临时脚本文件(默认 false, 执行后删除) |
+| `read_only` | boolean | | 只读护栏: 命中写操作模式直接拒绝(默认 false) |
+| `description` | string | | 本次用途简述(展示在任务列表与卡片标题) |
+| `strip_ansi` | boolean | | 清洗 ANSI/控制字符/进度帧(默认 true) |
+| `timeout` | integer | | 远端命令超时(秒), 默认 60(显式下发; CLI 自身默认仅 30) |
 | `region` | string | | 地域, 可缺省(CLI 从实例 ID 自动推断) |
 | `run_in_background` | boolean | | 后台执行长命令: 立即返回 `job_id`, `job_output` 增量读取(不适用于批量) |
 
-返回 `{ kind: single|batch|background, ... }`。
+返回 `{ kind: single|batch|background, ... }`(含 `exit_code` / `request_id` / `session_id`)。
+
+**什么时候用 `script`**: 命令里出现任何嵌套引号就一律用它。典型对比 ——
+
+```text
+# 容易碎(要穿透远端 sh -c + docker exec + node -e 三层引号)
+ecs_exec { instance_id: "i-xxx", command: "docker exec app node -e \"console.log('hi')\"" }
+
+# 零转义(推荐)
+ecs_exec { instance_id: "i-xxx", script: "docker exec app node -e \"console.log('hi')\"" }
+```
 
 ### `ecs_upload` —— 上传本地文件到实例
 
@@ -291,12 +312,13 @@ CLI 对应: `workbench upload <local-file> <remote-path> --instance-id <id> [--f
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `local_file` | string | ✅ | 本地文件路径(相对路径基于会话工作区) |
-| `remote_path` | string | ✅ | 远端目标路径(文件或目录) |
+| `remote_path` | string | ✅ | 远端目标路径(以分隔符结尾视为目录, 自动拼接文件名) |
 | `instance_id` | string | ✅ | 目标实例 ID |
 | `region` | string | | 地域, 可缺省 |
 | `force` | boolean | | 覆盖远端已存在文件而不需确认(默认 false) |
+| `verify_sha256` | boolean | | 上传后比对本地/远端 sha256(默认 false; 发布关键路径建议开启) |
 
-经阿里云 OSS 中继传输(最大 1GB)。搭配 `ecs_deploy` / `ecs_exec` 完成发布。
+经阿里云 OSS 中继传输(最大 1GB)。返回 `verification`(`ok` / `mismatch` / `remote-unavailable` / `local-tool-unavailable`)与两侧摘要。搭配 `ecs_deploy` / `ecs_exec` 完成发布。
 
 ### `ecs_download` —— 从实例下载文件到本地
 
@@ -320,12 +342,15 @@ CLI 对应: 一次远程 `exec`(分号串联的只读命令集)
 |---|---|---|---|
 | `instance_id` | string | ✅ | 目标实例 ID |
 | `region` | string | | 地域, 可缺省 |
-| `extra_command` | string | | 追加的自定义只读命令(会被安全守卫检查) |
-| `timeout` | integer | | 超时(秒), 默认 120 |
+| `extra_command` | string | | 追加的自定义只读命令 |
+| `read_only` | boolean | | 只读护栏, **默认 true**; 传 `false` 才允许 `extra_command` 中写入 |
+| `description` | string | | 本次体检用途简述 |
+| `strip_ansi` | boolean | | 清洗 ANSI/控制字符/进度帧(默认 true) |
+| `timeout` | integer | | 超时(秒), 默认 120(显式下发) |
 
 内置 7 段: 主机信息 / 负载与运行时长 / 内存 / 磁盘 / 运行服务与容器(docker ps)/ 内存 TOP 进程 / 监听端口。**生产排障的起始动作** —— 一个工具代替一串命令。
 
-### `ecs_deploy` —— 受控发布(上传 + 重启 + 健康检查)
+### `ecs_deploy` —— 受控发布(上传 + 校验 + 重启 + 健康检查)
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -334,9 +359,10 @@ CLI 对应: 一次远程 `exec`(分号串联的只读命令集)
 | `local_file` | string | | 可选: 要上传的本地文件 |
 | `remote_path` | string | | 可选: 上传目标远端路径(local_file 提供时必填) |
 | `health_check` | string | | 可选: 健康检查命令, 如 `curl -fsS http://127.0.0.1/health \|\| true` |
-| `region` / `force` / `timeout` | | | 同前 |
+| `verify_sha256` | boolean | | 上传后校验 sha256, **默认 true**; 不一致即中止发布(不执行重启) |
+| `region` / `force` / `timeout` | | | 地域 / 覆盖确认 / 每阶段超时(秒, 默认 180) |
 
-三段流程结果全部返回(任一失败不中断后续阶段): 上传 → 重启 → 健康检查。**"改代码 → 上传 → 重启 → 验证"的完整修复闭环**。
+四段流程结果全部返回(阶段内失败不中断后续阶段): 上传 → sha256 校验 → 重启 → 健康检查; 唯一例外是**校验失败会中止**(见 `aborted` / `abort_reason`), 避免用损坏的发布物重启服务。**"改代码 → 上传 → 校验 → 重启 → 验证"的完整修复闭环**。
 
 ### `ecs_session` —— 会话管理
 
@@ -353,7 +379,9 @@ CLI 对应: `workbench session list` / `workbench session close <id>` / `--all`
 ## 安全机制
 
 - **破坏性命令守卫**: `ecs_exec` / `ecs_deploy`(重启命令与健康检查)执行前扫描命令, 命中 `rm -rf`、`shutdown`/`poweroff`/`reboot`/`halt`、`mkfs`、`dd`、`init 0/6`、`systemctl stop/disable/mask`、`service stop`、`iptables -F/-X`、`userdel`/`groupdel` 等模式时, 接入 Harness `approval` 服务请求确认; 未获 `allowed-once`(或无审批服务/政策为 never)一律拒绝执行(fail closed)。
-- **只读体检**: `ecs_diagnose` 内置命令均为只读; 自定义命令同样过守卫。
+- **只读护栏**(v0.4.0+): `read_only=true` 时在命令进入 shell 之前拒绝写操作 —— 非 `/dev/null` 重定向、`rm`/`mv`/`cp`/`mkdir`/`touch`/`chmod`/`chown`/`truncate`、`tee`、`sed -i`、`docker`/`docker compose` 变更、`systemctl`/`service` 状态变更、包管理与 `git` 写操作、`kill`/`nohup`、`crontab`/用户管理、`find -delete/-exec` 等。这是**防呆**, 不是权限边界(动态拼接仍可绕过), 强约束仍走审批。
+- **只读体检**: `ecs_diagnose` 内置命令均为只读并默认开启护栏; 自定义命令同样过守卫。
+- **传输完整性**: `ecs_upload.verify_sha256` / `ecs_deploy.verify_sha256`(默认开启)比对本地与远端 sha256, 损坏的发布物在重启前就会被拦下。
 - **文件传输确认**: `ecs_upload`/`ecs_download` 默认对已存在文件要求确认, `force=true` 才覆盖。
 - **凭据安全**: 凭据只存在本机 `~/.workbench/config.json`(0600), 建议用 RamRoleArn/CredentialsCmd/CredentialsURI 模式而非长期 AK。
 
@@ -369,7 +397,13 @@ ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
 # 3. 看日志
 ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "cd /var/log/nginx && tail -n 100 error.log" }
 
-# 4. 修改代码后受控发布(上传 + 重启 + 健康检查)
+# 3b. 复杂命令一律用 script(零转义, 含容器内验证)
+ecs_exec {
+  instance_id: "i-uf66ct2o35p7fjcd0sru",
+  script: "docker exec nailong-server node -e \"fetch('http://127.0.0.1/health').then(r=>console.log(r.status))\""
+}
+
+# 4. 修改代码后受控发布(上传 + sha256 校验 + 重启 + 健康检查)
 ecs_deploy {
   instance_id: "i-uf66ct2o35p7fjcd0sru",
   local_file: "./app.jar", remote_path: "/opt/app/app.jar",
@@ -419,7 +453,8 @@ ecs_exec: workbench CLI 错误 (code 1): session resolve: login instance: SDKErr
 
 ```bash
 npm install          # 安装 devDependencies(@deepseek-ai/dsh-tools)
-npm test             # 冒烟测试: 模块导出 + 7 工具注册契约 + body 一致性
+npm test             # 单元回归(不触达实例) + 冒烟测试(模块导出 + 7 工具注册契约 + body 一致性)
+npm run test:unit    # 只跑单元回归: base64/只读护栏/超时默认/输出清洗/sha256 链路
 npm run test:e2e     # 真实 CLI 端到端测试(需要本机 Workbench CLI + 有效凭据 + 可达实例)
 npm run build:body   # 生成动态挂载用 body(与 lib/ 同源)
 ```

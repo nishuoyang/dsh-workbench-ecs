@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.3.7 · MIT License
+> v0.4.0 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -15,10 +15,15 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 - **Real API calls**: tools run the local `workbench` command and reach instances through the Alibaba Cloud Workbench backend (works for instances **without public IPs**)
 - **JSON parsing + readable rendering**: parses CLI JSON output into tables/text/terminal cards; CLI-level errors (`{code, message}`) become readable messages
 - **Safety guard**: destructive commands (`rm -rf`, `shutdown`, `reboot`, `mkfs`, `dd`, `iptables -F/-X`, …) request confirmation through the Harness approval service; anything not `allowed-once` is rejected (fail closed)
+- **Script delivery** (v0.4.0+): `ecs_exec`'s `script` parameter base64-delivers the body to a remote file and executes it, so the content never passes through a shell quoting layer — `docker exec ... node -e "..."`, Chinese text, `$`, backticks, heredocs and multi-line scripts all work with **zero escaping**; bodies over 16KB are delivered in chunks and verified by byte count
+- **Read-only guard** (v0.4.0+): `read_only` on `ecs_exec` / `ecs_diagnose` rejects write operations before they reach a shell (redirects, `rm`/`mv`/`cp`/`chmod`, `docker`/`systemctl` mutations, `nohup`, …); on by default for `ecs_diagnose`, with zero false positives on the built-in diagnostic script
+- **Transfer integrity** (v0.4.0+): `ecs_upload.verify_sha256` compares local/remote digests after upload; `ecs_deploy` enables it by default and **aborts before restart** on a mismatch. Local hashing uses `sha256sum`/`shasum`/`certutil`, so no extra runtime is required
 - **Background jobs**: `ecs_exec` supports `run_in_background` — long commands register with jobs, `job_output` reads incrementally, `job_kill` cancels
 - **Batch execution**: `ecs_exec` supports an `instance_ids` array (serial; per-instance failures do not stop others)
 - **Per-instance serialization**: operations touching the same instance run one at a time (FIFO), so concurrent calls can never interleave output through the shared Workbench session; different instances still run in parallel. A long background task holds its instance's slot until it finishes
 - **Large-output spill**: oversized stdout spills to disk with the full path returned, so log triage never loses the head
+- **Output cleanup**: ANSI escapes, control characters and CLI progress frames (spinners, percentage bars) are stripped by default, so logs and upload results stay readable (`strip_ansi: false` opts out)
+- **Reliable exit codes**: the remote `exit_code` from the CLI's JSON is authoritative (rather than the local process status), and `request_id`/`session_id` come back for after-the-fact isolation checks
 - **Robust binary resolution**: resolves `workbench` via PATH and falls back to common install locations (e.g. `C:\Program Files\workbench\workbench.exe`), handling stale host-process PATH
 - **Cancellation support**: aborted tool calls terminate the process tree (SIGTERM → SIGKILL), leaving no orphan processes
 
@@ -44,7 +49,7 @@ That's it — the bundle layer inserts the plugin row into the web profile: the 
 
 ```bash
 curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.3.7"}
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.4.0"}
 ```
 
 Then ask the Agent:
@@ -277,12 +282,28 @@ CLI equivalent: `workbench exec --instance-id <id> --command <cmd> [--timeout <s
 |---|---|---|---|
 | `instance_id` | string | | Target instance ID (alternate with `instance_ids`) |
 | `instance_ids` | array\<string\> | | Batch targets (serial, max 20, per-instance failures do not stop others) |
-| `command` | string | ✅ | Remote command; chain with `&&` or `;` when shared context is needed |
-| `timeout` | integer | | Command timeout in seconds, default 30 |
+| `command` | string | | Remote command (alternate with `script`); chain with `&&` or `;` when shared context is needed |
+| `script` | string | | Script body (alternate with `command`). **Zero escaping**: the text is base64-delivered to a remote file and executed, so quotes, Chinese, `$`, backticks, multi-line and heredocs need no handling |
+| `shell` | `bash`\|`sh` | | Interpreter for `script` mode, default `bash` |
+| `keep_script` | boolean | | Keep the remote temp script (default false; removed after execution) |
+| `read_only` | boolean | | Read-only guard: reject write operations (default false) |
+| `description` | string | | Short purpose note (shown in the job list and card title) |
+| `strip_ansi` | boolean | | Strip ANSI/control chars/progress frames (default true) |
+| `timeout` | integer | | Remote command timeout in seconds, default 60 (always sent explicitly; the CLI default is only 30) |
 | `region` | string | | Region, optional (CLI infers it from the instance ID) |
 | `run_in_background` | boolean | | Run long commands in the background: returns a `job_id`, read with `job_output` (not for batches) |
 
-Returns `{ kind: single|batch|background, ... }`.
+Returns `{ kind: single|batch|background, ... }` (including `exit_code` / `request_id` / `session_id`).
+
+**When to use `script`**: whenever the command contains nested quotes. Compare —
+
+```text
+# Fragile (three quoting layers: remote sh -c + docker exec + node -e)
+ecs_exec { instance_id: "i-xxx", command: "docker exec app node -e \"console.log('hi')\"" }
+
+# Zero escaping (recommended)
+ecs_exec { instance_id: "i-xxx", script: "docker exec app node -e \"console.log('hi')\"" }
+```
 
 ### `ecs_upload` — upload a local file to an instance
 
@@ -291,12 +312,13 @@ CLI equivalent: `workbench upload <local-file> <remote-path> --instance-id <id> 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `local_file` | string | ✅ | Local file path (relative paths resolve against the session workspace) |
-| `remote_path` | string | ✅ | Remote target path (file or directory) |
+| `remote_path` | string | ✅ | Remote target path (a trailing separator means directory; the file name is appended) |
 | `instance_id` | string | ✅ | Target instance ID |
 | `region` | string | | Region, optional |
 | `force` | boolean | | Overwrite an existing remote file without confirmation (default false) |
+| `verify_sha256` | boolean | | Compare local/remote sha256 after upload (default false; recommended on release paths) |
 
-Transfers through Alibaba Cloud OSS (up to 1GB). Pair with `ecs_deploy` / `ecs_exec` for deployments.
+Transfers through Alibaba Cloud OSS (up to 1GB). Returns `verification` (`ok` / `mismatch` / `remote-unavailable` / `local-tool-unavailable`) plus both digests. Pair with `ecs_deploy` / `ecs_exec` for deployments.
 
 ### `ecs_download` — download a file from an instance
 
@@ -320,12 +342,15 @@ CLI equivalent: one remote `exec` (semicolon-joined read-only command set)
 |---|---|---|---|
 | `instance_id` | string | ✅ | Target instance ID |
 | `region` | string | | Region, optional |
-| `extra_command` | string | | Extra read-only command (also passes the safety guard) |
-| `timeout` | integer | | Timeout in seconds, default 120 |
+| `extra_command` | string | | Extra read-only command |
+| `read_only` | boolean | | Read-only guard, **default true**; pass `false` to allow writes in `extra_command` |
+| `description` | string | | Short purpose note |
+| `strip_ansi` | boolean | | Strip ANSI/control chars/progress frames (default true) |
+| `timeout` | integer | | Timeout in seconds, default 120 (always sent explicitly) |
 
 Built-in 7 sections: host info / uptime & load / memory / disk / running services & containers (`docker ps`) / top memory processes / listening ports. **The starting point of production debugging** — one tool instead of a command string.
 
-### `ecs_deploy` — guarded deployment (upload + restart + health check)
+### `ecs_deploy` — guarded deployment (upload + verify + restart + health check)
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -334,9 +359,10 @@ Built-in 7 sections: host info / uptime & load / memory / disk / running service
 | `local_file` | string | | Optional local file to upload |
 | `remote_path` | string | | Upload target path (required when `local_file` is set) |
 | `health_check` | string | | Optional health-check command, e.g. `curl -fsS http://127.0.0.1/health \|\| true` |
-| `region` / `force` / `timeout` | | | As above |
+| `verify_sha256` | boolean | | Verify sha256 after upload, **default true**; a mismatch aborts the deployment before restart |
+| `region` / `force` / `timeout` | | | Region / overwrite confirmation / per-phase timeout in seconds (default 180) |
 
-All three phases return their results (a failing phase does not stop later ones): upload → restart → health check. **The complete *edit → upload → restart → verify* fix loop.**
+All phases return their results (a failing phase does not stop later ones): upload → sha256 verify → restart → health check — with the one exception that a verification failure aborts (`aborted` / `abort_reason`), so a corrupt artifact never gets deployed. **The complete *edit → upload → verify → restart → verify* fix loop.**
 
 ### `ecs_session` — session management
 
@@ -353,7 +379,9 @@ Normally unnecessary (sessions are auto-managed); used for diagnostics and resou
 ## Safety
 
 - **Destructive-command guard**: before execution, `ecs_exec` and `ecs_deploy` (restart command and health check) scan the command; matches against `rm -rf`, `shutdown`/`poweroff`/`reboot`/`halt`, `mkfs`, `dd`, `init 0/6`, `systemctl stop/disable/mask`, `service stop`, `iptables -F/-X`, `userdel`/`groupdel` go through the Harness `approval` service; anything not `allowed-once` (no approver, or policy `never`) is rejected (fail closed).
-- **Read-only diagnostics**: `ecs_diagnose` sections are read-only; custom commands still pass the guard.
+- **Read-only guard** (v0.4.0+): with `read_only=true`, write operations are rejected before the command reaches a shell — redirects other than `/dev/null`, `rm`/`mv`/`cp`/`mkdir`/`touch`/`chmod`/`chown`/`truncate`, `tee`, `sed -i`, `docker`/`docker compose` mutations, `systemctl`/`service` state changes, package managers, `git` writes, `kill`/`nohup`, `crontab`/user management, `find -delete/-exec`. This is a guard rail, not a sandbox (dynamic assembly can still evade it); hard enforcement stays with the approval service.
+- **Read-only diagnostics**: `ecs_diagnose` sections are read-only and the guard is on by default; custom commands still pass the safety guard.
+- **Transfer integrity**: `ecs_upload.verify_sha256` / `ecs_deploy.verify_sha256` (on by default for deploys) compare local and remote sha256 so a corrupt artifact is caught before any restart.
 - **Transfer confirmation**: `ecs_upload`/`ecs_download` require confirmation on existing files unless `force=true`.
 - **Credential hygiene**: credentials live only in local `~/.workbench/config.json` (0600); prefer RamRoleArn/CredentialsCmd/CredentialsURI over long-lived AK.
 
@@ -369,7 +397,13 @@ ecs_diagnose { instance_id: "i-uf66ct2o35p7fjcd0sru" }
 # 3. Inspect logs
 ecs_exec { instance_id: "i-uf66ct2o35p7fjcd0sru", command: "cd /var/log/nginx && tail -n 100 error.log" }
 
-# 4. Guarded deployment after fixing the code
+# 3b. Use script for anything with nested quotes (zero escaping, incl. in-container checks)
+ecs_exec {
+  instance_id: "i-uf66ct2o35p7fjcd0sru",
+  script: "docker exec nailong-server node -e \"fetch('http://127.0.0.1/health').then(r=>console.log(r.status))\""
+}
+
+# 4. Guarded deployment after fixing the code (upload + sha256 verify + restart + health check)
 ecs_deploy {
   instance_id: "i-uf66ct2o35p7fjcd0sru",
   local_file: "./app.jar", remote_path: "/opt/app/app.jar",
@@ -419,7 +453,8 @@ ecs_exec: workbench CLI 错误 (code 1): session resolve: login instance: SDKErr
 
 ```bash
 npm install          # install devDependencies (@deepseek-ai/dsh-tools)
-npm test             # smoke test: module exports + 7-tool registration contract + body consistency
+npm test             # unit regressions (no instance needed) + smoke test: module exports + 7-tool contract + body consistency
+npm run test:unit    # unit regressions only: base64 / read-only guard / timeout defaults / output cleanup / sha256
 npm run test:e2e     # real-CLI end-to-end test (needs local Workbench CLI, valid credentials, a reachable instance)
 npm run build:body   # generate the dynamic-mount body (same origin as lib/)
 ```

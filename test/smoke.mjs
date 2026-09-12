@@ -12,9 +12,11 @@ import { readFileSync } from 'node:fs'
 import { name, inject, apply } from '../lib/index.js'
 
 // 全部工具的必填参数契约
+// 注意: ecs_exec 的 command 自 v0.4.0 起与 script 二选一, 两者都可缺省
+// (由 execute 内部校验), 因此必填列表为空。
 const EXPECTED = {
   ecs_list: ['region'],
-  ecs_exec: ['command'],
+  ecs_exec: [],
   ecs_upload: ['local_file', 'remote_path', 'instance_id'],
   ecs_download: ['remote_path', 'instance_id'],
   ecs_diagnose: ['instance_id'],

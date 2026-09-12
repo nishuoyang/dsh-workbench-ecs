@@ -41,7 +41,8 @@ function readerFor(chunks) {
 const fakeSubprocess = {
   async resolveExecutable(name) {
     if (name === 'workbench') return WORKBENCH_EXE
-    throw new Error('unresolved: ' + name)
+    // 其它本机程序(sha256sum/shasum/certutil 等)交给 PATH 解析
+    return name
   },
   spawn(spec) {
     const child = spawn(spec.argv[0], spec.argv.slice(1), {
@@ -132,9 +133,108 @@ await run('ecs_exec 单实例(真实命令)', async () => {
   assert.equal(value.kind, 'single')
   assert.ok(value.output.includes('e2e-ok-123'), '输出应包含 e2e-ok-123')
   assert.equal(value.exit_code, 0)
+  // D1 回归: 工具声明的默认超时必须显式下发(CLI 默认仅 30s)
+  assert.ok(value.command_line.includes('--timeout 60'), '默认超时应显式下发 60, 实际: ' + value.command_line)
+  // 排障字段: request_id/session_id 便于事后核对隔离性
+  assert.ok(typeof value.request_id === 'string' && value.request_id.startsWith('r-'), '应带回 request_id, 实际: ' + value.request_id)
+  assert.ok(typeof value.session_id === 'string', '应带回 session_id')
   assertLossless('ecs_exec single value', value)
   assertLossless('ecs_exec single presentationMeta', def.output.presentationMeta(args, value))
   assertLossless('ecs_exec single presentCall', def.presentCall(args))
+})
+
+// ---- S1 脚本直送: 引号/中文/$/反引号/heredoc/多行 全部零转义 ----
+await run('ecs_exec script 模式(10 类转义敏感构造)', async () => {
+  const def = ecsExecDefinition(ctx)
+  const script = [
+    'echo "T1:outer \'inner\' done"',
+    'echo "T2:中文输出-OK"',
+    'V=abc; echo "T3:value=$V"',
+    'echo "T4:backtick=`echo bt-ok`"',
+    "cat <<'EOF'",
+    'T5:heredoc line',
+    'EOF',
+    'echo "T6:it\'s fine"',
+    "printf 'T7:%s\\n' 'a\\b\\c'",
+    'ls /dsh-nonexistent-dir 2>/dev/null; echo "T8:redirect-ok"',
+    'echo "T9:$(uname -n)"',
+    'echo "T10:quote\\"inside\\"done"',
+  ].join('\n')
+  const args = { instance_id: INSTANCE_ID, script, description: 'e2e script 转义回归' }
+  const value = await def.execute(args, makeExec('ecs_exec'))
+  assert.equal(value.kind, 'single')
+  assert.equal(value.exit_code, 0, 'script 应执行成功, stderr: ' + value.stderr)
+  for (let i = 1; i <= 10; i++) {
+    assert.ok(value.output.includes('T' + i + ':'), '脚本输出应含 T' + i + ' 段, 实际: ' + value.output)
+  }
+  assert.ok(value.output.includes("T1:outer 'inner' done"), '双引号嵌套应原样保留')
+  assert.ok(value.output.includes('T2:中文输出-OK'), '中文应原样保留')
+  assert.ok(value.output.includes('T5:heredoc line'), 'heredoc 应可用')
+  assert.ok(value.script_mode === true, '应标记 script_mode')
+  assert.ok(value.script_bytes > 100, '应回报脚本字节数')
+  assert.equal(value.script_truncated, false)
+  assertLossless('ecs_exec script value', value)
+  assertLossless('ecs_exec script presentationMeta', def.output.presentationMeta(args, value))
+  assertLossless('ecs_exec script presentCall', def.presentCall(args))
+})
+
+await run('ecs_exec script 模式: >16KB 分片投递', async () => {
+  const def = ecsExecDefinition(ctx)
+  const lines = []
+  for (let i = 0; i < 1500; i++) lines.push('echo "big-' + i + '"')
+  lines.push('echo BIG-SCRIPT-DONE')
+  const script = lines.join('\n')
+  assert.ok(Buffer.byteLength(script, 'utf8') > 16 * 1024, '脚本应大于内联阈值, 实际 ' + Buffer.byteLength(script, 'utf8'))
+  const value = await def.execute({ instance_id: INSTANCE_ID, script, description: 'e2e 大脚本分片' }, makeExec('ecs_exec'))
+  assert.equal(value.exit_code, 0, '大脚本应执行成功, stderr: ' + value.stderr)
+  assert.ok(value.output.includes('big-1499'), '应执行到脚本末尾')
+  assert.ok(value.output.includes('BIG-SCRIPT-DONE'), '应含结束标记')
+  assert.ok(value.script_bytes > 16 * 1024, '应回报真实字节数')
+  assertLossless('ecs_exec big script value', value)
+})
+
+await run('ecs_exec script 模式: 容器内 node -e(反馈 F1 原始场景)', async () => {
+  const probe = await ecsExecDefinition(ctx).execute(
+    { instance_id: INSTANCE_ID, command: "docker ps --format '{{.Names}}'" },
+    makeExec('ecs_exec'),
+  )
+  const container = probe.output.split('\n').map((s) => s.trim()).find((s) => s.length > 0)
+  if (container === undefined) {
+    console.log('    (跳过: 该实例上没有运行中的容器)')
+    return
+  }
+  const def = ecsExecDefinition(ctx)
+  const script = 'docker exec ' + container + ' node -e "console.log(JSON.stringify({ok:true,msg:\\"容器内引号 OK\\"}))"'
+  const value = await def.execute({ instance_id: INSTANCE_ID, script, description: 'e2e 容器内 node -e' }, makeExec('ecs_exec'))
+  assert.equal(value.exit_code, 0, '容器内 node -e 应成功, stderr: ' + value.stderr)
+  assert.ok(value.output.includes('"ok":true') || value.output.includes('"ok": true'), '应拿到 JSON 输出, 实际: ' + value.output)
+  assert.ok(value.output.includes('容器内引号 OK'), '容器内中文/引号应原样返回')
+})
+
+await run('ecs_exec: command 与 script 二选一校验', async () => {
+  const def = ecsExecDefinition(ctx)
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID, command: 'echo a', script: 'echo b' }, makeExec('ecs_exec')),
+    /二选一/,
+  )
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID }, makeExec('ecs_exec')),
+    /必须提供 command 或 script/,
+  )
+})
+
+// ---- S6 只读护栏 ----
+await run('ecs_exec read_only: 拒绝写命令, 放行只读命令', async () => {
+  const def = ecsExecDefinition(ctx)
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID, command: 'echo x > /tmp/dsh-e2e-should-not-exist', read_only: true }, makeExec('ecs_exec')),
+    /read_only|写操作/,
+    'read_only 下应拒绝重定向写入',
+  )
+  const value = await def.execute({ instance_id: INSTANCE_ID, command: 'echo readonly-ok', read_only: true }, makeExec('ecs_exec'))
+  assert.equal(value.read_only, true)
+  assert.ok(value.output.includes('readonly-ok'))
+  assertLossless('ecs_exec read_only value', value)
 })
 
 await run('ecs_exec 批量(1 成功 + 1 失败)', async () => {
@@ -222,14 +322,41 @@ const tmpDir = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-'))
 const localFile = join(tmpDir, 'e2e-upload.txt')
 writeFileSync(localFile, 'hello-from-dsh-e2e\n')
 
-await run('ecs_upload(真实上传)', async () => {
+await run('ecs_upload(真实上传 + sha256 校验)', async () => {
   const def = ecsUploadDefinition(ctx)
   const value = await def.execute(
-    { local_file: localFile, remote_path: '/tmp/dsh-e2e-upload.txt', instance_id: INSTANCE_ID, force: true },
+    { local_file: localFile, remote_path: '/tmp/dsh-e2e-upload.txt', instance_id: INSTANCE_ID, force: true, verify_sha256: true },
     makeExec('ecs_upload'),
   )
-  assert.equal(value.exit_code, 0, '上传应成功')
+  assert.equal(value.exit_code, 0, '上传应成功, 实际 exit=' + value.exit_code + ' message=' + String(value.message).slice(0, 400))
+  assert.equal(value.verification, 'ok', 'sha256 应校验通过, 实际: ' + value.verification)
+  assert.equal(value.sha256_ok, true)
+  assert.match(String(value.sha256_local), /^[0-9a-f]{64}$/, '应回报 64 位十六进制摘要')
+  assert.equal(value.sha256_local, value.sha256_remote)
   assertLossless('ecs_upload value', value)
+})
+
+await run('ecs_upload(目录语义: remote_path 以 / 结尾)', async () => {
+  const def = ecsUploadDefinition(ctx)
+  const value = await def.execute(
+    { local_file: localFile, remote_path: '/tmp/', instance_id: INSTANCE_ID, force: true, verify_sha256: true },
+    makeExec('ecs_upload'),
+  )
+  assert.equal(value.exit_code, 0, '上传应成功, 实际 exit=' + value.exit_code + ' message=' + String(value.message).slice(0, 400))
+  assert.equal(value.verification, 'ok', '目录语义下也应按 <dir>/<basename> 校验通过')
+  assertLossless('ecs_upload dir value', value)
+})
+
+await run('sha256 断言: 不同内容摘要不同(损坏可被发现)', async () => {
+  const other = join(tmpDir, 'e2e-other.txt')
+  writeFileSync(other, 'a-different-payload\n')
+  const { localSha256, remoteSha256 } = await import('../lib/common.js')
+  const h1 = await localSha256(ctx, localFile)
+  const h2 = await localSha256(ctx, other)
+  const remoteH1 = await remoteSha256(ctx, INSTANCE_ID, '/tmp/dsh-e2e-upload.txt')
+  assert.ok(h1 !== undefined && h2 !== undefined, '本机应能计算 sha256')
+  assert.notEqual(h1, h2, '不同内容摘要必须不同')
+  assert.equal(remoteH1, h1, '远端摘要应与本机一致(校验判据)')
 })
 
 await run('ecs_download(真实下载并校验内容)', async () => {
@@ -250,8 +377,19 @@ await run('ecs_diagnose(一键体检)', async () => {
   assert.equal(value.exit_code, 0)
   assert.ok(value.output.includes('1/7') || value.output.includes('主机信息'), '体检输出应含分段标记')
   assert.ok(value.output.includes('docker') || value.output.includes('systemctl'), '体检输出应含服务段')
+  // v0.4.0: 默认只读护栏 + 默认超时显式下发
+  assert.equal(value.read_only, true, '诊断应默认开启只读护栏')
+  assert.ok(value.command_line.includes('--timeout 120'), '默认超时应显式下发 120, 实际: ' + value.command_line)
   assertLossless('ecs_diagnose value', value)
   assertLossless('ecs_diagnose presentationMeta', def.output.presentationMeta({}, value))
+})
+
+await run('ecs_diagnose: extra_command 写入被只读护栏拒绝', async () => {
+  const def = ecsDiagnoseDefinition(ctx)
+  await assert.rejects(
+    def.execute({ instance_id: INSTANCE_ID, extra_command: 'echo x > /tmp/dsh-e2e-diagnose-should-not-exist' }, makeExec('ecs_diagnose')),
+    /read_only|写操作/,
+  )
 })
 
 await run('ecs_session list', async () => {
@@ -276,9 +414,36 @@ await run('ecs_deploy(重启 + 健康检查)', async () => {
   assert.equal(value.done_stage, 2)
   assert.equal(value.ok, true, '两阶段都应成功')
   assert.ok(value.stages[0].output.includes('deploy-restart-ok'))
+  // 显式超时应被原样下发(该用例传了 timeout: 30)
+  assert.ok(value.command_line.includes('--timeout 30'), '显式超时应被采用, 实际: ' + value.command_line)
   assertLossless('ecs_deploy value', value)
   assertLossless('ecs_deploy presentationMeta', def.output.presentationMeta({}, value))
   assertLossless('ecs_deploy presentCall', def.presentCall({ instance_id: INSTANCE_ID, command: 'echo x' }))
+})
+
+await run('ecs_deploy(上传 + 默认开启 sha256 校验)', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const value = await def.execute(
+    {
+      instance_id: INSTANCE_ID,
+      local_file: localFile,
+      remote_path: '/tmp/dsh-e2e-deploy.txt',
+      force: true,
+      command: 'echo deploy-verify-ok',
+    },
+    makeExec('ecs_deploy'),
+  )
+  assert.equal(value.total_stage, 3, '应为 上传 + 校验 + 重启 三阶段')
+  assert.equal(value.done_stage, 3)
+  assert.equal(value.ok, true, '三阶段都应成功: ' + JSON.stringify(value.stages.map((s) => [s.name, s.ok, s.error])))
+  assert.equal(value.aborted, undefined, '校验通过时不应中止')
+  const verifyStage = value.stages.find((s) => s.name.includes('sha256'))
+  assert.ok(verifyStage !== undefined, '应存在 sha256 校验阶段')
+  assert.equal(verifyStage.ok, true)
+  assert.equal(verifyStage.sha256_local, verifyStage.sha256_remote)
+  // D1 回归: 未传 timeout 时必须显式下发默认的 180
+  assert.ok(value.command_line.includes('--timeout 180'), '默认阶段超时应为 180, 实际: ' + value.command_line)
+  assertLossless('ecs_deploy upload value', value)
 })
 
 console.log('')
