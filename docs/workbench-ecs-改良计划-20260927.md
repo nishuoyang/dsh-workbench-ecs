@@ -337,7 +337,15 @@ read_only=true 命中 3 条写操作模式, 已拒绝执行:
 
 | 版本 | commit | npm | 说明 |
 |---|---|---|---|
-| v0.8.0 | (见本次提交) | ⏳ 未发布 | v0.7.0 + v0.8.0 两批同期完成, **合并为一次提交与一个 tag**; 版本号 0.6.7 → 0.8.0 |
+| v0.8.0 | `c485efc` | ⏳ 未发布 | v0.7.0 + v0.8.0 两批同期完成, **合并为一次提交与一个 tag**(轻量 tag, 与 v0.6.x 一致); 版本号 0.6.7 → 0.8.0 |
+
+发布(如需): 推 tag 会触发 CI 的 test + publish(`NPM_TOKEN` secret 缺失时 Publish 步骤优雅跳过):
+
+```bash
+git push origin main
+git push origin v0.8.0        # 注意: 单次推送 tag 不超过 3 个, 否则 GitHub 不触发 workflow
+# 或不走 CI: npm publish
+```
 
 **开发期踩坑(务必记牢): 不要用 PowerShell 5.1 的 `Get-Content`/`Set-Content` 改本仓库的源码文件。**
 本机 `pwsh` 实际是 Windows PowerShell 5.1: 它把无 BOM 的 UTF-8 文件按 ANSI(GBK) 读入, 再写回时
