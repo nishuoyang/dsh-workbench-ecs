@@ -8,13 +8,14 @@
 // 说明: 本测试只使用只读命令与 /tmp 临时文件, 不会改动生产数据。
 // ============================================================================
 import { spawn } from 'node:child_process'
-import { writeFileSync, readFileSync, mkdtempSync, mkdirSync, readdirSync } from 'node:fs'
+import { writeFileSync, readFileSync, mkdtempSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, isAbsolute, normalize } from 'node:path'
 import assert from 'node:assert'
 import { isJsonValue } from '@deepseek-ai/dsh-session'
 
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
+import { ecsFindDefinition } from '../lib/tools/ecs-find.js'
 import { ecsExecDefinition } from '../lib/tools/ecs-exec.js'
 import { ecsLogDefinition } from '../lib/tools/ecs-log.js'
 import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
@@ -23,8 +24,10 @@ import { ecsDiagnoseDefinition } from '../lib/tools/ecs-diagnose.js'
 import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
 import { ecsSessionDefinition } from '../lib/tools/ecs-session.js'
 import { ecsRunbookDefinition } from '../lib/tools/ecs-runbook.js'
+import { ecsSnapshotDefinition } from '../lib/tools/ecs-snapshot.js'
+import { apply } from '../lib/index.js'
 import { createSettingsCore } from '../lib/settings-api.js'
-import { runWorkbench, localSha256, remoteSha256, delay, hasLocalTimer } from '../lib/common.js'
+import { runWorkbench, localSha256, remoteSha256, delay, hasLocalTimer, REMOTE_TIMEOUT_EXIT_CODE } from '../lib/common.js'
 import { RUNBOOK_DIR } from '../lib/runbooks.js'
 
 const INSTANCE_ID = process.argv[2] ?? 'i-uf66ct2o35p7fjcd0sru'
@@ -90,7 +93,8 @@ function makeCtx(overrides = {}) {
   }
 }
 
-// 最小 fs 服务替身(真实文件系统): 只实现 runbook 机制用到的 resolve/readText/listDir
+// 最小 fs 服务替身(真实文件系统): 实现 runbook 机制与快照清单用到的
+// resolve/readText/writeText/stat/listDir(v0.8.0 快照要真的落盘)
 function nodeFsAdapter(root) {
   return {
     async resolve(p) {
@@ -99,6 +103,18 @@ function nodeFsAdapter(root) {
     },
     async readText(target) {
       return readFileSync(target.targetKey, 'utf8')
+    },
+    async writeText(target, content) {
+      writeFileSync(target.targetKey, content)
+      return { version: 'v1' }
+    },
+    async stat(target) {
+      try {
+        statSync(target.targetKey)
+        return { kind: 'file' }
+      } catch (err) {
+        return undefined
+      }
     },
     async listDir(target) {
       return readdirSync(target.targetKey, { withFileTypes: true }).map((e) => ({ name: e.name }))
@@ -679,6 +695,10 @@ await run('ecs_upload 目录模式: local_dir 不存在时报错(不留本地归
     /归档失败/,
     '本机 tar 失败应给出明确错误',
   )
+  // v0.8.0 回归: tar 失败也会先建出半个归档文件, 清理必须覆盖这一步
+  // (此前归档失败发生在 try 之外, 残留的 .dsh-ecs-upload-*.tar.gz 会一直堆在工作区)
+  const leftovers = readdirSync(process.cwd()).filter((f) => f.startsWith('.dsh-ecs-upload-'))
+  assert.deepEqual(leftovers, [], '归档失败后不得在工作区留下任何 .dsh-ecs-upload-* 残留: ' + leftovers.join(', '))
 })
 
 await run('ecs_download(真实下载并校验内容)', async () => {
@@ -1172,6 +1192,355 @@ await run('D11: 跑书目录取会话工作区(而非部署兜底), 面板 dir �
   const overridden = await coreWithDir.runbookList({ dir: e2eRbDir })
   assert.ok(overridden.ok === true && overridden.runbooks.length >= 3, JSON.stringify(overridden).slice(0, 200))
   assert.ok(String(overridden.dir).replace(/\\/g, '/').endsWith('.dsh/workbench-ecs/runbooks'), overridden.dir)
+})
+
+// ============================================================================
+// v0.7.0 —— 真机核对: F1 跨地域 / D14 超时结算 / A1 实例锚点 / D1 sections /
+//          L1 多路径 / S1 校验默认值 / G1 护栏拒绝信息
+// ============================================================================
+console.log('')
+console.log('== v0.7.0 新增能力(真机) ==')
+
+await run('F1: ecs_find 跨地域找到目标实例(内置地域清单)', async () => {
+  const def = ecsFindDefinition(ctx)
+  const value = await def.execute({ keyword: INSTANCE_ID.slice(0, 10), concurrency: 6 }, makeExec('ecs_find'))
+  assert.ok(value.regions_tried.length >= 10, '应检索内置地域清单: ' + value.regions_tried.length)
+  assert.ok(value.regions_ok >= 5, '大部分地域应查询成功: ' + value.regions_ok)
+  const hit = value.hits.find((h) => h.region === REGION)
+  assert.ok(hit !== undefined, '应在 ' + REGION + ' 命中: ' + JSON.stringify(value.hits.map((h) => h.region)))
+  assert.ok(hit.instances.some((it) => it.instance_id === INSTANCE_ID), '命中实例应为 ' + INSTANCE_ID)
+  assert.ok(value.scanned >= 1)
+  assertLossless('ecs_find value', value)
+  assertLossless('ecs_find presentationMeta', def.output.presentationMeta({}, value))
+  // 只按关键词过滤: 不存在的关键词应为 0 台(而不是把全部实例倒出来)
+  const miss = await def.execute({ keyword: 'no-such-instance-xyz', region: REGION }, makeExec('ecs_find'))
+  assert.equal(miss.total, 0, '不匹配的关键词应为 0 台')
+})
+
+await run('F1: ecs_list 0 台时给出 ecs_find 指引', async () => {
+  const def = ecsListDefinition(ctx)
+  const value = await def.execute({ region: 'cn-hangzhou', instance_name: 'dsh-no-such-instance-*' }, makeExec('ecs_list'))
+  assert.equal(value.count, 0)
+  assert.ok(String(value.empty_hint).includes('ecs_find'), '实际: ' + value.empty_hint)
+})
+
+await run('D14: 远端超时按 124 结算(不再显示成功 + 无输出)', async () => {
+  const def = ecsExecDefinition(ctx)
+  const value = await def.execute(
+    { instance_id: INSTANCE_ID, command: 'sleep 8; echo done-late', timeout: 3, description: 'e2e 超时结算' },
+    makeExec('ecs_exec'),
+  )
+  assert.equal(value.timed_out, true, '应标记超时: ' + JSON.stringify(value))
+  assert.equal(value.exit_code, REMOTE_TIMEOUT_EXIT_CODE, '超时必须结算为 124(此前是 0)')
+  assert.ok(value.duration !== undefined, '应带上实际耗时')
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('远端命令被 CLI 掐断'), text)
+  assert.ok(text.includes('detach=true'), '必须给出 detach 这条下一步: ' + text)
+  assertLossless('ecs_exec timeout value', value)
+  // 反例: 正常命令不应被标记超时
+  const okValue = await def.execute({ instance_id: INSTANCE_ID, command: 'echo ontime' }, makeExec('ecs_exec'))
+  assert.equal(okValue.timed_out, undefined)
+  assert.equal(okValue.exit_code, 0)
+})
+
+await run('A1: 实例锚点(instance_id 写锚点名 + region 自动补齐 + 字段进 runbook 隐式参数)', async () => {
+  // 锚点文件写在真实工作区(临时目录), 通过 apply 注册的工具执行 —— 覆盖工具注册边界
+  const root = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-anchor-'))
+  mkdirSync(join(root, '.dsh', 'workbench-ecs'), { recursive: true })
+  writeFileSync(join(root, '.dsh', 'workbench-ecs', 'instances.json'), JSON.stringify({
+    prod: { instance_id: INSTANCE_ID, region: REGION, repo: '/root/nailonghub' },
+  }))
+  const captured = []
+  const applyCtx = {
+    tools: { register(def) { captured.push(def); return () => {} } },
+    webServer: undefined,
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'subprocess') return fakeSubprocess
+      if (name === 'fs') return nodeFsAdapter(root)
+      if (name === 'sandboxPolicy') return { workspaceRoot: root }
+      return undefined
+    },
+  }
+  apply(applyCtx)
+  const execDef = captured.find((d) => d.name === 'ecs_exec')
+  assert.ok(execDef !== undefined, 'apply 应注册 ecs_exec')
+  const withSession = {
+    name: 'ecs_exec',
+    signal: new AbortController().signal,
+    agent: { session: { header: { cwd: root } } },
+  }
+  const value = await execDef.execute({ instance_id: 'prod', command: 'echo anchor-ok && uname -s' }, withSession)
+  assert.equal(value.exit_code, 0, JSON.stringify(value))
+  assert.ok(String(value.output).includes('anchor-ok'), '锚点名应被解析成真实实例: ' + value.output)
+  assertLossless('ecs_exec via anchor', value)
+
+  // 锚点字段成为 runbook 隐式参数: ${repo} 不需显式传参
+  const deployDef = captured.find((d) => d.name === 'ecs_deploy')
+  const runbook = {
+    name: 'anchor-implicit',
+    steps: [
+      {
+        kind: 'assert',
+        command: 'test "${repo}" = "/root/nailonghub" && echo repo-ok',
+        expect: { stdout_contains: ['repo-ok'] },
+      },
+    ],
+  }
+  const deployed = await deployDef.execute({ instance_id: 'prod', runbook }, withSession)
+  assert.equal(deployed.ok, true, JSON.stringify(deployed.stages))
+  assert.equal(deployed.stages[0].ok, true)
+  assert.equal(deployed.runbook.declared_params.includes('repo'), true, 'runbook 应声明 ${repo}: ' + JSON.stringify(deployed.runbook))
+
+  // 锚点名写错 → 列出可用锚点(而不是把错名字丢给 CLI)
+  await assert.rejects(
+    () => execDef.execute({ instance_id: 'prodd', command: 'echo x' }, withSession),
+    /prod/,
+    '锚点名写错应给出可用锚点',
+  )
+})
+
+await run('D1: ecs_diagnose 按需取段 + 默认不回显命令全文', async () => {
+  const def = ecsDiagnoseDefinition(ctx)
+  const value = await def.execute(
+    { instance_id: INSTANCE_ID, sections: ['disk', 'ports'], description: 'e2e 体检子集' },
+    makeExec('ecs_diagnose'),
+  )
+  assert.equal(value.exit_code, 0, JSON.stringify(value).slice(0, 300))
+  assert.deepEqual(value.sections, ['disk', 'ports'])
+  assert.ok(value.output.includes('4/7 磁盘'), '应采集磁盘段: ' + value.output.slice(0, 200))
+  assert.ok(value.output.includes('7/7 监听端口'), '应采集端口段')
+  assert.ok(!value.output.includes('1/7 主机信息'), '未选段落不应出现: ' + value.output.slice(0, 200))
+  const text = def.output.render({}, value)[0].text
+  assert.ok(!text.includes('$ ' + value.command), '默认不应回显整段命令')
+  assert.ok(text.includes('[采集段落: disk, ports]'), text.slice(0, 200))
+})
+
+await run('L1: ecs_log 一次读多文件(各自游标)', async () => {
+  const exec = makeExec('ecs_exec')
+  await ecsExecDefinition(ctx).execute({
+    instance_id: INSTANCE_ID,
+    command: 'printf "alpha\\n" > /tmp/dsh-e2e-multi-a.log; printf "bravo\\n" > /tmp/dsh-e2e-multi-b.log',
+  }, exec)
+  const def = ecsLogDefinition(ctx)
+  const value = await def.execute(
+    { instance_id: INSTANCE_ID, paths: ['/tmp/dsh-e2e-multi-a.log', '/tmp/dsh-e2e-multi-b.log'], after: 0 },
+    makeExec('ecs_log'),
+  )
+  assert.equal(value.mode, 'multi')
+  assert.equal(value.files.length, 2)
+  assert.ok(value.files[0].text.includes('alpha'), JSON.stringify(value.files[0]))
+  assert.ok(value.files[1].text.includes('bravo'), JSON.stringify(value.files[1]))
+  assert.equal(value.files[0].eof, true, '文件已读完')
+  // 续读: 游标到底后再读应为空且游标不倒退
+  const again = await def.execute(
+    { instance_id: INSTANCE_ID, paths: ['/tmp/dsh-e2e-multi-a.log'], after: { '/tmp/dsh-e2e-multi-a.log': value.files[0].next_offset } },
+    makeExec('ecs_log'),
+  )
+  assert.equal(again.files[0].text, '')
+  assert.equal(again.files[0].next_offset, value.files[0].next_offset)
+  assertLossless('ecs_log multi value', value)
+})
+
+await run('S1: ecs_upload 不传 verify_sha256 时也默认校验', async () => {
+  const uploadFile = join(tmpDir, 'e2e-default-verify.txt')
+  writeFileSync(uploadFile, 'default-verify\n')
+  const def = ecsUploadDefinition(ctx)
+  const value = await def.execute(
+    { local_file: uploadFile, remote_path: '/tmp/dsh-e2e-default-verify.txt', instance_id: INSTANCE_ID, force: true },
+    makeExec('ecs_upload'),
+  )
+  assert.equal(value.exit_code, 0, JSON.stringify(value).slice(0, 300))
+  assert.equal(value.verification, 'ok', '不传 verify_sha256 也必须校验: ' + JSON.stringify(value))
+  assert.equal(value.verify_sha256, true)
+  assert.ok(value.attempts === 1, '首次成功不应重试: ' + value.attempts)
+  assertLossless('ecs_upload default verify', value)
+})
+
+await run('G1: 只读护栏拒绝信息逐条给出规则/命中文本/位置与替代写法(真机只读路径)', async () => {
+  const def = ecsExecDefinition(ctx)
+  let err
+  try {
+    await def.execute({
+      instance_id: INSTANCE_ID,
+      script: 'mkdir -p /tmp/dsh-e2e-ro && docker images > /tmp/dsh-e2e-ro/images.txt && curl -o /tmp/x.tar.gz https://example.com/x.tar.gz',
+      read_only: true,
+    }, makeExec('ecs_exec'))
+  } catch (e) {
+    err = e
+  }
+  assert.ok(err !== undefined, '写操作必须被只读护栏拒绝')
+  const text = String(err.message)
+  assert.ok(text.includes('[1]') && text.includes('[2]') && text.includes('[3]'), '应逐条列出命中: ' + text)
+  assert.ok(text.includes('位置'), text)
+  assert.ok(text.includes('只读等价写法建议'), text)
+  // 确认远端确实没被改动(护栏是拒绝执行, 不是"执行后报错")
+  const check = await ecsExecDefinition(ctx).execute({
+    instance_id: INSTANCE_ID, command: 'test -e /tmp/dsh-e2e-ro && echo EXISTS || echo ABSENT',
+  }, makeExec('ecs_exec'))
+  assert.equal(String(check.output).trim(), 'ABSENT', '被拒绝的脚本不得留下任何痕迹')
+})
+
+// ============================================================================
+// v0.8.0 —— 真机核对: P1 参数契约 / P2 raw / P3 from_step + 重跑建议 / N1 快照
+// ============================================================================
+console.log('')
+console.log('== v0.8.0 新增能力(真机) ==')
+
+await run('P1: 参数契约在 validate/plan 阶段拦住, 执行期同一文案', async () => {
+  const rbDir = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-params-'))
+  mkdirSync(join(rbDir, '.dsh', 'workbench-ecs', 'runbooks'), { recursive: true })
+  writeFileSync(join(rbDir, '.dsh', 'workbench-ecs', 'runbooks', 'strict.json'), JSON.stringify({
+    name: 'strict',
+    description: '参数契约演示',
+    params: {
+      sha: { required: true, pattern: '^[0-9a-f]{7,40}$', hint: 'git rev-parse --short HEAD' },
+      env: { default: 'prod', enum: ['prod', 'staging'] },
+    },
+    // 只用 sha(env 有默认值, 故意不引用以免 unused 提醒干扰断言)
+    steps: [{ kind: 'assert', command: 'test "${sha}" != "" && echo sha-ok', expect: { stdout_contains: ['sha-ok'] } }],
+  }))
+  const ctxRb = makeCtx({ fs: nodeFsAdapter(rbDir), workspaceRoot: rbDir })
+  const exec = { name: 'ecs_runbook', signal: new AbortController().signal, agent: { session: { header: { cwd: rbDir } } } }
+  const def = ecsRunbookDefinition(ctxRb)
+
+  // 缺必填 → validate 就报错(还没下发任何命令)
+  const missing = await def.execute({ action: 'validate', runbook: 'strict' }, exec)
+  assert.equal(missing.ok, false)
+  assert.ok(missing.issues.some((i) => i.code === 'param_required'), JSON.stringify(missing.issues))
+  assert.ok(missing.issues.find((i) => i.code === 'param_required').message.includes('git rev-parse'), '应带 hint')
+  assert.ok(missing.param_specs.sha.required === true, '报告里应看到参数契约')
+  const missingText = def.output.render({}, missing)[0].text
+  assert.ok(missingText.includes('参数契约'), missingText.slice(0, 400))
+
+  // pattern 不匹配 → 也拦住
+  const bad = await def.execute({ action: 'validate', runbook: 'strict', runbook_params: { sha: 'NOT-HEX' } }, exec)
+  assert.equal(bad.ok, false)
+  assert.ok(bad.issues.some((i) => i.code === 'param_pattern'))
+
+  // 合法参数 → 通过, 并能给出计划与重跑建议
+  const okPlan = await def.execute({
+    action: 'plan', runbook: 'strict', runbook_params: { sha: 'abc1234' }, instance_id: INSTANCE_ID, region: REGION,
+  }, exec)
+  assert.equal(okPlan.ok, true, JSON.stringify(okPlan.issues))
+  assert.ok(okPlan.replay !== undefined, 'plan 应带重跑建议')
+  assertLossless('ecs_runbook plan(v0.8.0)', okPlan)
+
+  // 执行期同一套校验: 缺参数时 ecs_deploy 直接拒绝
+  const deployDef = ecsDeployDefinition(ctxRb)
+  await assert.rejects(
+    () => deployDef.execute({ instance_id: INSTANCE_ID, runbook: 'strict' },
+      { name: 'ecs_deploy', signal: new AbortController().signal, agent: { session: { header: { cwd: rbDir } } } }),
+    /缺少参数|参数不合法/,
+  )
+  // 合法参数 → 真机跑通
+  const deployed = await deployDef.execute(
+    { instance_id: INSTANCE_ID, runbook: 'strict', runbook_params: { sha: 'abc1234' } },
+    { name: 'ecs_deploy', signal: new AbortController().signal, agent: { session: { header: { cwd: rbDir } } } },
+  )
+  assert.equal(deployed.ok, true, JSON.stringify(deployed.stages))
+  assert.equal(deployed.runbook.param_specs.sha.required, true)
+  assertLossless('ecs_deploy runbook(param specs)', deployed)
+})
+
+await run('P2: raw: true 步骤的 ${VAR} 原样下发到远端', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const value = await def.execute({
+    instance_id: INSTANCE_ID,
+    steps: [
+      // raw: true → ${DSH_RAW_PROBE} 不被插件替换, 由远端 shell 展开
+      { raw: true, description: 'e2e raw 步骤', command: 'DSH_RAW_PROBE=raw-ok; echo "value=${DSH_RAW_PROBE}"' },
+      { kind: 'assert', command: 'echo placeholder-check', expect: { stdout_contains: ['placeholder-check'] } },
+    ],
+  }, makeExec('ecs_deploy'))
+  assert.equal(value.ok, true, JSON.stringify(value.stages))
+  assert.ok(String(value.stages[0].output).includes('value=raw-ok'), '远端应把 ${DSH_RAW_PROBE} 展开: ' + value.stages[0].output)
+  assert.ok(!String(value.stages[0].output).includes('${DSH_RAW_PROBE}'), '不应残留未展开的占位符')
+})
+
+await run('P3: from_step 从指定步骤继续(真机只执行剩余步骤)', async () => {
+  const def = ecsDeployDefinition(ctx)
+  const marker = '/tmp/dsh-e2e-from-step'
+  const value = await def.execute({
+    instance_id: INSTANCE_ID,
+    from_step: 2,
+    steps: [
+      { command: 'echo should-not-run > ' + marker },
+      { command: 'echo should-not-run-2 > ' + marker + '2' },
+      { command: 'echo from-step-ran > ' + marker + '-3' },
+      { kind: 'assert', command: 'cat ' + marker + '-3', expect: { stdout_contains: ['from-step-ran'] } },
+    ],
+  }, makeExec('ecs_deploy'))
+  assert.equal(value.ok, true, JSON.stringify(value.stages))
+  assert.deepEqual(value.skipped_prefix, [0, 1])
+  assert.equal(value.from_step, 2)
+  assert.equal(value.stages[0].skipped, true)
+  assert.equal(value.stages[0].skipped_prefix, true)
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('已跳过 [0][1]'), text)
+  // 远端核对: 被跳过的步骤确实没执行
+  const check = await ecsExecDefinition(ctx).execute({
+    instance_id: INSTANCE_ID,
+    command: 'test -e ' + marker + ' && echo EXISTS || echo ABSENT; test -e ' + marker + '2 && echo EXISTS2 || echo ABSENT2',
+  }, makeExec('ecs_exec'))
+  assert.ok(String(check.output).includes('ABSENT'), '第 0 步不得执行: ' + check.output)
+  assert.ok(String(check.output).includes('ABSENT2'), '第 1 步不得执行: ' + check.output)
+})
+
+await run('N1: ecs_snapshot create -> diff(真机采集, 工作区清单)', async () => {
+  const snapRoot = mkdtempSync(join(tmpdir(), 'dsh-wbecs-e2e-snap-'))
+  const ctxSnap = makeCtx({ fs: nodeFsAdapter(snapRoot), workspaceRoot: snapRoot })
+  const exec = { name: 'ecs_snapshot', signal: new AbortController().signal, agent: { session: { header: { cwd: snapRoot } } } }
+  const def = ecsSnapshotDefinition(ctxSnap)
+
+  // 先放一个受控文件, 让快照有可核对的关键文件
+  await ecsExecDefinition(ctx).execute({
+    instance_id: INSTANCE_ID, command: 'mkdir -p /tmp/dsh-e2e-snap && echo v1 > /tmp/dsh-e2e-snap/config.txt',
+  }, makeExec('ecs_exec'))
+
+  const created = await def.execute({
+    action: 'create',
+    name: 'e2e-pre',
+    instance_id: INSTANCE_ID,
+    region: REGION,
+    note: 'e2e 快照',
+    paths: ['/tmp/dsh-e2e-snap/config.txt'],
+    collectors: ['host'],
+  }, exec)
+  assert.equal(created.ok, true, JSON.stringify(created))
+  assert.equal(created.file_count, 1)
+  assert.equal(created.files_summary[0].status, 'file')
+  assert.ok(String(created.files_summary[0].sha256).length === 64, '关键文件应有真实 sha256: ' + JSON.stringify(created.files_summary))
+  assert.ok(created.path.replace(/\\/g, '/').includes('.dsh/workbench-ecs/snapshots/e2e-pre.json'))
+  assertLossless('ecs_snapshot create(真机)', created)
+  assertLossless('ecs_snapshot presentCall', def.presentCall({ action: 'create', name: 'e2e-pre', instance_id: INSTANCE_ID }))
+
+  const listed = await def.execute({ action: 'list' }, exec)
+  assert.equal(listed.count, 1)
+  assert.ok(String(listed.command_line).includes('未调用任何 CLI 命令'), 'list 必须零远程调用')
+
+  // 未改动 → clean
+  const clean = await def.execute({ action: 'diff', name: 'e2e-pre' }, exec)
+  assert.equal(clean.clean, true, JSON.stringify(clean.files))
+
+  // 改动远端 → diff 必须检出
+  await ecsExecDefinition(ctx).execute({
+    instance_id: INSTANCE_ID, command: 'echo v2-changed > /tmp/dsh-e2e-snap/config.txt',
+  }, makeExec('ecs_exec'))
+  const changed = await def.execute({ action: 'diff', name: 'e2e-pre' }, exec)
+  assert.equal(changed.clean, false)
+  assert.equal(changed.files_changed, 1)
+  assert.equal(changed.files[0].status, 'changed')
+  const changedText = def.output.render({}, changed)[0].text
+  assert.ok(changedText.includes('/tmp/dsh-e2e-snap/config.txt'), changedText)
+  assertLossless('ecs_snapshot diff(真机)', changed)
+
+  // 文件消失 → removed
+  await ecsExecDefinition(ctx).execute({
+    instance_id: INSTANCE_ID, command: 'rm -f /tmp/dsh-e2e-snap/config.txt',
+  }, makeExec('ecs_exec'))
+  const removed = await def.execute({ action: 'diff', name: 'e2e-pre' }, exec)
+  assert.equal(removed.files[0].status, 'removed', JSON.stringify(removed.files))
 })
 
 console.log('')

@@ -3,9 +3,21 @@
   "description": "通用域名/证书体检（只读）：HTTPS 可达与状态码、证书剩余天数 ≥ 阈值、证书主题与有效期留档。适合定时或发布后确认 Caddy/Nginx 的证书没掉。",
   "params": {
     "host": "<host>",
-    "port": 443,
-    "path": "/",
-    "min_days": 14
+    "port": {
+      "default": 443,
+      "description": "HTTPS 端口",
+      "pattern": "^[0-9]{1,5}$"
+    },
+    "path": {
+      "default": "/",
+      "description": "健康路径（以 / 开头）",
+      "pattern": "^/.*$"
+    },
+    "min_days": {
+      "default": 14,
+      "description": "证书剩余天数下限（低于即断言失败）",
+      "pattern": "^[0-9]{1,4}$"
+    }
   },
   "steps": [
     {

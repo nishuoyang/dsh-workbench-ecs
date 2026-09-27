@@ -3,9 +3,20 @@
   "description": "通用日志排查（只读）：核对日志文件 → 统计最近 N 行里关键字命中数（超过阈值即失败）→ 回显最近命中行。默认阈值 0，即“最近 N 行不出现 ERROR 才算过”。",
   "params": {
     "log_path": "<log_path>",
-    "lines": 500,
-    "pattern": "ERROR",
-    "max_hits": 0
+    "lines": {
+      "default": 500,
+      "description": "只看最后多少行",
+      "pattern": "^[0-9]{1,7}$"
+    },
+    "pattern": {
+      "default": "ERROR",
+      "description": "要命中的关键字（远端 grep -E 语法）"
+    },
+    "max_hits": {
+      "default": 0,
+      "description": "命中数上限（超过即断言失败；0 = 最近 N 行不允许出现该关键字）",
+      "pattern": "^[0-9]{1,7}$"
+    }
   },
   "steps": [
     {

@@ -171,6 +171,10 @@ ok('exec 拦截 rm -rf', guarded != null && guarded.ok === false && /已拦截/.
 if (sample !== undefined) {
   const ex1 = await rpc('exec', { instance_id: sample.instance_id, command: 'echo dsh-workbench-ecs-rpc-ok', timeout: 30, region: REGION })
   ok('exec 真机 echo 成功', ex1 != null && ex1.ok === true && /dsh-workbench-ecs-rpc-ok/.test(String(ex1.output || '')), ex1)
+  // v0.7.0(D14): 面板也必须把"远端超时"读成失败(而不是 ok:true + 空输出)
+  const exTimeout = await rpc('exec', { instance_id: sample.instance_id, command: 'sleep 8; echo late', timeout: 3, region: REGION })
+  ok('exec 远端超时 → ok:false + timed_out', exTimeout != null && exTimeout.ok === false && exTimeout.timed_out === true &&
+    exTimeout.exit_code === 124 && /超时/.test(String(exTimeout.error || '')), exTimeout)
 } else {
   console.log('  · 无运行中实例, 跳过真机 exec')
 }

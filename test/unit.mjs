@@ -8,9 +8,9 @@
 import assert from 'node:assert'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, isAbsolute, normalize } from 'node:path'
 
 import {
   base64Encode, utf8ByteLength, cleanOutput, shellQuote, baseName, remoteJoin,
@@ -19,19 +19,35 @@ import {
   buildLogReadCommand, parseLogRead, buildDetachLaunch, parseDetachPid, hasLocalTimer, delay,
   splitLocalPath, buildTarCreateArgv, buildArchiveExtractScript, parseArchiveEntries,
   runWithConcurrency,
+  scanWriteCommands, inspectReadOnly, guardDestructiveCommand, remoteResultOf, timeoutAdvice,
+  classifyTransientFailure, withRetry, resolveRetryOptions, looseOutcomeOf, uploadFailureAdvice,
+  REMOTE_TIMEOUT_EXIT_CODE,
 } from '../lib/common.js'
-import { buildDiagnoseScript } from '../lib/tools/ecs-diagnose.js'
+import {
+  ECS_PUBLIC_REGIONS, parseRegionSpec, matchInstanceKeyword, buildListEcsArgv, listInstancesInRegion, searchInstances,
+} from '../lib/regions.js'
+import {
+  INSTANCES_FILE, loadAnchors, resolveAnchorsInArgs, anchorInfoOf, anchorImplicitParams, isInstanceIdLike, isAnchorNameLike,
+} from '../lib/anchors.js'
+import { buildDiagnoseScript, resolveDiagnoseSections, DIAGNOSE_SECTIONS, ecsDiagnoseDefinition } from '../lib/tools/ecs-diagnose.js'
 import { buildSessionScript, extractSessionCwd, ecsExecDefinition } from '../lib/tools/ecs-exec.js'
 import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
+import { ecsFindDefinition } from '../lib/tools/ecs-find.js'
+import { ecsLogDefinition, buildMultiLogReadCommand, splitLogSegments, resolveLogPaths, resolveAfter } from '../lib/tools/ecs-log.js'
 import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
 import { createSettingsCore } from '../lib/settings-api.js'
 import {
   isValidRunbookName, substituteParams, collectParamNames, parseRunbook, buildRunbookRun,
-  loadRunbook, listRunbookNames, RUNBOOK_DIR, lintRunbook,
+  loadRunbook, listRunbookNames, RUNBOOK_DIR, lintRunbook, parseParamDeclarations, validateParamValues,
 } from '../lib/runbooks.js'
 import { ecsRunbookDefinition } from '../lib/tools/ecs-runbook.js'
-import { planSteps, stepTimeoutOf, STEPS_MAX_STEP_TIMEOUT } from '../lib/steps-engine.js'
+import { ecsSnapshotDefinition } from '../lib/tools/ecs-snapshot.js'
+import {
+  buildSnapshotScript, parseSnapshotOutput, diffFacts, DEFAULT_SNAPSHOT_COLLECTORS,
+  SNAPSHOT_DIR, isValidSnapshotName,
+} from '../lib/snapshots.js'
+import { planSteps, stepTimeoutOf, replayAdvice, resolveFromStep, STEPS_MAX_STEP_TIMEOUT } from '../lib/steps-engine.js'
 
 let passed = 0
 let failed = 0
@@ -931,6 +947,55 @@ function fakeFs(files) {
   }
 }
 
+// 真实文件系统适配器(v0.8.0 快照清单要真的落盘): 只实现快照机制用到的五个方法
+function nodeFsAdapter(root) {
+  return {
+    async resolve(p) {
+      const abs = isAbsolute(String(p)) ? String(p) : join(root, String(p))
+      return { targetKey: normalize(abs) }
+    },
+    async readText(target) {
+      return readFileSync(target.targetKey, 'utf8')
+    },
+    async writeText(target, content) {
+      writeFileSync(target.targetKey, content)
+      return { version: 'v1' }
+    },
+    async stat(target) {
+      try {
+        statSync(target.targetKey)
+        return { kind: 'file' }
+      } catch (err) {
+        return undefined
+      }
+    },
+    async listDir(target) {
+      return readdirSync(target.targetKey, { withFileTypes: true }).map((e) => ({ name: e.name }))
+    },
+  }
+}
+
+// 轻量 lossless 检查(与 DSH 的 isJsonValue 同口径的关键点: 不含 undefined 值属性/非法数字)
+function assertLosslessUnit(label, value) {
+  const seen = new Set()
+  const walk = (v, path) => {
+    if (v === undefined) throw new Error(label + ': ' + path + ' 是 undefined')
+    if (v === null) return
+    if (typeof v === 'number' && (!Number.isFinite(v) || Object.is(v, -0))) throw new Error(label + ': ' + path + ' 非法数字')
+    if (typeof v === 'function' || typeof v === 'symbol') throw new Error(label + ': ' + path + ' 不可序列化')
+    if (typeof v !== 'object') return
+    if (seen.has(v)) throw new Error(label + ': ' + path + ' 循环引用')
+    seen.add(v)
+    if (Array.isArray(v)) {
+      v.forEach((item, i) => walk(item, path + '[' + i + ']'))
+      return
+    }
+    for (const key of Object.keys(v)) walk(v[key], path + '.' + key)
+  }
+  walk(value, '$')
+  assert.equal(typeof JSON.stringify(value), 'string')
+}
+
 await runAsync('loadRunbook: 从工作区读取 / 缺文件时列出可用名字 / 无 fs 时给出替代方案', async () => {
   const root = '/ws'
   const rbPath = root + '/' + RUNBOOK_DIR + '/release.json'
@@ -1539,6 +1604,1119 @@ await runAsync('D11: 设置页 runbook 目录可显式覆盖(dir 参数), 且优
   const plan = await core.runbookPlan({ instance_id: 'i-x', runbook: 'release', dir: 'E:/proj/' + RUNBOOK_DIR })
   assert.equal(plan.ok, true)
   assert.ok(String(plan.runbook.path).startsWith('E:/proj/'), 'loadRunbook 应拿到同一目录: ' + plan.runbook.path)
+})
+
+// ============================================================================
+// v0.7.0 —— G1 护栏拒绝信息 / G2 审批策略 / D14 超时结算 / R1 上传重试 /
+//          S1 校验默认值 / F1 跨地域 / A1 实例锚点 / D1 sections / L1 多路径
+// ============================================================================
+console.log('')
+console.log('== v0.7.0 新增能力 ==')
+
+// ---- G1: 只读护栏逐条列出命中(反馈 §三.4/§三.6) ----
+run('G1: scanWriteCommands 逐条给出 rule/命中文本/位置', () => {
+  const script = 'mkdir -p /tmp/snap && docker images > /tmp/snap/images.txt && cp -r /data /data.bak && curl -o /tmp/x.tar.gz https://x/y'
+  const hits = scanWriteCommands(script)
+  assert.ok(hits.length >= 4, '反馈里那种脚本的多个写动作都要报出来, 实际: ' + JSON.stringify(hits.map((h) => h.rule)))
+  for (const hit of hits) {
+    assert.equal(typeof hit.rule, 'string')
+    assert.ok(hit.rule.length > 0)
+    assert.ok(hit.matched_text.length > 0, '必须给出命中文本')
+    assert.ok(hit.span.start >= 0 && hit.span.end > hit.span.start, '必须给出位置区间: ' + JSON.stringify(hit.span))
+    assert.equal(script.slice(hit.span.start, hit.span.end).includes(hit.matched_text.replace(/…$/, '')), true,
+      '位置区间应对得上命中文本: ' + JSON.stringify(hit))
+  }
+  const matched = hits.map((h) => h.matched_text).join('|')
+  assert.ok(matched.includes('mkdir'), '应能看见 mkdir: ' + matched)
+  assert.ok(matched.includes('cp'), '同一规则的第二处(cp)也要列出来: ' + matched)
+  assert.ok(matched.includes('>'), '重定向要列出来: ' + matched)
+  assert.ok(matched.includes('curl -o'), '下载落盘要列出来: ' + matched)
+  const rules = hits.map((h) => h.rule).join('|')
+  assert.ok(rules.includes('文件增删改'), 'mkdir/cp 应命中文件增删改: ' + rules)
+  assert.ok(rules.includes('输出重定向'), '> 应命中输出重定向: ' + rules)
+  assert.ok(rules.includes('下载落盘'), 'curl -o 应命中下载落盘: ' + rules)
+})
+
+run('G1: guardReadOnly 报错含全部命中 + 只读等价写法; 只读命令零误杀', () => {
+  let err
+  try {
+    guardReadOnly('mkdir -p /tmp/a && echo hi > /tmp/a/f', 'ecs_exec')
+  } catch (e) {
+    err = e
+  }
+  assert.ok(err !== undefined, '写操作必须被拒绝')
+  const text = String(err.message)
+  assert.ok(text.includes('[1]') && text.includes('[2]'), '应逐条列出(不再只报第一条): ' + text)
+  assert.ok(text.includes('位置'), '应给出命中位置: ' + text)
+  assert.ok(text.includes('只读等价写法建议'), '应给出"下一步怎么办": ' + text)
+  assert.ok(text.includes('detach'), '只读等价写法里应包含 detach + ecs_log 的路径: ' + text)
+  assert.doesNotThrow(() => guardReadOnly('df -h; docker ps; tail -n 20 /var/log/app.log'))
+  const info = inspectReadOnly('echo hi > /tmp/x')
+  assert.equal(info.ok, false)
+  assert.equal(info.hits.length, 1)
+  assert.ok(info.advice.length > 0)
+})
+
+// ---- G2: 审批四方情形分开报(反馈 §三.5) ----
+function approvalFixture(policy, outcome) {
+  const calls = []
+  return {
+    calls,
+    approval: {
+      effectivePolicy: () => policy,
+      async request(req) {
+        calls.push(req)
+        return outcome
+      },
+    },
+  }
+}
+const destructiveExec = { name: 'ecs_exec', callId: 'c-1', signal: { aborted: false }, agent: { session: { events: [] } } }
+
+await runAsync('G2: 无审批服务 → fail closed 并说明原因', async () => {
+  const ctx = { get: () => undefined }
+  await assert.rejects(
+    () => guardDestructiveCommand(ctx, destructiveExec, 'rm -rf /tmp/x'),
+    (err) => {
+      assert.ok(String(err.message).includes('未挂载审批服务'), err.message)
+      assert.ok(String(err.message).includes('rm -rf / -fr'), '应给出命中规则: ' + err.message)
+      return true
+    },
+  )
+})
+
+await runAsync('G2: 审批策略 never → 直接拒绝且不发起审批请求', async () => {
+  const fx = approvalFixture('never', 'rejected')
+  const ctx = { get: (n) => (n === 'approval' ? fx.approval : undefined) }
+  await assert.rejects(
+    () => guardDestructiveCommand(ctx, destructiveExec, 'reboot'),
+    (err) => {
+      assert.ok(String(err.message).includes('审批策略为 never'), err.message)
+      assert.ok(String(err.message).includes('审批已禁用'), err.message)
+      assert.ok(String(err.message).includes('重试同一条命令不会有不同结果'), '必须点明"不是命令写错": ' + err.message)
+      return true
+    },
+  )
+  assert.equal(fx.calls.length, 0, 'never 策略下不应发起审批请求')
+})
+
+await runAsync('G2: 用户拒绝 / 取消 / 无应答者 三种情形文案不同', async () => {
+  const messages = {}
+  for (const outcome of ['rejected', 'cancelled', 'unavailable']) {
+    const fx = approvalFixture('ask', outcome)
+    const ctx = { get: (n) => (n === 'approval' ? fx.approval : undefined) }
+    let err
+    try {
+      await guardDestructiveCommand(ctx, destructiveExec, 'mkfs.ext4 /dev/sdb')
+    } catch (e) {
+      err = e
+    }
+    assert.ok(err !== undefined, outcome + ' 必须拒绝')
+    messages[outcome] = String(err.message)
+    assert.equal(fx.calls.length, 1, outcome + ' 应发起一次审批请求')
+  }
+  assert.ok(messages.rejected.includes('用户在审批中拒绝'), messages.rejected)
+  assert.ok(messages.cancelled.includes('审批请求被取消'), messages.cancelled)
+  assert.ok(messages.unavailable.includes('无审批应答者'), messages.unavailable)
+  assert.notEqual(messages.rejected, messages.cancelled)
+  assert.notEqual(messages.rejected, messages.unavailable)
+})
+
+await runAsync('G2: 获批(allowed-once)时放行; 无 agent/callId 上下文时拒绝', async () => {
+  const fx = approvalFixture('ask', 'allowed-once')
+  const ctx = { get: (n) => (n === 'approval' ? fx.approval : undefined) }
+  await guardDestructiveCommand(ctx, destructiveExec, 'systemctl stop nginx')
+  assert.equal(fx.calls.length, 1)
+  await assert.rejects(
+    () => guardDestructiveCommand(ctx, { name: 'ecs_exec', signal: { aborted: false } }, 'reboot'),
+    /缺少审批上下文/,
+  )
+})
+
+// ---- D14: 远端超时不能当成成功 ----
+run('D14: remoteResultOf 把 timed_out 结算成 exit 124(否则会显示成功 + 无输出)', () => {
+  const timeoutJson = { exit_code: 0, stdout: '', output: '', stderr: '', timed_out: true, duration: '3.002s' }
+  const r = remoteResultOf(timeoutJson, { exitCode: 124, stderr: '{"code":124,"message":"command timed out after 3s"}', stdout: '' })
+  assert.equal(r.exit_code, 124, '超时必须报 124, 不能沿用 JSON 里的 0')
+  assert.equal(r.timed_out, true)
+  assert.equal(r.duration, '3.002s')
+  assert.equal(r.timeout_message, 'command timed out after 3s', '应带上 CLI 的超时原因')
+
+  const normal = remoteResultOf({ exit_code: 0, stdout: 'ok\n', output: 'ok\n', stderr: '', duration: '80ms' }, { exitCode: 0, stderr: '' })
+  assert.equal(normal.exit_code, 0)
+  assert.equal(normal.timed_out, undefined, '正常命令不应被标记超时')
+  assert.equal(normal.output, 'ok\n')
+
+  // 远端自身退出码仍以 JSON 为准; JSON 缺 output 时回落 stdout
+  const failed = remoteResultOf({ exit_code: 3, stdout: 'x\n', stderr: 'err\n' }, { exitCode: 3, stderr: '' })
+  assert.equal(failed.exit_code, 3)
+  assert.equal(failed.output, 'x\n')
+  assert.equal(failed.stderr, 'err\n')
+  // CLI 进程 124 但 JSON 说 0(CLI 自己在本地掐断): 同样按超时处理
+  assert.equal(remoteResultOf({ exit_code: 0, output: '' }, { exitCode: 124 }).exit_code, 124)
+})
+
+await runAsync('D14: ecs_exec 超时返回 exit 124 + detach 指引(不再显示成功)', async () => {
+  const timeoutJson = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: '', stderr: '', timed_out: true, duration: '3.002s' })
+  const stub = {
+    async resolveExecutable() { return 'workbench' },
+    spawn() {
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: timeoutJson, nextOffset: timeoutJson.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '{"code":124,"message":"command timed out after 3s"}', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 124, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const def = ecsExecDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  const value = await def.execute({ instance_id: 'i-x', command: 'sleep 8; echo done', timeout: 3 }, { name: 'ecs_exec', signal: { aborted: false } })
+  assert.equal(value.exit_code, 124, '超时应结算为 124')
+  assert.equal(value.timed_out, true)
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('[exit code: 124]'), text)
+  assert.ok(text.includes('远端命令被 CLI 掐断'), text)
+  assert.ok(text.includes('detach=true'), '超时提示必须给出 detach 这条下一步: ' + text)
+})
+
+// ---- R1: 上传重试只针对瞬时网络类失败 ----
+run('R1: classifyTransientFailure 区分瞬时网络与语义类失败', () => {
+  const transient = [
+    'upload failed: upload to OSS: put object: operation error PutObject: Put "https://x": dial tcp 47.101.94.154:443: i/o timeout',
+    'read tcp 10.0.0.2:55321->47.101.94.154:443: connection reset by peer',
+    'command timed out after 60s',
+    'context deadline exceeded',
+    'unexpected EOF',
+  ]
+  for (const text of transient) assert.equal(classifyTransientFailure(text), true, '应判为瞬时: ' + text)
+  const semantic = [
+    'remote file "/tmp/x" already exists (7 B, modified Sep 27 19:59); use --force to overwrite',
+    'permission denied',
+    'no such file or directory',
+    'invalid region "all": region does not exist or is not recognized',
+  ]
+  for (const text of semantic) assert.equal(classifyTransientFailure(text), false, '不应重试: ' + text)
+  assert.equal(classifyTransientFailure(''), false)
+})
+
+await runAsync('R1: withRetry 瞬时失败重试, 语义失败立刻停', async () => {
+  const opts = { attempts: 3, baseDelayMs: 0, maxDelayMs: 0 }
+  let calls = 0
+  const transient = await withRetry({ get: () => undefined }, opts, async (i) => {
+    calls = i
+    return i < 2 ? { ok: false, failureText: 'dial tcp 1.2.3.4:443: i/o timeout' } : { ok: true, value: 'ok' }
+  })
+  assert.equal(transient.ok, true)
+  assert.equal(transient.attempts, 2, '第 2 次应成功')
+  assert.equal(calls, 2)
+  assert.equal(transient.failures.length, 1)
+
+  let semanticCalls = 0
+  const semantic = await withRetry({ get: () => undefined }, opts, async () => {
+    semanticCalls += 1
+    return { ok: false, failureText: 'remote file "/tmp/x" already exists; use --force to overwrite' }
+  })
+  assert.equal(semantic.ok, false)
+  assert.equal(semantic.attempts, 1, '语义类失败不得重试')
+  assert.equal(semanticCalls, 1)
+  assert.equal(semantic.failures[0].transient, false)
+
+  const ro = resolveRetryOptions({})
+  assert.deepEqual({ retries: ro.retries, attempts: ro.attempts }, { retries: 2, attempts: 3 })
+  assert.equal(resolveRetryOptions({ retries: 0 }).attempts, 1, 'retries: 0 表示不重试')
+  assert.equal(resolveRetryOptions({ retries: 99 }).retries, 8, '重试次数有上限')
+})
+
+await runAsync('R1: ecs_upload 首次 OSS 抖动 → 自动重试并成功(attempts=2)', async () => {
+  let uploadCalls = 0
+  const hash = expectedHash
+  const stub = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) {
+      const exe = String(spec.argv[0])
+      if (exe !== 'workbench') return localSubprocess.spawn(spec)
+      const argv = spec.argv.slice(1)
+      let body
+      let stderr = ''
+      let exitCode = 0
+      if (argv[0] === 'upload') {
+        uploadCalls += 1
+        if (uploadCalls === 1) {
+          body = 'Uploading x (7 B) to i-x:/tmp/x\n'
+          stderr = '{"code":1,"message":"upload failed: upload to OSS: put object: operation error PutObject: Put \\"https://oss-x\\": dial tcp 47.101.94.154:443: i/o timeout"}'
+          exitCode = 1
+        } else {
+          body = 'Upload complete: x -> /tmp/x\n'
+        }
+      } else {
+        body = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: hash + '  /tmp/x\n', stderr: '' })
+      }
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: stderr, nextOffset: stderr.length, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const def = ecsUploadDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  const value = await def.execute(
+    { local_file: hashFile, remote_path: '/tmp/x', instance_id: 'i-x', retries: 2, retry_delay: 0 },
+    { signal: { aborted: false } },
+  )
+  assert.equal(uploadCalls, 2, '应重试一次后成功')
+  assert.equal(value.attempts, 2)
+  assert.equal(value.exit_code, 0)
+  assert.equal(value.retry_errors.length, 1)
+  assert.ok(value.retry_errors[0].message.includes('i/o timeout'))
+  assert.equal(value.verification, 'ok', 'S1: 不传 verify_sha256 时也默认校验')
+  assert.equal(value.verify_sha256, true)
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('上传重试: 共尝试 2 次后成功'), text)
+})
+
+await runAsync('R1: 语义类失败(远端已存在)不重试, 报错点明归属', async () => {
+  let uploadCalls = 0
+  const stub = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) {
+      if (String(spec.argv[0]) !== 'workbench') return localSubprocess.spawn(spec)
+      uploadCalls += 1
+      const body = 'Uploading probe (7 B) to i-x:/tmp/x\nUpload complete: probe -> /tmp/x\n'
+      const stderr = '{"code":1,"message":"remote file \\"/tmp/x\\" already exists (7 B, modified Sep 27 19:59); use --force to overwrite"}'
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: stderr, nextOffset: stderr.length, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 1, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const def = ecsUploadDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  let err
+  try {
+    await def.execute({ local_file: hashFile, remote_path: '/tmp/x', instance_id: 'i-x' }, { signal: { aborted: false } })
+  } catch (e) {
+    err = e
+  }
+  assert.ok(err !== undefined, '上传失败必须报错(stdout 里有 "Upload complete" 也不能当成成功)')
+  const text = String(err.message)
+  assert.ok(text.includes('already exists'), text)
+  assert.ok(!text.includes('已尝试'), '语义类失败不应出现重试次数: ' + text)
+  assert.equal(uploadCalls, 1, '不得重试')
+})
+
+// ---- S1: verify_sha256 三处默认值统一为 true ----
+run('S1: 三个入口的 verify 默认值一致(不传即校验)', () => {
+  const plan = planSteps([{ kind: 'upload', local_file: 'a.jar', remote_path: '/opt/a.jar' }], { instance_id: 'i-x' })
+  assert.equal(plan[0].verify, true, 'steps[].upload 默认校验')
+  assert.equal(planSteps([{ kind: 'upload', local_file: 'a.jar', remote_path: '/opt/a.jar', verify_sha256: false }], { instance_id: 'i-x' })[0].verify,
+    false, '显式 false 才关闭')
+  const desc = ecsUploadDefinition({ get: () => undefined }).parameters.verify_sha256.description
+  assert.ok(desc.includes('默认 true'), 'ecs_upload 的参数说明应写"默认 true": ' + desc)
+  const deployDesc = ecsDeployDefinition({ get: () => undefined }).parameters.verify_sha256.description
+  assert.ok(deployDesc.includes('默认 true'), 'ecs_deploy 的参数说明应写"默认 true": ' + deployDesc)
+})
+
+await runAsync('S1: ecs_upload 显式 verify_sha256:false 时不校验', async () => {
+  const stub = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) {
+      if (String(spec.argv[0]) !== 'workbench') return localSubprocess.spawn(spec)
+      const body = 'Upload complete: x -> /tmp/x\n'
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const def = ecsUploadDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  const value = await def.execute(
+    { local_file: hashFile, remote_path: '/tmp/x', instance_id: 'i-x', verify_sha256: false },
+    { signal: { aborted: false } },
+  )
+  assert.equal(value.verification, undefined, '显式关闭时不应有校验结论')
+  assert.equal(value.verify_sha256, undefined)
+})
+
+// ---- F1: 跨地域检索 ----
+run('F1: parseRegionSpec / 关键词匹配 / argv 构造', () => {
+  assert.equal(parseRegionSpec(undefined).mode, 'all')
+  assert.equal(parseRegionSpec('all').regions.length, ECS_PUBLIC_REGIONS.length)
+  assert.deepEqual(parseRegionSpec('cn-shanghai').regions, ['cn-shanghai'])
+  assert.deepEqual(parseRegionSpec('cn-shanghai, cn-hangzhou').regions, ['cn-shanghai', 'cn-hangzhou'])
+  assert.equal(parseRegionSpec('CN-Shanghai').regions[0], 'cn-shanghai', '地域名应归一为小写')
+
+  const inst = { instance_id: 'i-uf66ct2o35p7fjcd0sru', instance_name: 'iZuf66ct2o35p7fjcd0sruZ', public_ip: '47.103.38.58', tags: { env: 'prod' } }
+  assert.equal(matchInstanceKeyword(inst, 'uf66'), true, '实例 ID 子串应命中')
+  assert.equal(matchInstanceKeyword(inst, '47.103'), true, '公网 IP 子串应命中')
+  assert.equal(matchInstanceKeyword(inst, 'PROD'), true, '标签值应命中且大小写不敏感')
+  assert.equal(matchInstanceKeyword(inst, 'nailonghub'), false)
+  assert.equal(matchInstanceKeyword(inst, ''), true, '空关键词 = 不过滤')
+
+  const argv = buildListEcsArgv({ region: 'cn-shanghai', status: 'Running', tag: ['env=prod'], limit: 20 })
+  assert.deepEqual(argv, ['list', 'ecs', '--region', 'cn-shanghai', '--output', 'json', '--status', 'Running', '--tag', 'env=prod', '--limit', '20'])
+})
+
+await runAsync('F1: ecs_find 跨地域检索命中并汇报检索范围', async () => {
+  const calls = []
+  const stub = {
+    async resolveExecutable() { return 'workbench' },
+    spawn(spec) {
+      const argv = spec.argv.slice(1)
+      calls.push(argv)
+      const region = argv[argv.indexOf('--region') + 1]
+      // cn-hangzhou 空(裸数组, 实测形状) / cn-beijing 报错 / 其它地域返回实例
+      let body
+      let exitCode = 0
+      if (region === 'cn-hangzhou') body = '[]'
+      else if (region === 'cn-beijing') {
+        body = ''
+        exitCode = 1
+      } else {
+        body = JSON.stringify({ instances: [{ instance_id: 'i-uf66ct2o35p7fjcd0sru', instance_name: 'prod-web', public_ip: '47.103.38.58', status: 'Running' }] })
+      }
+      const stderr = exitCode === 0 ? '' : '{"code":2,"message":"invalid region \\"cn-beijing\\""}'
+      const text = body
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: stderr, nextOffset: stderr.length, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const ctx = { get: (n) => (n === 'subprocess' ? stub : undefined) }
+  const def = ecsFindDefinition(ctx)
+  const value = await def.execute({ keyword: 'uf66', region: 'cn-shanghai,cn-hangzhou,cn-beijing' },
+    { signal: { aborted: false }, name: 'ecs_find' })
+  assert.equal(value.total, 1, '应命中 1 台: ' + JSON.stringify(value.hits))
+  assert.equal(value.regions_tried.length, 3)
+  assert.equal(value.regions_ok, 2)
+  assert.equal(value.regions_failed.length, 1, '某地域失败要如实回报')
+  assert.equal(value.regions_failed[0].region, 'cn-beijing')
+  assert.equal(value.hits[0].instances[0].instance_id, 'i-uf66ct2o35p7fjcd0sru')
+  assert.equal(calls.length, 3, '每个地域一次查询')
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('跨地域实例检索'), text)
+  assert.ok(text.includes('部分地域查询失败'), '失败地域要出现在可读输出里: ' + text)
+  assert.ok(text.includes(INSTANCES_FILE), '应提示实例锚点约定: ' + text)
+})
+
+await runAsync('F1: ecs_list 0 台时提示改用 ecs_find', async () => {
+  const stub = stubSubprocess('[]')
+  const def = ecsListDefinition({ get: (n) => (n === 'subprocess' ? stub.subprocess : undefined) })
+  const value = await def.execute({ region: 'cn-hangzhou' }, { signal: { aborted: false } })
+  assert.equal(value.count, 0)
+  assert.ok(String(value.empty_hint).includes('ecs_find'), '0 台时应指向 ecs_find: ' + value.empty_hint)
+  assert.ok(def.output.render({}, value)[0].text.includes('ecs_find'))
+})
+
+// ---- A1: 实例锚点 ----
+function anchorCtx(anchorJson, workspaceRoot) {
+  return {
+    get: (n) => {
+      if (n === 'fs') return fakeFs({ [workspaceRoot + '/' + INSTANCES_FILE]: JSON.stringify(anchorJson) })
+      if (n === 'sandboxPolicy') return { workspaceRoot }
+      return undefined
+    },
+  }
+}
+const anchorRoot = 'E:/proj'
+const anchorExec = { name: 'ecs_exec', signal: { aborted: false }, agent: { session: { header: { cwd: anchorRoot } } } }
+
+await runAsync('A1: 锚点名 → instance_id, 且 region 自动补齐', async () => {
+  const ctx = anchorCtx({ prod: { instance_id: 'i-uf66ct2o35p7fjcd0sru', region: 'cn-shanghai', repo: '/root/nailonghub' } }, anchorRoot)
+  const resolved = await resolveAnchorsInArgs(ctx, { instance_id: 'prod', command: 'dfs' }, anchorExec)
+  assert.equal(resolved.args.instance_id, 'i-uf66ct2o35p7fjcd0sru')
+  assert.equal(resolved.args.region, 'cn-shanghai', 'region 应自动补齐')
+  const info = anchorInfoOf(resolved.args)
+  assert.equal(info.name, 'prod')
+  assert.deepEqual(anchorImplicitParams(info), { repo: '/root/nailonghub' }, '锚点自定义字段应成为隐式参数')
+
+  // 显式 region 优先于锚点
+  const explicit = await resolveAnchorsInArgs(ctx, { instance_id: 'prod', region: 'cn-beijing' }, anchorExec)
+  assert.equal(explicit.args.region, 'cn-beijing')
+  // 真实 instance_id 原样透传(不受锚点影响)
+  const raw = await resolveAnchorsInArgs(ctx, { instance_id: 'i-bp1abc' }, anchorExec)
+  assert.equal(raw.args.instance_id, 'i-bp1abc')
+  assert.equal(raw.anchor, undefined)
+  // 批量: 锚点与真实 ID 混用
+  const batch = await resolveAnchorsInArgs(ctx, { instance_ids: ['prod', 'i-bp1abc'] }, anchorExec)
+  assert.deepEqual(batch.args.instance_ids, ['i-uf66ct2o35p7fjcd0sru', 'i-bp1abc'])
+})
+
+await runAsync('A1: 锚点文件缺失时按原值下发(向后兼容); 名字写错时列出可用锚点', async () => {
+  const noFile = { get: (n) => (n === 'fs' ? fakeFs({}) : (n === 'sandboxPolicy' ? { workspaceRoot: anchorRoot } : undefined)) }
+  const passthrough = await resolveAnchorsInArgs(noFile, { instance_id: 'prod' }, anchorExec)
+  assert.equal(passthrough.args.instance_id, 'prod', '没有锚点文件时应原样下发(交给 CLI 报错)')
+
+  const ctx = anchorCtx({
+    prod: { instance_id: 'i-uf66ct2o35p7fjcd0sru', region: 'cn-shanghai' },
+    staging: { instance_id: 'i-bp1staging', region: 'cn-hangzhou' },
+  }, anchorRoot)
+  let err
+  try {
+    await resolveAnchorsInArgs(ctx, { instance_id: 'prodd' }, anchorExec)
+  } catch (e) {
+    err = e
+  }
+  assert.ok(err !== undefined, '锚点名写错必须报错')
+  assert.ok(String(err.message).includes('prod, staging'), '应列出可用锚点: ' + err.message)
+
+  const loaded = await loadAnchors(ctx, { workspaceRoot: anchorRoot })
+  assert.equal(loaded.ok, true)
+  assert.deepEqual(loaded.names, ['prod', 'staging'])
+})
+
+await runAsync('A1: 坏锚点文件 → 降级为原值下发, 不阻断工具', async () => {
+  const ctx = {
+    get: (n) => {
+      if (n === 'fs') return fakeFs({ [anchorRoot + '/' + INSTANCES_FILE]: '{ not json' })
+      if (n === 'sandboxPolicy') return { workspaceRoot: anchorRoot }
+      return undefined
+    },
+  }
+  const resolved = await resolveAnchorsInArgs(ctx, { instance_id: 'prod' }, anchorExec)
+  assert.equal(resolved.args.instance_id, 'prod')
+  const loaded = await loadAnchors(ctx, { workspaceRoot: anchorRoot })
+  assert.equal(loaded.ok, false)
+  assert.equal(loaded.reason, 'invalid-json')
+})
+
+// ---- D1: ecs_diagnose sections / echo_command ----
+run('D1: sections 子集只拼接选定段; 非法段名报错', () => {
+  const all = buildDiagnoseScript('echo extra')
+  for (const section of DIAGNOSE_SECTIONS) assert.ok(all.includes(section.title), '默认应采集全部段落: ' + section.title)
+  const subset = buildDiagnoseScript(undefined, { sections: ['disk', 'ports'] })
+  assert.ok(subset.includes('4/7 磁盘') && subset.includes('7/7 监听端口'))
+  assert.ok(!subset.includes('1/7 主机信息') && !subset.includes('3/7 内存'), '未选段落不得出现在脚本里: ' + subset)
+  assert.equal(checkWriteCommand(subset), undefined, 'sections 子集仍须零误杀')
+
+  const resolved = resolveDiagnoseSections(['extra'])
+  assert.deepEqual(resolved.ids, [])
+  assert.equal(resolved.extra, true)
+  assert.throws(() => resolveDiagnoseSections(['nope']), /未知段落/)
+  assert.throws(() => resolveDiagnoseSections([]), /不能为空/)
+  assert.throws(() => resolveDiagnoseSections('disk'), /必须是数组/)
+})
+
+await runAsync('D1: echo_command 默认不回显命令全文; true 时回显', async () => {
+  const calls = []
+  const stub = {
+    async resolveExecutable() { return 'workbench' },
+    spawn(spec) {
+      calls.push(spec.argv.slice(1))
+      const body = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: '==== 4/7 磁盘 ====\n/dev/vda1 40G\n', stderr: '' })
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const def = ecsDiagnoseDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  const value = await def.execute({ instance_id: 'i-x', sections: ['disk'] }, { name: 'ecs_diagnose', signal: { aborted: false } })
+  assert.deepEqual(value.sections, ['disk'])
+  assert.equal(value.echo_command, undefined)
+  const short = def.output.render({}, value)[0].text
+  assert.ok(!short.includes('$ ' + value.command), '默认不回显整段命令: ' + short)
+  assert.ok(short.includes('[采集段落: disk]'), short)
+  assert.ok(calls[0][calls[0].indexOf('--command') + 1].includes('df -h'), '实际下发的是子集脚本')
+
+  const loud = def.output.render({ echo_command: true }, Object.assign({}, value, { echo_command: true }))[0].text
+  assert.ok(loud.includes('$ ' + value.command), 'echo_command=true 时应回显')
+})
+
+// ---- L1: ecs_log 多路径 ----
+run('L1: 多文件读取命令与分段解析', () => {
+  const entries = [
+    { path: '/var/log/app.log', after: 0, maxBytes: 1024 },
+    { path: '/var/log/access.log', after: 5, maxBytes: 1024 },
+  ]
+  const command = buildMultiLogReadCommand(entries, { exitPath: '/tmp/job/exit' })
+  assert.ok(command.includes("printf \"__DSH_ECS_FILE__%s\\n\" '/var/log/app.log'"), command)
+  assert.ok(command.includes("tail -c +1 '/var/log/app.log'"), command)
+  assert.ok(command.includes("tail -c +6 '/var/log/access.log'"), '第二个文件应按自己的游标: ' + command)
+  assert.equal(checkWriteCommand(command), undefined, '多文件读命令必须仍是只读')
+
+  const output = '__DSH_ECS_FILE__/var/log/app.log\n__DSH_ECS_META__ 7\nhello\n' +
+    '__DSH_ECS_FILE__/var/log/access.log\n__DSH_ECS_META__ 12\nworld\n__DSH_ECS_EXIT__ 0\n'
+  const segments = splitLogSegments(output, ['/var/log/app.log', '/var/log/access.log'])
+  assert.equal(segments.length, 2)
+  const first = parseLogRead(segments[0].raw, 0, 1024)
+  const second = parseLogRead(segments[1].raw, 5, 1024)
+  assert.equal(first.text, 'hello')
+  assert.equal(first.total_bytes, 7)
+  assert.equal(first.next_offset, 7)
+  assert.equal(second.text, 'world')
+  assert.equal(second.exit_code, 0)
+  assert.equal(second.next_offset, 12)
+
+  assert.throws(() => resolveLogPaths({ path: 'a', paths: ['b'] }), /二选一/)
+  assert.throws(() => resolveLogPaths({}), /必须提供/)
+  assert.throws(() => resolveLogPaths({ paths: Array.from({ length: 9 }, (_, i) => 'f' + i) }), /最多 8 个/)
+  assert.equal(resolveAfter({ after: 12 }, '/a'), 12)
+  assert.equal(resolveAfter({ after: { '/a': 7, '/b': 3 } }, '/b'), 3)
+  assert.equal(resolveAfter({ after: { '/a': 7 } }, '/c'), 0)
+})
+
+await runAsync('L1: ecs_log paths 一次读多文件(各自游标), 且超时不推进游标', async () => {
+  const seen = []
+  const stub = {
+    async resolveExecutable() { return 'workbench' },
+    spawn(spec) {
+      const argv = spec.argv.slice(1)
+      seen.push(argv)
+      const body = JSON.stringify({
+        instance_id: 'i-x', exit_code: 0, stderr: '',
+        output: '__DSH_ECS_FILE__/var/log/a.log\n__DSH_ECS_META__ 4\naaa\n' +
+          '__DSH_ECS_FILE__/var/log/b.log\n__DSH_ECS_META__ 9\nbbb\n',
+      })
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const logDef = ecsLogDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  const value = await logDef.execute(
+    { instance_id: 'i-x', paths: ['/var/log/a.log', '/var/log/b.log'], after: { '/var/log/a.log': 0, '/var/log/b.log': 4 } },
+    { name: 'ecs_log', signal: { aborted: false } },
+  )
+  assert.equal(seen.length, 1, '多文件应只发一次远程调用')
+  assert.equal(value.files.length, 2)
+  assert.equal(value.files[0].text, 'aaa')
+  assert.equal(value.files[0].next_offset, 4)
+  assert.equal(value.files[1].after, 4, '第二个文件应按对象里的游标')
+  assert.equal(value.files[1].text, 'bbb')
+  assert.equal(value.files[1].next_offset, 9, '游标推进到远端总长(4 + 剩余 5 字节)')
+  const text = logDef.output.render({}, value)[0].text
+  assert.ok(text.includes('多文件日志读取'), text)
+  assert.ok(text.includes('/var/log/b.log'), text)
+})
+
+// ============================================================================
+// v0.8.0 —— P1 参数契约 / P2 raw: true / P3 重跑建议 + from_step / N1 快照
+// ============================================================================
+console.log('')
+console.log('== v0.8.0 新增能力 ==')
+
+run('P1: parseParamDeclarations 区分"标量默认值"与"参数描述符"', () => {
+  const decl = parseParamDeclarations({
+    delay: 5,
+    sha: { required: true, pattern: '^[0-9a-f]{7,40}$', hint: 'git rev-parse --short HEAD' },
+    env: { default: 'prod', enum: ['prod', 'staging'], description: '部署环境' },
+    empty: {},
+  })
+  assert.equal(decl.defaults.delay, 5, '标量仍是默认值')
+  assert.equal(decl.defaults.empty !== undefined, true, '空对象不是描述符(当作对象默认值)')
+  assert.equal(decl.specs.sha.required, true)
+  assert.equal(decl.specs.sha.pattern, '^[0-9a-f]{7,40}$')
+  assert.equal(decl.specs.env.default, 'prod')
+  assert.deepEqual(decl.specs.env.enum, ['prod', 'staging'])
+  assert.equal(decl.specs.sha.hasDefault, false)
+  assert.equal(decl.specs.env.hasDefault, true)
+
+  const typo = parseParamDeclarations({ a: { requred: true } })
+  assert.equal(typo.unknownKeys.length, 0, 'requred 不是已知键 → 整个对象被视为默认值(不误判为描述符)')
+  const typo2 = parseParamDeclarations({ a: { required: true, patern: '^x$' } })
+  assert.deepEqual(typo2.unknownKeys, [{ param: 'a', key: 'patern' }], '已知键+笔误键 → 报出笔误字段')
+})
+
+run('P1: 必填/pattern/enum 校验(含隐式参数)', () => {
+  const specs = parseParamDeclarations({
+    sha: { required: true, pattern: '^[0-9a-f]{7,40}$' },
+    env: { default: 'prod', enum: ['prod', 'staging'] },
+  }).specs
+  const ok = validateParamValues(specs, { sha: 'abc1234', env: 'staging' })
+  assert.deepEqual(ok, [])
+  const missing = validateParamValues(specs, {})
+  assert.equal(missing.length, 1)
+  assert.equal(missing[0].code, 'param_required')
+  assert.ok(missing[0].message.includes('必填'))
+  const badPattern = validateParamValues(specs, { sha: 'XYZ', env: 'prod' })
+  assert.equal(badPattern[0].code, 'param_pattern')
+  assert.ok(badPattern[0].message.includes('^[0-9a-f]{7,40}$'))
+  const badEnum = validateParamValues(specs, { sha: 'abc1234', env: 'dev' })
+  assert.equal(badEnum[0].code, 'param_enum')
+  assert.ok(badEnum[0].message.includes('prod / staging'))
+  const brokenRegex = validateParamValues(parseParamDeclarations({ a: { pattern: '(' } }).specs, { a: 'x' })
+  assert.equal(brokenRegex[0].code, 'param_pattern_invalid')
+  // 隐式参数同样受约束(instance_id 由调用侧注入)
+  const implicit = buildRunbookRun(
+    parseRunbook(JSON.stringify({ params: { instance_id: { pattern: '^i-[0-9a-z]+$' } }, steps: [{ command: 'echo ${instance_id}' }] })),
+    {},
+    { instance_id: 'i-uf66ct2o35p7fjcd0sru' },
+  )
+  assert.deepEqual(implicit.param_issues, [])
+  const badImplicit = buildRunbookRun(
+    parseRunbook(JSON.stringify({ params: { instance_id: { pattern: '^i-[0-9a-z]+$' } }, steps: [{ command: 'echo ${instance_id}' }] })),
+    {},
+    { instance_id: 'prod-typo' },
+  )
+  assert.equal(badImplicit.param_issues[0].code, 'param_pattern')
+})
+
+await runAsync('P1: lint 在 validate 阶段就拦住缺必填/不匹配(与执行期同一文案)', async () => {
+  const text = JSON.stringify({
+    name: 'strict',
+    params: { sha: { required: true, pattern: '^[0-9a-f]{7,40}$', hint: 'git rev-parse --short HEAD' } },
+    steps: [{ command: 'echo deploying ${sha}' }],
+  })
+  const lint = lintRunbook(text, { name: 'strict' })
+  assert.equal(lint.ok, false, '缺必填参数应在 lint 阶段就失败')
+  const codes = lint.issues.map((i) => i.code)
+  assert.ok(codes.includes('param_required'), codes.join(','))
+  assert.ok(lint.issues.find((i) => i.code === 'param_required').message.includes('git rev-parse'), '应带上 hint')
+  assert.ok(lint.missing_required.includes('sha'))
+
+  const lintBad = lintRunbook(text, { name: 'strict', params: { sha: 'NOT-HEX' } })
+  assert.equal(lintBad.ok, false)
+  assert.ok(lintBad.issues.some((i) => i.code === 'param_pattern'))
+  const lintOk = lintRunbook(text, { name: 'strict', params: { sha: 'abc1234' } })
+  assert.equal(lintOk.ok, true, JSON.stringify(lintOk.issues))
+  assert.equal(lintOk.param_specs.sha.required, true, '报告里应能看到参数契约')
+
+  // 执行期同一套校验(工具侧)
+  const def = ecsDeployDefinition({ get: () => undefined })
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', runbook: JSON.parse(text) }, { name: 'ecs_deploy', signal: { aborted: false } }),
+    /参数不合法|缺少参数/,
+  )
+})
+
+run('P1: 描述符笔误与"声明了却没用到"都要报出来', () => {
+  const lint = lintRunbook(JSON.stringify({
+    params: { sha: { required: true, patern: '^x$' }, ghost: 'v1' },
+    steps: [{ command: 'echo ${sha}' }],
+  }), { name: 'x' })
+  const codes = lint.issues.map((i) => i.code)
+  assert.ok(codes.includes('unknown_param_field'), '描述符字段笔误: ' + codes.join(','))
+  assert.ok(lint.issues.find((i) => i.code === 'unknown_param_field').message.includes('pattern'), '应提示是否想写 pattern')
+  assert.ok(codes.includes('unused_default'), 'ghost 没被用到: ' + codes.join(','))
+})
+
+run('P2: step 级 raw: true 整步不替换, 且其占位符不计入已声明参数', () => {
+  const runbook = parseRunbook(JSON.stringify({
+    params: { tag: 'v1' },
+    steps: [
+      { command: 'echo ${tag}' },
+      { raw: true, script: 'echo "${HOME}" "${tag}" > /tmp/x' },
+    ],
+  }))
+  const run = buildRunbookRun(runbook, {}, {})
+  assert.equal(run.steps[0].command, 'echo v1', '普通步骤照常替换')
+  assert.equal(run.steps[1].script, 'echo "${HOME}" "${tag}" > /tmp/x', 'raw 步骤原样保留')
+  assert.deepEqual(run.declared, ['tag'], 'raw 步骤里的 ${tag}/${HOME} 不计入声明')
+  assert.deepEqual(run.missing, [], 'raw 步骤不应报缺参数')
+})
+
+run('P2: raw 步骤里有占位符时 lint 提醒(不是静默忽略)', () => {
+  const lint = lintRunbook(JSON.stringify({
+    steps: [{ raw: true, command: 'echo ${TAG}' }],
+  }), { name: 'x' })
+  const codes = lint.issues.map((i) => i.code)
+  assert.ok(codes.includes('raw_placeholders'), codes.join(','))
+  assert.ok(!codes.includes('unknown_field'), 'raw 应在字段白名单里: ' + codes.join(','))
+})
+
+run('P3: replayAdvice 逐步幂等性 + 重跑建议', () => {
+  const plan = planSteps([
+    { kind: 'upload', local_file: 'a.jar', remote_path: '/opt/a.jar', force: true },
+    { kind: 'assert', command: 'test -f /opt/a.jar', expect: {} },
+    { command: 'docker compose up -d' },
+    { kind: 'tail', path: '/tmp/x.log' },
+  ], { instance_id: 'i-x' })
+  const replay = replayAdvice(plan)
+  assert.deepEqual(replay.steps.map((s) => s.idempotent), [true, true, false, true])
+  assert.equal(replay.safe_prefix, 2)
+  assert.equal(replay.replayable, false)
+  assert.ok(replay.note.includes('from_step: 2'), replay.note)
+
+  const allSafe = replayAdvice(planSteps([
+    { command: 'df -h', read_only: true },
+    { kind: 'tail', path: '/tmp/x.log' },
+  ], { instance_id: 'i-x' }))
+  assert.equal(allSafe.replayable, true)
+  assert.ok(allSafe.note.includes('直接重跑整条跑书'))
+
+  // 无 --force 的上传不算幂等(远端已存在时会失败)
+  const noForce = replayAdvice(planSteps([{ kind: 'upload', local_file: 'a', remote_path: '/opt/a' }], { instance_id: 'i-x' }))
+  assert.equal(noForce.steps[0].idempotent, false)
+})
+
+await runAsync('P3: from_step 跳过前置步骤且结果显式可见', async () => {
+  const issued = []
+  const stub = {
+    async resolveExecutable() { return 'workbench' },
+    spawn(spec) {
+      issued.push(spec.argv.slice(1).join(' '))
+      const body = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: 'ok', stderr: '' })
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const def = ecsDeployDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  const steps = [
+    { command: 'echo step-zero' },
+    { command: 'echo step-one' },
+    { command: 'echo step-two' },
+  ]
+  const value = await def.execute({ instance_id: 'i-x', steps, from_step: 2 }, { name: 'ecs_deploy', signal: { aborted: false } })
+  assert.equal(value.ok, true, JSON.stringify(value.stages))
+  assert.deepEqual(value.skipped_prefix, [0, 1])
+  assert.equal(value.from_step, 2)
+  assert.equal(value.stages[0].skipped, true)
+  assert.equal(value.stages[0].skipped_prefix, true)
+  assert.equal(value.stages[2].ok, true)
+  assert.ok(!issued.join('\n').includes('step-zero'), '被跳过的步骤不得下发: ' + issued.join('\n'))
+  assert.ok(issued.join('\n').includes('step-two'))
+
+  // 预演同样标注跳过段
+  const preview = await def.execute({ instance_id: 'i-x', steps, from_step: 1, dry_run: true }, { name: 'ecs_deploy', signal: { aborted: false } })
+  assert.deepEqual(preview.skipped_prefix, [0])
+  assert.equal(preview.plan[0].skipped, true)
+  assert.equal(preview.plan[1].skipped, undefined)
+  const previewText = def.output.render({}, preview)[0].text
+  assert.ok(previewText.includes('将跳过 [0]'), previewText)
+  assert.ok(previewText.includes('[重跑建议]'), '预演里应给出重跑建议')
+
+  // 越界直接报错
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', steps, from_step: 9 }, { name: 'ecs_deploy', signal: { aborted: false } }),
+    /from_step/,
+  )
+  // 老三阶段不支持 from_step(没有可跳过的编号, 明确报错而不是静默忽略)
+  await assert.rejects(
+    () => def.execute({ instance_id: 'i-x', command: 'echo x', from_step: 1 }, { name: 'ecs_deploy', signal: { aborted: false } }),
+    /from_step 仅配合 steps/,
+  )
+})
+
+await runAsync('P3: 失败后的结果里带重跑建议; ecs_runbook plan 也带 replay', async () => {
+  const stub = {
+    async resolveExecutable() { return 'workbench' },
+    spawn() {
+      const body = JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: '', stderr: '' })
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const def = ecsDeployDefinition({ get: (n) => (n === 'subprocess' ? stub : undefined) })
+  const value = await def.execute({
+    instance_id: 'i-x',
+    steps: [{ command: 'echo a' }, { kind: 'assert', command: 'echo b', expect: { stdout_contains: ['definitely-absent'] } }],
+  }, { name: 'ecs_deploy', signal: { aborted: false } })
+  assert.equal(value.ok, false)
+  assert.ok(value.replay !== undefined, '失败结果应带 replay')
+  const text = def.output.render({}, value)[0].text
+  assert.ok(text.includes('[重跑建议]'), text)
+
+  // ecs_runbook plan: 只读且带 replay
+  const files = {}
+  files['E:/proj/' + RUNBOOK_DIR + '/rel.json'] = JSON.stringify({
+    params: { tag: 'v1' },
+    steps: [{ command: 'echo ${tag}', read_only: true }],
+  })
+  const ctx2 = { get: (n) => (n === 'fs' ? fakeFs(files) : (n === 'sandboxPolicy' ? { workspaceRoot: 'E:/proj' } : undefined)) }
+  const rbDef = ecsRunbookDefinition(ctx2)
+  const plan = await rbDef.execute({ action: 'plan', runbook: 'rel', instance_id: 'i-x' },
+    { name: 'ecs_runbook', signal: { aborted: false }, agent: { session: { header: { cwd: 'E:/proj' } } } })
+  assert.equal(plan.ok, true, JSON.stringify(plan.issues))
+  assert.equal(plan.replay.replayable, true)
+  const planText = rbDef.output.render({}, plan)[0].text
+  assert.ok(planText.includes('[重跑建议]'), planText)
+
+  const lint = await rbDef.execute({ action: 'validate', runbook: 'rel' },
+    { name: 'ecs_runbook', signal: { aborted: false }, agent: { session: { header: { cwd: 'E:/proj' } } } })
+  assert.ok(lint.replay !== undefined, 'validate 也应给出重跑建议')
+})
+
+// ---- N1: 快照 ----
+run('N1: 采集脚本只读且含三段标记(采集器 / 退出码 / 路径指纹)', () => {
+  const script = buildSnapshotScript({
+    collectors: DEFAULT_SNAPSHOT_COLLECTORS,
+    paths: ["/root/app/config.yml", '/opt/data'],
+  })
+  assert.equal(checkWriteCommand(script), undefined, '采集脚本必须零写操作: ' + checkWriteCommand(script))
+  assert.ok(script.includes('__DSH_SNAP_CMD__%s'), script.slice(0, 120))
+  assert.ok(script.includes('__DSH_SNAP_RC__%s %s'), '要记录采集器退出码')
+  assert.ok(script.includes('sha256sum'), '文件指纹用远端 sha256sum')
+  assert.ok(script.includes("-printf '%P %s"), '目录记文件清单摘要')
+  assert.ok(script.includes("'/root/app/config.yml'"), '路径要经 shell 引用')
+  assert.ok(!script.includes('rm -f') && !script.includes('docker run'), '不得混入任何写操作')
+})
+
+run('N1: parseSnapshotOutput 解析采集器与文件指纹', () => {
+  const spec = { collectors: [{ label: 'images', command: 'docker images' }], paths: ['/a', '/b'] }
+  const output = [
+    '__DSH_SNAP_CMD__images', 'img:v1 abc123', '__DSH_SNAP_RC__images 0',
+    '__DSH_SNAP_PATH__/a', 'file aaaa 12 1700000000',
+    '__DSH_SNAP_PATH__/b', 'missing',
+  ].join('\n')
+  const parsed = parseSnapshotOutput(output, spec)
+  assert.equal(parsed.commands.images.exit_code, 0)
+  assert.equal(parsed.commands.images.lines, 1)
+  assert.deepEqual(parsed.commands.images.head, ['img:v1 abc123'])
+  assert.equal(parsed.files['/a'].status, 'file')
+  assert.equal(parsed.files['/a'].sha256, 'aaaa')
+  assert.equal(parsed.files['/a'].size, 12)
+  assert.equal(parsed.files['/b'].status, 'missing')
+
+  const dirOut = ['__DSH_SNAP_PATH__/d', 'dir dddd 7 1700000000'].join('\n')
+  const parsedDir = parseSnapshotOutput(dirOut, { collectors: [], paths: ['/d'] })
+  assert.equal(parsedDir.files['/d'].status, 'dir')
+  assert.equal(parsedDir.files['/d'].entries, 7)
+})
+
+run('N1: diffFacts 逐项给出 unchanged/changed/added/removed/metadata-only', () => {
+  const before = {
+    files: {
+      '/same': { status: 'file', sha256: 'aa', size: 1, mtime: 10 },
+      '/content': { status: 'file', sha256: 'aa', size: 1, mtime: 10 },
+      '/meta': { status: 'file', sha256: 'bb', size: 1, mtime: 10 },
+      '/gone': { status: 'file', sha256: 'cc', size: 1, mtime: 10 },
+      '/dir': { status: 'dir', digest: 'dd', entries: 3, mtime: 10 },
+    },
+    commands: {
+      images: { exit_code: 0, lines: 2, digest: 'x1', head: ['a', 'b'] },
+      ports: { exit_code: 0, lines: 1, digest: 'y1', head: ['80'] },
+    },
+  }
+  const after = {
+    files: {
+      '/same': { status: 'file', sha256: 'aa', size: 1, mtime: 10 },
+      '/content': { status: 'file', sha256: 'zz', size: 9, mtime: 11 },
+      '/meta': { status: 'file', sha256: 'bb', size: 1, mtime: 99 },
+      '/new': { status: 'file', sha256: 'ee', size: 2, mtime: 12 },
+      '/dir': { status: 'dir', digest: 'ff', entries: 4, mtime: 12 },
+    },
+    commands: {
+      images: { exit_code: 0, lines: 3, digest: 'x2', head: ['a', 'c'] },
+      ports: { exit_code: 0, lines: 1, digest: 'y1', head: ['80'] },
+    },
+  }
+  const result = diffFacts(before, after)
+  const byPath = {}
+  for (const item of result.files) byPath[item.path] = item.status
+  assert.equal(byPath['/same'], 'unchanged')
+  assert.equal(byPath['/content'], 'changed')
+  assert.equal(byPath['/meta'], 'metadata-only')
+  assert.equal(byPath['/gone'], 'removed')
+  assert.equal(byPath['/new'], 'added')
+  assert.equal(byPath['/dir'], 'changed')
+  const byLabel = {}
+  for (const item of result.commands) byLabel[item.label] = item
+  assert.equal(byLabel.images.status, 'changed')
+  assert.equal(byLabel.images.first_difference.line, 2)
+  assert.equal(byLabel.ports.status, 'unchanged')
+  assert.equal(result.clean, false)
+  assert.equal(result.changed_count, 6, JSON.stringify(byPath))
+  assert.equal(result.files_changed, 4)
+  assert.equal(result.commands_changed, 1)
+
+  const same = diffFacts(before, before)
+  assert.equal(same.clean, true)
+  assert.equal(same.changed_count, 0)
+
+  // 基线里是文件、现在采集到 missing → 应报 removed(而不是"类型变化")
+  const vanished = diffFacts(
+    { files: { '/x': { status: 'file', sha256: 'aa', size: 1, mtime: 1 } }, commands: {} },
+    { files: { '/x': { status: 'missing' } }, commands: {} },
+  )
+  assert.equal(vanished.files[0].status, 'removed')
+  const appeared = diffFacts(
+    { files: { '/y': { status: 'missing' } }, commands: {} },
+    { files: { '/y': { status: 'file', sha256: 'aa', size: 1, mtime: 1 } }, commands: {} },
+  )
+  assert.equal(appeared.files[0].status, 'added')
+})
+
+await runAsync('N1: ecs_snapshot create -> list -> diff(工作区清单, 远端可编排)', async () => {
+  const dirRoot = mkdtempSync(join(tmpdir(), 'dsh-wbecs-unit-snap-'))
+  const remoteOutput = (sha) => [
+    '__DSH_SNAP_CMD__containers', 'app web:1 Up 2 hours', '__DSH_SNAP_RC__containers 0',
+    '__DSH_SNAP_PATH__/root/app/config.yml', 'file ' + sha + ' 42 1700000000',
+  ].join('\n')
+  let sha = 'aa'.repeat(32)
+  const issued = []
+  const stub = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) {
+      const exe = String(spec.argv[0])
+      if (exe !== 'workbench') return localSubprocess.spawn(spec)
+      const argv = spec.argv.slice(1)
+      issued.push(argv.join(' '))
+      // base64 投递的前置命令回空, 执行脚本的那条返回采集结果
+      const isRunner = argv.join(' ').includes('.dsh-ecs-')
+      const body = isRunner
+        ? JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: remoteOutput(sha), stderr: '', duration: '120ms' })
+        : JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: '', stderr: '' })
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text: body, nextOffset: body.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const ctx = {
+    get: (n) => {
+      if (n === 'subprocess') return stub
+      if (n === 'fs') return nodeFsAdapter(dirRoot)
+      if (n === 'sandboxPolicy') return { workspaceRoot: dirRoot }
+      return undefined
+    },
+  }
+  const exec = { name: 'ecs_snapshot', signal: new AbortController().signal, agent: { session: { header: { cwd: dirRoot } } } }
+  const def = ecsSnapshotDefinition(ctx)
+
+  const created = await def.execute({
+    action: 'create', name: 'pre-abc1234', instance_id: 'i-x', region: 'cn-shanghai',
+    note: '发布前回滚点', collectors: ['containers'], paths: ['/root/app/config.yml'],
+  }, exec)
+  assert.equal(created.ok, true, JSON.stringify(created))
+  assert.equal(created.file_count, 1)
+  assert.equal(created.files_summary[0].status, 'file')
+  assert.ok(created.path.replace(/\\/g, '/').endsWith('.dsh/workbench-ecs/snapshots/pre-abc1234.json'), created.path)
+  assert.ok(issued.some((line) => line.includes('exec --instance-id i-x')), '应真的下发采集命令')
+  assertLosslessUnit('ecs_snapshot create', created)
+  assertLosslessUnit('ecs_snapshot create meta', def.output.presentationMeta({}, created))
+
+  const listed = await def.execute({ action: 'list' }, exec)
+  assert.equal(listed.count, 1)
+  assert.equal(listed.snapshots[0].name, 'pre-abc1234')
+  assert.equal(listed.snapshots[0].note, '发布前回滚点')
+  assert.ok(String(listed.command_line).includes('未调用任何 CLI 命令'), 'list 必须零远程调用')
+
+  // 未改动 → clean
+  const cleanDiff = await def.execute({ action: 'diff', name: 'pre-abc1234' }, exec)
+  assert.equal(cleanDiff.clean, true, JSON.stringify(cleanDiff))
+  assert.equal(cleanDiff.changed_count, 0)
+  const cleanText = def.output.render({}, cleanDiff)[0].text
+  assert.ok(cleanText.includes('无差异'), cleanText)
+
+  // 远端变化 → diff 检出(文件 sha256 变了)
+  sha = 'bb'.repeat(32)
+  const changedDiff = await def.execute({ action: 'diff', name: 'pre-abc1234' }, exec)
+  assert.equal(changedDiff.clean, false)
+  assert.equal(changedDiff.files_changed, 1)
+  assert.equal(changedDiff.files[0].status, 'changed')
+  const changedText = def.output.render({}, changedDiff)[0].text
+  assert.ok(changedText.includes('变化'), changedText)
+
+  // 名字非法 / 快照不存在都要有可操作的报错
+  await assert.rejects(() => def.execute({ action: 'create', name: '../etc/passwd', instance_id: 'i-x' }, exec), /非法/)
+  await assert.rejects(() => def.execute({ action: 'create', instance_id: 'i-x' }, exec), /name 非法/)
+  await assert.rejects(() => def.execute({ action: 'diff', name: 'nope' }, exec), /读取快照失败|可用快照/)
+  await assert.rejects(() => def.execute({ action: 'nope' }, exec), /action 非法/)
+})
+
+await runAsync('N1: profile 提供采集内容; profile 不存在时列出可用名字', async () => {
+  const dirRoot = mkdtempSync(join(tmpdir(), 'dsh-wbecs-unit-snap2-'))
+  mkdirSync(join(dirRoot, '.dsh', 'workbench-ecs'), { recursive: true })
+  writeFileSync(join(dirRoot, '.dsh', 'workbench-ecs', 'snapshot-profiles.json'), JSON.stringify({
+    web: { paths: ['/root/app/config.yml'], commands: { health: 'curl -fsS http://127.0.0.1/health' }, collectors: ['containers'] },
+    db: { paths: ['/var/lib/db.sqlite'] },
+  }))
+  const body = JSON.stringify({
+    instance_id: 'i-x', exit_code: 0, duration: '90ms', stderr: '',
+    output: [
+      '__DSH_SNAP_CMD__containers', 'app web:1 Up', '__DSH_SNAP_RC__containers 0',
+      '__DSH_SNAP_CMD__health', 'ok', '__DSH_SNAP_RC__health 0',
+      '__DSH_SNAP_PATH__/root/app/config.yml', 'file cccc 10 1700000000',
+    ].join('\n'),
+  })
+  const stub = {
+    async resolveExecutable(name) { return name },
+    spawn(spec) {
+      if (String(spec.argv[0]) !== 'workbench') return localSubprocess.spawn(spec)
+      const isRunner = spec.argv.slice(1).join(' ').includes('.dsh-ecs-')
+      const text = isRunner ? body : JSON.stringify({ instance_id: 'i-x', exit_code: 0, output: '', stderr: '' })
+      return {
+        pid: 1,
+        collected: {
+          stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        done: Promise.resolve({ exitCode: 0, signal: null }),
+        terminate() {},
+        async waitForExit() { return true },
+      }
+    },
+  }
+  const ctx = {
+    get: (n) => {
+      if (n === 'subprocess') return stub
+      if (n === 'fs') return nodeFsAdapter(dirRoot)
+      if (n === 'sandboxPolicy') return { workspaceRoot: dirRoot }
+      return undefined
+    },
+  }
+  const exec = { name: 'ecs_snapshot', signal: new AbortController().signal, agent: { session: { header: { cwd: dirRoot } } } }
+  const def = ecsSnapshotDefinition(ctx)
+  const created = await def.execute({ action: 'create', name: 'pre-1', instance_id: 'i-x', profile: 'web' }, exec)
+  assert.equal(created.profile, 'web')
+  assert.deepEqual(created.collectors, ['containers', 'health'], 'profile 的 collectors + commands 都要生效')
+  assert.deepEqual(created.paths, ['/root/app/config.yml'], 'profile 的 paths 生效')
+  await assert.rejects(
+    () => def.execute({ action: 'create', name: 'pre-2', instance_id: 'i-x', profile: 'nope' }, exec),
+    /可用 profile: web, db/,
+  )
 })
 
 console.log('')

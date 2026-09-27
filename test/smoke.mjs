@@ -10,7 +10,7 @@
 import assert from 'node:assert'
 import { readFileSync, readdirSync } from 'node:fs'
 import { name, inject, apply } from '../lib/index.js'
-import { lintRunbook, parseRunbook, buildRunbookRun, collectParamNames } from '../lib/runbooks.js'
+import { lintRunbook, parseRunbook, buildRunbookRun, collectParamNames, parseParamDeclarations } from '../lib/runbooks.js'
 import { planSteps } from '../lib/steps-engine.js'
 
 // 全部工具的必填参数契约
@@ -20,13 +20,16 @@ import { planSteps } from '../lib/steps-engine.js'
 //       (以上均由 execute 内部校验), 因此必填列表为空/不含这些。
 const EXPECTED = {
   ecs_list: ['region'],
+  ecs_find: [],
   ecs_exec: [],
-  ecs_log: ['instance_id', 'path'],
+  // v0.7.0: ecs_log 的 path 与新增的 paths 二选一(由 execute 内部校验), 因此只有 instance_id 必填
+  ecs_log: ['instance_id'],
   ecs_upload: ['remote_path', 'instance_id'],
   ecs_download: ['remote_path', 'instance_id'],
   ecs_diagnose: ['instance_id'],
   ecs_deploy: ['instance_id'],
   ecs_runbook: ['action'],
+  ecs_snapshot: ['action'],
   ecs_session: ['action'],
 }
 
@@ -157,11 +160,12 @@ for (const file of localModules) {
   assert.ok(bodyText.includes(marker[1]), 'lib/' + file + ' 未拼进动态 body(缺符号 ' + marker[1] + ')')
 }
 
-// ---- 通用跑书模板守卫(v0.6.7) ----
+// ---- 通用跑书模板守卫(v0.6.7 / v0.8.0) ----
 // templates/runbooks/*.json 是随包分发的**通用跑书**: 用户直接拷进项目工作区就用。
-// 模板最容易烂在没人跑: 少个默认值、字段写错、改成非法 timeout —— 静态校验全都能提前
-// 看见, 所以这里把"每份模板必须 lint 全绿(0 错误 0 提醒) + 参数齐备 + 无残留占位符"
-// 变成回归项, 模板坏了 CI 就红。
+// 模板最容易烂在没人跑: 少个默认值、字段写错、改成非法 timeout、参数契约与默认值自相矛盾
+// (例如 pattern 匹配不上自己的 default) —— 静态校验全都能提前看见, 所以这里把
+// "每份模板必须 lint 全绿(0 错误 0 提醒) + 参数齐备 + 无残留占位符 + 可完整展开"变成回归项。
+// v0.8.0 起还要保证: 参数契约(required/pattern/enum)对**默认值本身**也成立。
 const templateDirUrl = new URL('../templates/runbooks/', import.meta.url)
 const templateFiles = readdirSync(templateDirUrl).filter((f) => f.endsWith('.json')).sort()
 assert.ok(templateFiles.length >= 3, '应至少有 3 份通用跑书模板, 实际: ' + templateFiles.length)
@@ -175,13 +179,85 @@ for (const file of templateFiles) {
   const run = buildRunbookRun(runbook, {}, { instance_id: 'i-smoke', region: 'cn-shanghai' })
   assert.deepEqual(run.missing, [], '模板 ' + label + ' 的占位符必须都有默认值, 缺: ' + run.missing.join(','))
   assert.equal(collectParamNames(run.steps).size, 0, '模板 ' + label + ' 替换后不应残留占位符: ' + [...collectParamNames(run.steps)].join(','))
+  // 参数契约必须与默认值自洽(pattern/enum 不能把默认值自己拒掉)
+  assert.deepEqual((run.param_issues !== undefined ? run.param_issues : []), [],
+    '模板 ' + label + ' 的参数契约与默认值矛盾: ' + JSON.stringify(run.param_issues))
+  const decl = parseParamDeclarations(runbook.params)
+  assert.ok(Object.keys(decl.specs).length >= 1, '模板 ' + label + ' 应至少用一处参数描述符作为写法示范(v0.8.0)')
   const plan = planSteps(run.steps, { instance_id: 'i-smoke', region: 'cn-shanghai' })
   assert.equal(plan.length, runbook.steps.length, '模板 ' + label + ' 应能完整展开成计划')
   for (const step of plan) {
     assert.ok(Number(step.timeout) > 0, '模板 ' + label + ' 的 steps[' + step.index + '] 超时应为正数')
   }
+  assert.ok(lint.replay !== undefined, '模板 ' + label + ' 应能给出重跑建议(v0.8.0)')
 }
 assert.ok(pkg.files.includes('templates/'), 'package.json 的 files 必须包含 templates/(否则模板不会随 npm 包分发)')
+
+// ---- v0.7.0 不变量: 护栏/审批/超时/重试/锚点 收敛在 common 与 anchors, 不得各处复制 ----
+const commonText = readFileSync(new URL('../lib/common.js', import.meta.url), 'utf8')
+for (const symbol of ['scanWriteCommands', 'scanDangerousCommands', 'remoteResultOf', 'withRetry', 'classifyTransientFailure', 'READ_ONLY_ADVICE']) {
+  assert.ok(new RegExp('export (?:async )?(?:function|const) ' + symbol + '\\b').test(commonText),
+    'lib/common.js 应提供 ' + symbol)
+}
+// 超时结算只能有一个入口: 各工具不得再自己写"以 JSON exit_code 为准"的回退逻辑
+for (const file of readdirSync(new URL('../lib/tools/', import.meta.url)).filter((f) => f.endsWith('.js'))) {
+  const src = readFileSync(new URL('../lib/tools/' + file, import.meta.url), 'utf8')
+  assert.ok(!/typeof data\.exit_code === 'number'/.test(src),
+    'lib/tools/' + file + ' 不应自行判断远端 exit_code(请改用 common.remoteResultOf 以正确处理 timed_out)')
+}
+// 实例锚点约定: 工具参数说明与 README 口径一致(至少 ecs_exec/ecs_deploy 提到锚点)
+const anchorsText = readFileSync(new URL('../lib/anchors.js', import.meta.url), 'utf8')
+assert.ok(anchorsText.includes('.dsh/workbench-ecs/instances.json'), '锚点文件路径应写在 lib/anchors.js 里')
+const indexText = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+assert.ok(indexText.includes('resolveAnchorsInArgs'), '工具注册边界应统一解析实例锚点(A1)')
+assert.ok(readFileSync(new URL('../lib/regions.js', import.meta.url), 'utf8').includes('ECS_PUBLIC_REGIONS'),
+  '跨地域检索应基于内置地域清单(F1)')
+
+// ---- v0.8.0 不变量: 参数契约/raw/重跑建议/快照 都收敛在 runbooks+steps-engine+snapshots ----
+const runbooksText = readFileSync(new URL('../lib/runbooks.js', import.meta.url), 'utf8')
+for (const symbol of ['parseParamDeclarations', 'validateParamValues']) {
+  assert.ok(new RegExp('export (?:async )?(?:function|const) ' + symbol + '\\b').test(runbooksText),
+    'lib/runbooks.js 应提供 ' + symbol + '(参数契约的唯一实现)')
+}
+const stepsText = readFileSync(new URL('../lib/steps-engine.js', import.meta.url), 'utf8')
+for (const symbol of ['replayAdvice', 'resolveFromStep']) {
+  assert.ok(new RegExp('export (?:async )?(?:function|const) ' + symbol + '\\b').test(stepsText),
+    'lib/steps-engine.js 应提供 ' + symbol)
+}
+// 快照采集脚本必须恒为只读(工具里必须真的过护栏), 且清单落在工作区
+const snapshotToolText = readFileSync(new URL('../lib/tools/ecs-snapshot.js', import.meta.url), 'utf8')
+assert.ok(snapshotToolText.includes('guardReadOnly(script'), 'ecs_snapshot 的采集脚本必须过只读护栏')
+const snapshotsText = readFileSync(new URL('../lib/snapshots.js', import.meta.url), 'utf8')
+assert.ok(snapshotsText.includes('.dsh/workbench-ecs/snapshots'), '快照清单目录应由 lib/snapshots.js 定义')
+assert.ok(readFileSync(new URL('../templates/instances.json', import.meta.url), 'utf8').includes('instance_id'),
+  'templates/instances.json 应随包分发(实例锚点模板)')
+
+// ---- 源文件编码守卫: 所有文本文件必须是合法 UTF-8 ----
+// 为什么需要: 本机 pwsh 是 Windows PowerShell 5.1, 用 Get-Content/Set-Content 改文件
+// 会把 UTF-8 读成 GBK 再写回, 多字节尾部字节被替换成 '?'(2026-09-27 真实损坏过
+// lib/common.js 与 package.json, 600+ 处字节丢失)。这条守卫让同类损坏 CI 就能红。
+{
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  const dirs = ['', 'lib', 'lib/tools', 'test', 'scripts', 'templates', 'templates/runbooks', 'docs']
+  let checked = 0
+  for (const dir of dirs) {
+    const base = new URL('../' + (dir.length > 0 ? dir + '/' : ''), import.meta.url)
+    let entries
+    try {
+      entries = readdirSync(base)
+    } catch (err) {
+      continue
+    }
+    for (const name of entries) {
+      if (!/\.(js|mjs|json|md|yml|yaml|ps1)$/.test(name)) continue
+      const bytes = readFileSync(new URL(name, base))
+      checked += 1
+      assert.doesNotThrow(() => decoder.decode(bytes), dir + '/' + name + ' 不是合法 UTF-8(疑似被按 ANSI 写回)')
+    }
+  }
+  assert.ok(checked > 10, '编码守卫应至少检查 10 个文件, 实际 ' + checked)
+  console.log('encoding OK: ' + checked + ' 个文本文件均为合法 UTF-8')
+}
 
 console.log('smoke OK: name =', name, '| tools =', Object.keys(EXPECTED).sort().join(', '))
 console.log('rpc OK: 设置页路由 /dsh-workbench-ecs 已注册 (' + routes[0].kind + ')')

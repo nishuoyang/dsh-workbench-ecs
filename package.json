@@ -1,7 +1,7 @@
 {
   "name": "dsh-workbench-ecs",
-  "version": "0.6.7",
-  "description": "DeepSeek Harness (Cordis) plugin: control Alibaba Cloud ECS instances through the local Workbench CLI — list/exec/log/upload/download/diagnose/deploy/session model tools plus a visual settings panel",
+  "version": "0.8.0",
+  "description": "DeepSeek Harness (Cordis) plugin: control Alibaba Cloud ECS instances through the local Workbench CLI — find/list/exec/log/upload/download/diagnose/deploy/session model tools plus a visual settings panel",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

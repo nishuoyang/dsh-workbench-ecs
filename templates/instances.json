@@ -1,0 +1,19 @@
+{
+  "//1": "实例锚点(v0.7.0+)。拷到项目工作区 .dsh/workbench-ecs/instances.json 后按项目填写。",
+  "//2": "之后所有接受 instance_id 的工具都可以直接写锚点名(如 \"prod\"), region 未显式给出时自动补齐。",
+  "//3": "锚点里除 instance_id/region 之外的字段会成为 runbook 的隐式参数(跑书里可直接用 ${repo})。",
+  "//4": "以 // 或 _ 开头的键会被当作注释忽略。",
+
+  "prod": {
+    "instance_id": "i-uf66ct2o35p7fjcd0sru",
+    "region": "cn-shanghai",
+    "repo": "/root/app",
+    "note": "生产"
+  },
+  "staging": {
+    "instance_id": "i-bp1xxxxxxxxxxxxxxxxx",
+    "region": "cn-hangzhou",
+    "repo": "/root/app-staging",
+    "note": "预发(示例, 请替换成真实实例)"
+  }
+}

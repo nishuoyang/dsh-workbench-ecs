@@ -2,10 +2,23 @@
   "name": "disk-cleanup",
   "description": "通用磁盘回收：默认只报告不删（confirm 必须是 yes 才动手）。清理已退出容器、悬空镜像、构建缓存（保留 cache_keep），并断言关键容器仍在跑、磁盘水位达标。",
   "params": {
-    "confirm": "no",
-    "cache_keep": "2GB",
+    "confirm": {
+      "default": "no",
+      "enum": ["no", "yes"],
+      "description": "确认执行清理（只有 yes 才真的删东西）",
+      "hint": "先跑一次默认的 no 看报告，确认无误再改成 yes"
+    },
+    "cache_keep": {
+      "default": "2GB",
+      "description": "构建缓存保留量（传给 docker builder prune --keep-storage）",
+      "pattern": "^[0-9]+([KMGTP]B?)?$"
+    },
     "container_name": "",
-    "disk_max": 90
+    "disk_max": {
+      "default": 90,
+      "description": "清理后磁盘水位阈值（百分比）",
+      "pattern": "^[0-9]{1,3}$"
+    }
   },
   "steps": [
     {

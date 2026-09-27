@@ -3,12 +3,28 @@
   "description": "通用容器重部署：目录/编排文件核对 → 可选 git 快进 → compose 配置与 service 校验 → 重建服务 → 容器与 HTTP 健康断言 → 日志留档。产物怎么上去由项目决定（本文件只管编排与断言，脚本本体留在项目仓库）。",
   "params": {
     "app_dir": "<app_dir>",
-    "compose_file": "docker-compose.yml",
-    "service": "",
+    "compose_file": {
+      "default": "docker-compose.yml",
+      "description": "编排文件名（相对 app_dir）",
+      "pattern": "^[^/]+\\.ya?ml$"
+    },
+    "service": {
+      "default": "",
+      "description": "只重建某个服务（留空 = 全部）",
+      "pattern": "^$|^[A-Za-z0-9._-]+$"
+    },
     "container_name": "",
-    "health_url": "",
+    "health_url": {
+      "default": "",
+      "description": "健康检查 URL（留空则跳过 HTTP 断言）",
+      "pattern": "^$|^https?://.+"
+    },
     "git_ref": "",
-    "step_timeout": 300
+    "step_timeout": {
+      "default": 300,
+      "description": "每步超时（秒）",
+      "pattern": "^[0-9]{1,4}$"
+    }
   },
   "steps": [
     {
