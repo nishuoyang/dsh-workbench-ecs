@@ -343,14 +343,21 @@ read_only=true 命中 3 条写操作模式, 已拒绝执行:
 - npm 由本机 `npm publish` 完成(`npm whoami` = `nishuoyang`); 已回包核对发布物: 32 个文件,
   含 `lib/tools/ecs-find.js`、`lib/tools/ecs-snapshot.js`、`lib/snapshots.js`、`lib/regions.js`、
   `lib/anchors.js`、`templates/instances.json`、`lib/client.js` 与两份 README, 版本号 0.8.0。
-- **GitHub 推送未完成**: 本次网络无法连到 github.com:443(`Failed to connect ... Could not connect to server`),
-  因此 `main` 的两个提交与 tag `v0.8.0` **仍只在本地**, CI(Test/Publish)未触发。
-  网络恢复后补推即可:
+- **GitHub 推送未完成**: 本次网络无法完成 `git push`, 逐项排查结论(供下次一步到位):
+  1. **仓库配了代理但代理没在跑**: `git config http.proxy = http://127.0.0.1:7897`, 而本机 7897/7890/10809/1080/8080
+     均无监听 —— 这是"`git push` 报 Failed to connect"的直接原因。启动代理客户端后 `git push` 即可。
+  2. 绕过代理直连: `github.com:443` 的 TCP 三次握手能通(`Test-NetConnection` 连续 3 次 True), 但 git 的 HTTPS
+     被 **Connection was reset** —— 典型的 SNI 阻断, 客户端侧无解; 本机无 HTTP(S)_PROXY 环境变量。
+  3. SSH 通道: `ssh.github.com:443` 可达, 但本机 `~/.ssh/id_rsa` 在 GitHub 侧**未授权**
+     (`Permission denied (publickey)`) —— 需要先把公钥加到 GitHub 账号。
+  因此 `main` 的 3 个提交与 tag `v0.8.0` **仍只在本地**, CI(Test/Publish)未触发; 恢复代理后补推:
 
 ```bash
 git push origin main
 git push origin v0.8.0        # 注意: 单次推送 tag 不超过 3 个, 否则 GitHub 不触发 workflow
 ```
+  (CI 的 Publish 步骤是幂等的: `npm view dsh-workbench-ecs@<ver>` 已存在则跳过 —— 所以 npm 已发布这件事
+  不会让流水线变红。)
 - 历史遗留的 `backfill` dist-tag(`0.6.2`)本 Token 无 dist-tag 权限(403), 需在 npm 网页端删除。
 
 **开发期踩坑(务必记牢): 不要用 PowerShell 5.1 的 `Get-Content`/`Set-Content` 改本仓库的源码文件。**
