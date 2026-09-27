@@ -343,21 +343,35 @@ read_only=true 命中 3 条写操作模式, 已拒绝执行:
 - npm 由本机 `npm publish` 完成(`npm whoami` = `nishuoyang`); 已回包核对发布物: 32 个文件,
   含 `lib/tools/ecs-find.js`、`lib/tools/ecs-snapshot.js`、`lib/snapshots.js`、`lib/regions.js`、
   `lib/anchors.js`、`templates/instances.json`、`lib/client.js` 与两份 README, 版本号 0.8.0。
-- **GitHub 推送未完成**: 本次网络无法完成 `git push`, 逐项排查结论(供下次一步到位):
-  1. **仓库配了代理但代理没在跑**: `git config http.proxy = http://127.0.0.1:7897`, 而本机 7897/7890/10809/1080/8080
-     均无监听 —— 这是"`git push` 报 Failed to connect"的直接原因。启动代理客户端后 `git push` 即可。
-  2. 绕过代理直连: `github.com:443` 的 TCP 三次握手能通(`Test-NetConnection` 连续 3 次 True), 但 git 的 HTTPS
-     被 **Connection was reset** —— 典型的 SNI 阻断, 客户端侧无解; 本机无 HTTP(S)_PROXY 环境变量。
-  3. SSH 通道: `ssh.github.com:443` 可达, 但本机 `~/.ssh/id_rsa` 在 GitHub 侧**未授权**
-     (`Permission denied (publickey)`) —— 需要先把公钥加到 GitHub 账号。
-  因此 `main` 的 3 个提交与 tag `v0.8.0` **仍只在本地**, CI(Test/Publish)未触发; 恢复代理后补推:
+- git 推送**已完成**: `main` → `623dce0`,轻量 tag `v0.8.0` → `c485efc`(远端已核对)。
+- CI **两次全绿**:
+  - push main → [run 36321156618](https://github.com/nishuoyang/dsh-workbench-ecs/actions/runs/36321156618) ✅
+  - push tag v0.8.0 → [run 36321165185](https://github.com/nishuoyang/dsh-workbench-ecs/actions/runs/36321165185) ✅
+    (Test 作业在干净 Ubuntu runner 上跑通 `npm ci` + `build:body` + `npm test`;
+    Publish 作业命中"版本已存在则跳过"分支 —— 本机已发布 0.8.0, 流水线不会变红)
+- 历史遗留的 `backfill` dist-tag(`0.6.2`)本 Token 无 dist-tag 权限(403), 需在 npm 网页端删除。
+
+**发布踩坑(务必记牢: 本机 git 推送失败的两个原因都不是"网络不通")**:
+
+1. **代理配了但没在跑**: 仓库 `git config http.proxy = http://127.0.0.1:7897`, 而 7897/7890/10809/1080/8080
+   均无监听 —— 直接表现为 `Failed to connect to github.com port 443`。推送时用 `-c http.proxy=` 绕过,
+   或先启动代理客户端。
+2. **Windows schannel 的证书吊销检查**: 绕过代理后报 `Recv failure: Connection was reset`,
+   看着像 SNI 阻断, 实际是 schannel 吊销检查失败(`curl` 直连给出真正原因:
+   `CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - 吊销功能无法检查证书是否吊销`)。
+   本机 git 的 `http.sslBackend = schannel`, 而本网络访问不到 CA 的 CRL/OCSP 端点。
+   **验证**: `curl.exe -sSI --ssl-no-revoke https://github.com` → `HTTP/1.1 200 OK`。
+   **修法(仅本次命令生效, 不改全局配置)**:
 
 ```bash
-git push origin main
-git push origin v0.8.0        # 注意: 单次推送 tag 不超过 3 个, 否则 GitHub 不触发 workflow
+git -c http.proxy= -c http.schannelCheckRevoke=false push origin main
+git -c http.proxy= -c http.schannelCheckRevoke=false push origin v0.8.0
 ```
-  (CI 的 Publish 步骤是幂等的: `npm view dsh-workbench-ecs@<ver>` 已存在则跳过 —— 所以 npm 已发布这件事
-  不会让流水线变红。)
+
+   (若要长期生效: `git config http.schannelCheckRevoke false`; 或改用 OpenSSL 后端
+   `git config http.sslBackend openssl`。)
+3. SSH 通道不可用: `ssh.github.com:443` 可达, 但本机 `~/.ssh/id_rsa` 在 GitHub 侧未授权
+   (`Permission denied (publickey)`) —— 要用 SSH 需先把公钥加到 GitHub 账号。
 - 历史遗留的 `backfill` dist-tag(`0.6.2`)本 Token 无 dist-tag 权限(403), 需在 npm 网页端删除。
 
 **开发期踩坑(务必记牢): 不要用 PowerShell 5.1 的 `Get-Content`/`Set-Content` 改本仓库的源码文件。**
