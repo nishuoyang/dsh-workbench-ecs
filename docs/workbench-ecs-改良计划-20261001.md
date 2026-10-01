@@ -8,6 +8,10 @@
 >
 > **本文件记录一次"看起来像缺功能、实际是配置与版本闸门"的排查**: 插件代码本身在桌面端
 > 一直可用, 但它**从未被桌面端加载过**。根因有两个, 第二个是真正的坑。
+>
+> **实施状态(2026-10-01 更新)**: 已发布 **v0.9.0**(commit `23d8d71`, tag `v0.9.0`,
+> npm `0.9.0` = latest)。回归: `compat` + `unit 104/104` + `smoke` 全绿; 桌面端**真机**
+> 验证通过(health 200 / 11 个工具在册 / 设置页标签出现)。
 
 ---
 
@@ -115,7 +119,7 @@ profile, 桌面端照样什么都不加载 —— 而且**没有任何报错**�
 
 | 版本 | commit | npm | 说明 |
 |---|---|---|---|
-| v0.9.0 | `30ee699`(+ 本文档回填) | ✅ **0.9.0(latest)** | 桌面端适配; 版本号 0.8.0 → 0.9.0(无功能增删, 只有兼容性与安装路径修复) |
+| v0.9.0 | `23d8d71` | ✅ **0.9.0(latest)** | 桌面端适配; 版本号 0.8.0 → 0.9.0(无功能增删, 只有兼容性与安装路径修复) |
 
 **发布物核对(2026-10-01, 从注册表回读)**:
 
@@ -129,10 +133,20 @@ npm view dsh-workbench-ecs@0.9.0 dist
 dist-tags → { "backfill": "0.6.2", "latest": "0.9.0" }
 ```
 
-**git 推送**: `main` → `30ee699`(已核对远端)。推送命令沿用上一轮的两处绕过:
+**git 与 CI(均已完成并核对)**:
+
+- `main` → `23d8d71`;tag(附注 tag)`v0.9.0` → `23d8d71`。
+- CI **三连全绿**:
+  - push main(首版 `30ee699`)→ [run 36862461135](https://github.com/nishuoyang/dsh-workbench-ecs/actions/runs/36862461135) ✅
+  - push main(`23d8d71`,夹带文档回填的强推)→ [run 36863184089](https://github.com/nishuoyang/dsh-workbench-ecs/actions/runs/36863184089) ✅
+  - push tag `v0.9.0` → [run 36863192982](https://github.com/nishuoyang/dsh-workbench-ecs/actions/runs/36863192982) ✅
+    (`Test` 与 `Publish to npm` 两个作业都 success; Publish 命中"版本已存在则跳过"分支 ——
+    npm 上的 0.9.0 由本机发布, 流水线不会重复发也不会变红)
+- 推送命令沿用上一轮的两处绕过(代理未跑 + schannel 吊销检查):
 
 ```bash
 git -c http.proxy= -c http.schannelCheckRevoke=false push origin main
+git -c http.proxy= -c http.schannelCheckRevoke=false push origin v0.9.0
 ```
 
 ### npm 12.x 的"暂存发布"踩坑 —— 本次唯一让人误判的地方
