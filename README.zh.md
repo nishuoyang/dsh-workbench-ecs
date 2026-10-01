@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.8.0 · MIT License
+> v0.9.0 · MIT License
 
 [English](./README.md) | 中文
 
@@ -10,6 +10,7 @@
 
 ## 特性
 
+- **两个宿主都能跑**(v0.9.0+): 浏览器端(`dsh web`, DSH 0.1.x)**与** DeepSeek Harness 桌面应用(`dsh-desktop-host`, DSH 0.2.x)—— 同一个包、同一份 `lib/client.js`, 两端可用。桌面端就是同一个 web 面, 因此设置页标签与 11 个工具在桌面端同样出现; `peerDependencies` 区间同时覆盖两个运行时, 所以**哪一端都不会静默跳过**该 bundle, 并由 `test/compat.mjs` 把这条锁死
 - **11 个 Agent 原生工具**(v0.8.0+ 新增 `ecs_snapshot`, v0.7.0+ 新增 `ecs_find`): `ecs_find` / `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_runbook` / `ecs_snapshot` / `ecs_session`, 与 Harness 工具体系无缝集成
 - **发布快照 `ecs_snapshot`**(v0.8.0+): 把「动手前的**回滚点** + 动手后的**差异核对**」做成一等公民, 不必每次由 agent 手写 `docker tag` + `docker cp` + `docker images/ps` 的拼装脚本 —— `create` 一次**只读**采集(默认采集器: 主机信息 / `docker images --digests` / `docker ps` / `ss -tln`, 外加 `paths` 的文件·目录指纹与 `commands` 自定义采集器)并把清单写进工作区 `.dsh/workbench-ecs/snapshots/<name>.json`(**可 diff、可提交、可 grep**); `list` 零远程调用; `diff` 按清单里记录的采集器重采一次并逐项对差异(文件 `added`/`removed`/`changed`/`metadata-only`, 采集输出给出**首个差异行**), 还可用 `against` 与另一份快照对比
 - **runbook 参数契约**(v0.8.0+): `params` 从"默认值"升级为**参数描述符** `{ required, pattern, enum, default, description, hint }`(标量写法向后兼容), 并覆盖隐式参数(含实例锚点字段)—— 缺必填 / 正则不匹配 / 枚举不匹配在 `validate` / `plan` **下发任何命令之前**就被拦住; 设置面板的「校验」按钮与执行前检查共用**同一套实现**, 因此不会出现"面板说通过、执行时炸"
@@ -42,28 +43,58 @@
 
 ## 安装
 
+> **两个宿主, 两个 profile(v0.9.0+)** —— DSH 现在同时有**浏览器端**和**桌面端**, 它们是两个独立的宿主进程, 各自加载一个 profile, 因此**要分别安装**:
+>
+> | 你用哪个 | 宿主进程 | profile 目录 | 安装命令 |
+> |---|---|---|---|
+> | 浏览器(`dsh web`) | `dsh web`(npm 全局安装的 CLI) | `%DSH_HOME%\profiles\web` | `dsh plugin --profile web add dsh-workbench-ecs` |
+> | **桌面应用** | `dsh-desktop-host`(Electron 内置运行时) | `%DSH_HOME%\profiles\desktop` | `dsh plugin --profile desktop add dsh-workbench-ecs` |
+>
+> 两个都装就两条命令都执行。桌面端仍是 **web 面**(内置 `dsh-web-app`, 客户端模块系统只收 `dsh.client.platform === "web"`), 所以同一个包、同一份 `lib/client.js` 在两端都工作 —— 但**配置文件不通用**: 只在 web profile 里装过的话, 桌面端不会加载这个插件(11 个工具与设置页都不会出现)。
+
 ### 前置要求
 
-- Node.js ≥ 20 且 DeepSeek Harness 的 `dsh web` 正在运行;
+- Node.js ≥ 20, 且目标宿主正在运行(`dsh web`, 或 DeepSeek Harness 桌面应用);
 - **与本插件同一台机器**上安装并配置好官方 Workbench CLI(见下文 [使用前准备](#使用前准备))。
+
+### 版本兼容(v0.9.0+)
+
+DSH 宿主在加载 bundle 时会做一次**版本闸门**检查: 把包的 `peerDependencies` 里每个 `@deepseek-ai/dsh-*` 与运行时版本比对, 不满足就**把整个 bundle 静默跳过**(插件一行都不加载, 也不报错)。因此本包的 peer 区间必须同时覆盖两个运行时:
+
+| 宿主 | 实测 DSH 运行时 | 本包 peer 声明 |
+|---|---|---|
+| 浏览器 `dsh web` | `0.1.1-rc.2` | `@deepseek-ai/dsh-tools: ^0.1.1-rc.2 \|\| ^0.2.0-rc.2` |
+| 桌面应用 | `0.2.0-rc.2` | 同上(`@deepseek-ai/cordis: >=4.0.1 <5.0.0`) |
+
+> v0.8.0 只知道 `^0.1.1-rc.2`, 而它在 semver 下等于 `>=0.1.1-rc.2 <0.2.0-0` —— **0.2.0-rc.2 不满足**, 于是桌面端会静默跳过整个 bundle。v0.9.0 修掉了这一点, 并用 `test/compat.mjs` 把这条闸门变成回归项(任何一端不被覆盖, `npm test` 就会红)。
 
 ### 官方 dsh 命令一键安装
 
 ```bash
+# 浏览器端
 dsh plugin --profile web add dsh-workbench-ecs
+
+# 桌面应用(另开一条)
+dsh plugin --profile desktop add dsh-workbench-ecs
 ```
 
-就这一条 —— bundle 层会把插件行写入 web profile: 11 个工具对 Agent 立即可用, Harness 设置(齿轮图标)里出现 **「Workbench ECS」** 标签页。不支持热重载的部署请重启 `dsh web`。
+完成后: 11 个工具对 Agent 立即可用, Harness 设置(齿轮图标)里出现 **「Workbench ECS」** 标签页。
+
+- **`dsh web`**: 不支持热重载的部署请重启 `dsh web`;
+- **桌面应用**: profile 只在**进程启动时**读一次 —— 请**退出并重新打开 DeepSeek Harness**。
 
 > 本地从仓库开发时改用链接方式:
-> `dsh plugin --profile web add link:<仓库绝对路径>` —— 之后修改 `lib/client.js` 刷新页面即生效(无需重启服务)。
+> `dsh plugin --profile <web|desktop> add link:<仓库绝对路径>` —— 之后修改 `lib/client.js` 刷新页面即生效(无需重启服务)。
 
 ### 验证安装
 
 ```bash
-curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.8.0"}
+# 桌面端默认 19387, dsh web 默认 3080 —— 按你实际用的那个改端口
+curl -s http://127.0.0.1:19387/dsh-workbench-ecs/health
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.9.0"}
 ```
+
+> 桌面端/鉴权开启的宿主上, 直接 curl 可能返回 `401 unauthorized`(宿主用启动令牌 + 会话 Cookie 保护整站)。这不代表插件没装 —— 在**已登录的页面**里访问同一个地址即可看到 `health` JSON。
 
 然后让 Agent 调用:
 
@@ -238,11 +269,23 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
   name: dsh-workbench-ecs
 ```
 
-注意: 浏览器设置面板只能由 `dsh` 命令接上(bundle 层 `dsh.bundle` + `dsh.client` 声明)。
+注意: 设置面板只能由 `dsh` 命令接上(bundle 层 `dsh.bundle` + `dsh.client` 声明)。插件行要写进**你想用的那个 profile**: 浏览器端是 `%DSH_HOME%\profiles\web`, 桌面端是 `%DSH_HOME%\profiles\desktop`。
 
 #### 本地仓库开发
 
-用 [`scripts/install-local.ps1`](./scripts/install-local.ps1) 把仓库以 junction 链接进 `%DSH_HOME%` 并代写插件行(`install` / `status` / `uninstall`), 修改后随下一次 patch 热重载或 `dsh web` 重启生效。
+用 [`scripts/install-local.ps1`](./scripts/install-local.ps1) 把仓库以 junction 链接进 `%DSH_HOME%` 并代写插件行。脚本幂等且可回退:
+
+```powershell
+# 写进所有已存在的 profile(web + desktop)
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
+# 只写其中一个
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 -Profile desktop
+# 查看 / 卸载
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 status
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall
+```
+
+profile 目录要在该宿主**启动过一次**之后才会存在(浏览器端靠 `dsh web` 生成, 桌面端靠桌面应用生成)。改动随下一次 patch 热重载、页面刷新或对应宿主重启生效 —— 桌面应用只在进程启动时读一次 profile, 因此需要重启。
 
 ## 设置页面
 
@@ -261,13 +304,14 @@ workbench config delete --profile old     # 删除 profile(不能删除激活中
 
 ## 工作原理
 
-本包是 DSH **静态双半插件**, 以 **bundle 层** 编入 DSH web profile 组合:
+本包是 DSH **静态双半插件**, 以 **bundle 层** 编入 DSH profile 组合。它**两个宿主都能跑** —— 浏览器端(`dsh web`, DSH 0.1.x)与桌面应用(`dsh-desktop-host`, DSH 0.2.x): 桌面端服务的仍是同一个 web 面, 客户端半的筛选规则也一样(`dsh.client.platform === "web"`)。
 
 | 半 | 文件 | 职责 |
 |---|---|---|
 | Host 半(Node) | `lib/index.js` | 通过 `tools` 注册 11 个模型工具; 通过 `webServer` 注册同源路由 `/dsh-workbench-ecs/health` 与 `/dsh-workbench-ecs/rpc`; 设置页 RPC 经 `subprocess` 执行本机 CLI(共享 `lib/common.js` / `lib/settings-api.js` / `lib/steps-engine.js`; runbook 机制在 `lib/runbooks.js`, 跨地域检索在 `lib/regions.js`, 实例锚点在 `lib/anchors.js`, 发布快照在 `lib/snapshots.js`(v0.8.0+)) |
 | 浏览器半 | `lib/client.js` | 单文件 client bundle(`window.__ModuleLoader__` 工厂形式): 注册「Workbench ECS」设置页标签, 经同源 RPC 路由与 Host 通信 |
-| 组合层 | `cordis.patch.yml` | `dsh.bundle` patch: 把插件行插入 profile 组合 —— `dsh web` 启动即生效, 由 `dsh plugin --profile web add` 自动装载 |
+| 组合层 | `cordis.patch.yml` | `dsh.bundle` patch: 把插件行插入 profile 组合 —— 任一宿主启动该 profile 即生效, 由 `dsh plugin --profile <web\|desktop> add` 自动装载 |
+| 兼容性守卫 | `test/compat.mjs` | 断言 `peerDependencies` 区间覆盖**每一个**已实测的运行时(浏览器 0.1.x + 桌面 0.2.x)—— 不被覆盖的运行时会让宿主**静默跳过整个 bundle**; 随后用真 `@deepseek-ai/dsh-tools` 内核复核全部 11 个工具定义(v0.9.0+) |
 
 两端零构建: `lib/client.js` 为手写单文件 bundle, 无需打包器; 同一套 `lib/` 源码也可临时挂载为动态 body(`npm run build:body`)。
 

@@ -1,6 +1,6 @@
 # dsh-workbench-ecs
 
-> v0.8.0 · MIT License
+> v0.9.0 · MIT License
 
 English | [中文](README.zh.md)
 
@@ -10,6 +10,7 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 
 ## Features
 
+- **Runs on both surfaces** (v0.9.0+): the browser surface (`dsh web`, DSH 0.1.x) **and** the DeepSeek Harness desktop app (`dsh-desktop-host`, DSH 0.2.x) — one package, one `lib/client.js`, both hosts. The desktop host is the same web surface, so the settings tab and all 11 tools appear there too; the `peerDependencies` range covers both runtimes so neither host skips the bundle, and `test/compat.mjs` locks that in
 - **11 Agent-native tools** (v0.8.0+ adds `ecs_snapshot`, v0.7.0+ adds `ecs_find`): `ecs_find` / `ecs_list` / `ecs_exec` / `ecs_log` / `ecs_upload` / `ecs_download` / `ecs_diagnose` / `ecs_deploy` / `ecs_runbook` / `ecs_snapshot` / `ecs_session`, integrated with the Harness tool pipeline
 - **Release snapshots `ecs_snapshot`** (v0.8.0+): makes "the **rollback point** before you touch anything + the **difference check** afterwards" a first-class concern instead of a hand-written `docker tag` + `docker cp` + `docker images/ps` assembly script per agent — `create` runs one **read-only** collection (default collectors: host info / `docker images --digests` / `docker ps` / `ss -tln`, plus `paths` file-and-directory fingerprints and `commands` custom collectors) and writes the manifest into the workspace at `.dsh/workbench-ecs/snapshots/<name>.json` (**diffable, committable, greppable**); `list` makes no remote call at all; `diff` re-collects with the collectors recorded in the manifest and compares item by item (files `added`/`removed`/`changed`/`metadata-only`, collector output reported down to the **first differing line**), and `against` compares two snapshots with each other
 - **Runbook parameter contracts** (v0.8.0+): `params` grows from "just a default" into a **parameter descriptor** `{ required, pattern, enum, default, description, hint }` (the scalar form still means a default, fully backward compatible) and it covers implicit parameters too (including instance-anchor fields) — a missing required parameter, a `pattern` mismatch or an `enum` mismatch is caught by `validate` / `plan` **before any command is sent**. The settings panel's **Validate** button and the pre-execution checks share **one implementation**, so "the panel said OK but execution blew up" cannot happen
@@ -42,28 +43,58 @@ It drives the official Alibaba Cloud [Workbench CLI](https://help.aliyun.com/zh/
 
 ## Installation
 
+> **Two hosts, two profiles (v0.9.0+)** — DSH now ships both a **browser** surface and a **desktop app**. They are separate host processes loading separate profiles, so the plugin must be installed **into each one**:
+>
+> | Which one you use | Host process | Profile directory | Install command |
+> |---|---|---|---|
+> | Browser (`dsh web`) | `dsh web` (npm-global CLI) | `%DSH_HOME%\profiles\web` | `dsh plugin --profile web add dsh-workbench-ecs` |
+> | **Desktop app** | `dsh-desktop-host` (the runtime bundled in Electron) | `%DSH_HOME%\profiles\desktop` | `dsh plugin --profile desktop add dsh-workbench-ecs` |
+>
+> Run both commands to cover both. The desktop side is **still the web surface** (it bundles `dsh-web-app`, and the client module system only accepts `dsh.client.platform === "web"`), so one package and one `lib/client.js` serve both — but the **profiles are not shared**: if you only installed into the web profile, the desktop app will not load the plugin at all (no tools, no settings tab).
+
 ### Prerequisites
 
-- Node.js ≥ 20 with a running DeepSeek Harness `dsh web`;
+- Node.js ≥ 20, with the target host running (`dsh web`, or the DeepSeek Harness desktop app);
 - The official Workbench CLI installed and authenticated **on the same machine** (see [Before first use](#before-first-use) below).
+
+### Version compatibility (v0.9.0+)
+
+When the host loads a bundle it applies a **version gate**: every `@deepseek-ai/dsh-*` entry in the package's `peerDependencies` is compared against the running DSH version, and a mismatch makes the host **silently skip the whole bundle** (the plugin never loads and nothing is reported). The peer range therefore has to cover both runtimes:
+
+| Host | Measured DSH runtime | This package's peer declaration |
+|---|---|---|
+| Browser `dsh web` | `0.1.1-rc.2` | `@deepseek-ai/dsh-tools: ^0.1.1-rc.2 \|\| ^0.2.0-rc.2` |
+| Desktop app | `0.2.0-rc.2` | same (plus `@deepseek-ai/cordis: >=4.0.1 <5.0.0`) |
+
+> v0.8.0 only knew `^0.1.1-rc.2`, which under semver means `>=0.1.1-rc.2 <0.2.0-0` — **0.2.0-rc.2 does not satisfy it**, so the desktop host skipped the entire bundle. v0.9.0 fixes that and turns the gate into a regression test (`test/compat.mjs`): if either runtime stops being covered, `npm test` fails.
 
 ### Install via the official dsh command
 
 ```bash
+# browser surface
 dsh plugin --profile web add dsh-workbench-ecs
+
+# desktop app (a separate command)
+dsh plugin --profile desktop add dsh-workbench-ecs
 ```
 
-That's it — the bundle layer inserts the plugin row into the web profile: the 11 tools become visible to the Agent and a **"Workbench ECS"** tab appears in the harness settings (gear icon). Restart `dsh web` when hot reload is unavailable.
+Afterwards the 11 tools are visible to the Agent and a **"Workbench ECS"** tab appears in the harness settings (gear icon).
+
+- **`dsh web`**: restart `dsh web` when hot reload is unavailable;
+- **Desktop app**: the profile is read **once at process start** — **quit and reopen DeepSeek Harness**.
 
 > For local development from a checkout, link the repo instead:
-> `dsh plugin --profile web add link:<absolute-path-to-repo>` — subsequent `lib/client.js` edits apply after a plain page refresh (no server restart).
+> `dsh plugin --profile <web|desktop> add link:<absolute-path-to-repo>` — subsequent `lib/client.js` edits apply after a plain page refresh (no server restart).
 
 ### Verify
 
 ```bash
-curl -s http://127.0.0.1:3080/dsh-workbench-ecs/health
-# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.8.0"}
+# the desktop host uses 19387, `dsh web` uses 3080 — use whichever you run
+curl -s http://127.0.0.1:19387/dsh-workbench-ecs/health
+# => {"ok":true,"plugin":"dsh-workbench-ecs","version":"0.9.0"}
 ```
+
+> On the desktop host (and any host with authentication on) a bare `curl` can return `401 unauthorized`: the host protects the whole site with a launch token plus a session cookie. That does **not** mean the plugin is missing — open the same URL from the **already signed-in page** to see the `health` JSON.
 
 Then ask the Agent:
 
@@ -238,11 +269,23 @@ Add the plugin row to your Cordis composition instead (cordis.yml / cordis.patch
   name: dsh-workbench-ecs
 ```
 
-Note: the browser settings panel is only wired up by the `dsh` command (which uses the package's `dsh.bundle` layer and `dsh.client` declarations).
+Note: the settings panel is only wired up by the `dsh` command (which uses the package's `dsh.bundle` layer and `dsh.client` declarations). Add the row to **each** profile you want it in — `%DSH_HOME%\profiles\web` for the browser, `%DSH_HOME%\profiles\desktop` for the desktop app.
 
 #### Local development from a checkout
 
-Use [`scripts/install-local.ps1`](./scripts/install-local.ps1) to link the repo into `%DSH_HOME%` with a junction and write the plugin row for you (`install` / `status` / `uninstall`) — edits apply on the next patch reload or `dsh web` restart.
+Use [`scripts/install-local.ps1`](./scripts/install-local.ps1) to link the repo into `%DSH_HOME%` with a junction and write the plugin row for you. It is idempotent and reversible:
+
+```powershell
+# every profile that already exists (web + desktop)
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1
+# just one of them
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 -Profile desktop
+# inspect / undo
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 status
+powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall
+```
+
+A profile directory only exists after its host has started once (`dsh web` for `web`, the desktop app for `desktop`). Edits apply on the next patch reload, a page refresh, or the relevant host restart — the desktop app reads its profile once at process start, so it needs a restart.
 
 ## Settings panel
 
@@ -261,13 +304,14 @@ The panel talks to the **local** Workbench CLI through a same-origin route (`/ds
 
 ## How it works
 
-This package is a DSH **static two-half plugin**, composed into the DSH web profile as a **bundle layer**:
+This package is a DSH **static two-half plugin**, composed into a DSH profile as a **bundle layer**. It works on **both hosts** — the browser surface (`dsh web`, DSH 0.1.x) and the desktop app (`dsh-desktop-host`, DSH 0.2.x) — because the desktop host serves the same web surface and filters client halves with the same `dsh.client.platform === "web"` rule:
 
 | Half | File | Responsibility |
 |---|---|---|
 | Host half (Node) | `lib/index.js` | Registers the 11 model tools with `tools`, and same-origin routes `/dsh-workbench-ecs/health` & `/dsh-workbench-ecs/rpc` with `webServer`; the settings RPC runs the local CLI through `subprocess` (shared `lib/common.js` / `lib/settings-api.js` / `lib/steps-engine.js`; runbook mechanism in `lib/runbooks.js`, cross-region search in `lib/regions.js`, instance anchors in `lib/anchors.js`, release snapshots in `lib/snapshots.js` (v0.8.0+)) |
 | Browser half | `lib/client.js` | Single-file client bundle (`window.__ModuleLoader__` factory form): registers the "Workbench ECS" settings tab and talks to the host over the same-origin RPC route |
-| Composition | `cordis.patch.yml` | `dsh.bundle` patch: inserts the plugin row into the profile composition — active on `dsh web` startup, picked up automatically by `dsh plugin --profile web add` |
+| Composition | `cordis.patch.yml` | `dsh.bundle` patch: inserts the plugin row into the profile composition — active when either host boots that profile, and picked up automatically by `dsh plugin --profile <web\|desktop> add` |
+| Compatibility guard | `test/compat.mjs` | Asserts the `peerDependencies` range covers every runtime this package is verified against (`0.1.x` browser + `0.2.x` desktop), because an uncovered runtime makes the host **silently skip the whole bundle**; then re-checks all 11 tool definitions with the real `@deepseek-ai/dsh-tools` kernel (v0.9.0+) |
 
 Zero build on both ends: `lib/client.js` is a hand-written single-file bundle, no bundler required; the same `lib/` sources can also be mounted as a temporary dynamic body (`npm run build:body`).
 

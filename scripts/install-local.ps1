@@ -2,22 +2,36 @@
 # scripts/install-local.ps1 -- dsh-workbench-ecs local dev install (junction)
 # ----------------------------------------------------------------------------
 # Usage (run from the repo root):
-#   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1        (install)
+#   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1                     (install, all profiles)
+#   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 -Profile desktop    (desktop app only)
+#   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 -Profile web        (dsh web / browser only)
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 status
 #   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall
 #
 # install = (1) create a junction at %DSH_HOME%\node_modules\dsh-workbench-ecs
 # pointing at this repo (matches the DSH ESM resolution chain),
-#           (2) insert the plugin row into profiles/*/cordis.patch.yml (the
-# user patch layer, hot-reloadable). Idempotent & reversible; touches only
-# %DSH_HOME% and this repo.
+#           (2) insert the plugin row into the selected profiles'
+# cordis.patch.yml (the user patch layer, hot-reloadable). Idempotent &
+# reversible; touches only %DSH_HOME% and this repo.
 #
-# After install: refresh the settings page (or restart `dsh web` when hot
-# reload is unavailable).
+# Two hosts, two profiles (v0.9.0):
+#   * browser -> `dsh web`      -> %DSH_HOME%\profiles\web
+#   * desktop -> the Electron app -> %DSH_HOME%\profiles\desktop
+#     (the desktop host is @deepseek-ai/dsh-desktop-host and loads the
+#      `desktop` profile; it is still the web surface, so the same row works.)
+# Install into BOTH unless -Profile narrows it. The desktop app must be
+# restarted for a newly inserted row to take effect (it boots the profile once).
+#
+# After install: refresh the settings page (or restart the host) and open
+# Settings (gear) -> Workbench ECS.
 # NOTE: keep this file ASCII-only (Windows PowerShell 5.1 parses ANSI; use
 # install-local.mjs-style scripts for non-ASCII output).
 # ============================================================================
-param([string]$Command = 'install')
+param(
+  [string]$Command = 'install',
+  # install / uninstall target: all (default) | web | desktop | <any profile dir name>
+  [string]$Profile = 'all'
+)
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -27,7 +41,8 @@ $rowName = 'dsh-workbench-ecs'
 $patchBlock = @(
   '- insert:',
   '    # dsh-workbench-ecs (managed-by: install-local.ps1)',
-  '    # Settings panel "Workbench ECS" + 7 ECS tools; applies at dsh web start.',
+  '    # Settings panel "Workbench ECS" + 11 ECS tools; applies at host start',
+  "    # (`dsh web` for the browser profile, the desktop app for the desktop one).",
   '    - id: workbench-ecs',
   "      name: $rowName"
 )
@@ -39,15 +54,18 @@ $templateLines = @(
   ''
 )
 
+# Which profile directories this invocation targets. `all` = every profile that
+# already has a cordis.patch.yml (profiles are created on first host start); a
+# name selects exactly that one (and must already exist).
 function Get-ProfilePatchPaths {
   $profiles = Join-Path $dshHome 'profiles'
   $paths = @()
-  if (Test-Path $profiles) {
-    foreach ($d in Get-ChildItem $profiles -Directory -ErrorAction SilentlyContinue) {
-      if ($d.Name -eq 'node_modules') { continue }
-      $p = Join-Path $d.FullName 'cordis.patch.yml'
-      if (Test-Path $p) { $paths += $p }
-    }
+  if (-not (Test-Path $profiles)) { return $paths }
+  foreach ($d in Get-ChildItem $profiles -Directory -ErrorAction SilentlyContinue) {
+    if ($d.Name -eq 'node_modules') { continue }
+    if ($Profile -ne 'all' -and $d.Name -ne $Profile) { continue }
+    $p = Join-Path $d.FullName 'cordis.patch.yml'
+    if (Test-Path $p) { $paths += $p }
   }
   return $paths
 }
@@ -156,39 +174,53 @@ function Invoke-RemovePatch([string]$path) {
   Write-Host "[patch] removed the row from $path"
 }
 
+function Show-Targets {
+  Write-Host "target:   -Profile $Profile"
+  foreach ($p in Get-ProfilePatchPaths) {
+    $name = Split-Path -Parent $p | Split-Path -Leaf
+    $has = if (Test-RowPresent ((Get-Content $p -Raw))) { 'installed' } else { 'absent' }
+    Write-Host "profile:  $name -> $has"
+  }
+}
+
 switch ($Command.ToLower()) {
   'install' {
     if (-not (Invoke-EnsureLink)) { exit 1 }
     $paths = Get-ProfilePatchPaths
     if ($paths.Count -eq 0) {
-      Write-Error '[patch] no profiles/*/cordis.patch.yml found; run `dsh web` once to generate the profile, or add the row manually'
+      if ($Profile -eq 'all') {
+        Write-Error '[patch] no profiles/*/cordis.patch.yml found; start `dsh web` (or the desktop app) once to generate the profile, or add the row manually'
+      } else {
+        Write-Error "[patch] profile '$Profile' has no cordis.patch.yml; start that host once (the desktop app for 'desktop', ``dsh web`` for 'web') or add the row manually"
+      }
       exit 1
     }
     $any = $false
     foreach ($p in $paths) { if (Invoke-WritePatch $p) { $any = $true } }
     if (-not $any) { exit 1 }
     Write-Host ''
+    Show-Targets
+    Write-Host ''
     Write-Host 'Install done. Next:'
-    Write-Host '  1. Refresh the settings page (hot reload) or restart dsh web'
-    Write-Host '  2. Open Settings(gear) -> Workbench ECS tab'
-    Write-Host '  3. Session tools: ecs_list / ecs_exec / ecs_upload / ecs_download / ecs_diagnose / ecs_deploy / ecs_session'
+    Write-Host '  1. Browser (`dsh web`): refresh the page, or restart `dsh web`'
+    Write-Host '  2. Desktop app: quit and reopen DeepSeek Harness (the profile boots once)'
+    Write-Host '  3. Open Settings(gear) -> Workbench ECS'
+    Write-Host '  4. Session tools: ecs_find / ecs_list / ecs_exec / ecs_log / ecs_upload /'
+    Write-Host '     ecs_download / ecs_diagnose / ecs_deploy / ecs_runbook / ecs_snapshot / ecs_session'
   }
   'status' {
     Write-Host "DSH_HOME: $dshHome"
     Write-Host "repo:     $repo"
     Write-Host "link:     $linkPath -> $(Get-LinkState)"
-    foreach ($p in Get-ProfilePatchPaths) {
-      $has = if (Test-RowPresent ((Get-Content $p -Raw))) { 'installed' } else { 'absent' }
-      Write-Host "patch:    $p -> $has"
-    }
+    Show-Targets
     Write-Host ''
-    Write-Host 'Install: powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1'
-    Write-Host 'Uninstall: powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall'
+    Write-Host 'Install:   powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 [-Profile all|web|desktop]'
+    Write-Host 'Uninstall: powershell -ExecutionPolicy Bypass -File .\scripts\install-local.ps1 uninstall [-Profile ...]'
   }
   'uninstall' {
     foreach ($p in Get-ProfilePatchPaths) { Invoke-RemovePatch $p }
     Invoke-RemoveLink
-    Write-Host 'If it was also installed via `dsh plugin --profile web add`, run: dsh plugin --profile web remove dsh-workbench-ecs'
+    Write-Host 'If it was also installed via `dsh plugin --profile <name> add`, run: dsh plugin --profile <name> remove dsh-workbench-ecs'
   }
   default {
     Write-Error "unknown command: $Command (available: install / status / uninstall)"
