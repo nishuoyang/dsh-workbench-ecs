@@ -1,5 +1,7 @@
 # dsh-workbench-ecs
 
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/nishuoyang/dsh-workbench-ecs)
+
 > v0.9.0 · MIT License
 
 English | [中文](README.zh.md)
