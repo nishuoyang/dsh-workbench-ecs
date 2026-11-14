@@ -35,6 +35,7 @@ import { ecsUploadDefinition } from '../lib/tools/ecs-upload.js'
 import { ecsListDefinition } from '../lib/tools/ecs-list.js'
 import { ecsFindDefinition } from '../lib/tools/ecs-find.js'
 import { ecsLogDefinition, buildMultiLogReadCommand, splitLogSegments, resolveLogPaths, resolveAfter } from '../lib/tools/ecs-log.js'
+import { ecsSessionDefinition } from '../lib/tools/ecs-session.js'
 import { ecsDeployDefinition } from '../lib/tools/ecs-deploy.js'
 import { createSettingsCore } from '../lib/settings-api.js'
 import {
@@ -639,6 +640,24 @@ await runAsync('ecs_list: 顶到 limit 且 CLI 未给 token 时显式提示分�
   const v2 = await def2.execute({ region: 'cn-shanghai', limit: 10 }, { signal: { aborted: false } })
   assert.equal(v2.next_token, 'tok-2', 'CLI 给出 token 时应透出')
   assert.equal(v2.pagination_note, undefined, '有 token 时不应提示')
+})
+
+await runAsync('ecs_session list: 无活动会话时归一为空数组, 不再把 null 透给调用方', async () => {
+  const stub = stubSubprocess('null')
+  const def = ecsSessionDefinition({ get: (n) => (n === 'subprocess' ? stub.subprocess : undefined) })
+  const value = await def.execute({ action: 'list' }, { signal: { aborted: false } })
+  assert.deepEqual(value.sessions, [], 'sessions 应为空数组')
+  assert.equal(value.message, '没有活动的 Workbench 会话', '应给出可读文案而非 null')
+  const text = def.output.render({ action: 'list' }, value)[0].text
+  assert.ok(!text.includes('null'), '可读输出不应出现 null, 实际: ' + text)
+})
+
+await runAsync('ecs_session list: 有会话时原样透出数组', async () => {
+  const body = JSON.stringify([{ session_id: 's-1' }, { session_id: 's-2' }])
+  const stub = stubSubprocess(body)
+  const def = ecsSessionDefinition({ get: (n) => (n === 'subprocess' ? stub.subprocess : undefined) })
+  const value = await def.execute({ action: 'list' }, { signal: { aborted: false } })
+  assert.equal(value.sessions.length, 2, '应原样透出两条会话')
 })
 
 // ---- S4a: ecs_deploy steps 编排(v0.6.0) ----
