@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "dsh-workbench-ecs": "^0.9.1"
+  }
+}
